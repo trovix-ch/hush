@@ -218,9 +218,13 @@ Rules the hook must obey (from the Windows contract and prior-art bugs):
   hook thread may reinstall and it is the one stalled. Keystrokes between removal and
   reinstall are lost; that is inherent and accepted.
 - If the foreground window is elevated and we are not, the hook sees nothing; detect
-  and tell the user rather than fail silently. The same blindness happens on the UAC
-  secure desktop and the lock screen while a key is held, so a **maximum recording
-  duration** (default 120 s) always ends a recording even if key-up never arrives.
+  and tell the user rather than fail silently. Confirmed by hand 2026-09-24: the
+  hotkey simply does nothing in an admin window. Since no event arrives, the warning
+  has to be proactive: the app watches the foreground window and shows "admin window,
+  dictation unavailable" in the pill and tray while one has focus. The same blindness
+  happens on the UAC secure desktop and the lock screen while a key is held, so a
+  **maximum recording duration** (default 120 s) always ends a recording even if
+  key-up never arrives.
 - Shutdown order: stop producing events, unhook on the hook thread, then join it.
 
 Trade-offs of Right Ctrl as the default, stated so they are not rediscovered: while
@@ -274,7 +278,10 @@ the policy follows from that:
 Remote desktop sessions are detected up front (`SM_REMOTESESSION`). Inside one, paste
 works but the receipt is always third-party, and the dictated text is forwarded to the
 client machine's clipboard by design of RDP. A "type only in remote sessions" option
-keeps the text off the clipboard entirely for users who care.
+keeps the text off the clipboard entirely for users who care. Amended 2026-09-24: RDP
+is the maintainer's primary environment, so the third-party-read path and the
+fixed-delay restore are the *normal* case for this project, not a fallback, and every
+insertion change is tested there first.
 
 Before pasting: refocus the window captured at hotkey-down and abort if the foreground
 changed; release any held modifiers; refuse password fields; per-app paste chord
@@ -542,6 +549,17 @@ LLM round trip is about 220 ms here against 100 ms p50 in the isolated benchmark
 (the benchmark reused one HTTP agent; the app's first-request cost or the different
 prompt size are candidates). Both are inside the budget and both get measured before
 milestone 2 is called done.
+
+### First human run, 2026-09-24
+Method: the maintainer at the keyboard, over RDP (the primary way this machine is
+used), release build. Passed: build and `doctor`; hold-to-talk into Notepad with every
+word typed; Escape cancel; double-tap hands-free; max-duration stop; insertion into
+VS Code, a browser field, Windows Terminal and cmd; tray icon and "copy last".
+Findings: the overlay level bar barely moves at normal speaking volume although
+transcription is complete; the hotkey does nothing while an admin window has focus,
+which is the UIPI rule (a medium-integrity hook receives no keystrokes then), so the
+only possible behaviour is a warning before the user speaks; the tray icon should show
+state. Not yet tested: clipboard restore with an image or files, and the LLM pass.
 
 ### Clipboard read signals, 2026-09-24
 Method: `spikes/clipboard-receipt/`, delayed-rendered `CF_UNICODETEXT` pasted by
