@@ -3,6 +3,7 @@
 
 pub mod capture;
 mod cpal_backend;
+pub mod display;
 pub mod engine;
 pub mod resample;
 pub mod vad;

@@ -24,8 +24,8 @@ impl From<&Provenance> for ProvenanceHint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayState {
     Idle,
-    /// `level` in `0.0..=1.0`. The pipeline only ever sends `0.0`; routing the live meter's
-    /// 30 updates a second through the state machine would buy nothing.
+    /// `level` in `0.0..=1.0`. The pipeline only ever sends `0.0`; the live meter goes
+    /// straight from the driver to the overlay.
     Listening {
         level: f32,
     },

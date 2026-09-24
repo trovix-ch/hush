@@ -57,10 +57,30 @@ pub enum TrayError {
     Menu(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayIndicator {
+    Idle,
+    Listening,
+    Busy,
+    Error,
+}
+
+impl TrayIndicator {
+    fn rgb(self) -> [u8; 3] {
+        match self {
+            TrayIndicator::Idle => [0x9A, 0x9A, 0xA0],
+            TrayIndicator::Listening => [0x4C, 0xC2, 0x6E],
+            TrayIndicator::Busy => [0xF2, 0xB1, 0x3C],
+            TrayIndicator::Error => [0xF0, 0x4A, 0x4A],
+        }
+    }
+}
+
 /// Must live on a thread that runs a message loop.
 pub struct Tray {
     icon: TrayIcon,
     pause: MenuItem,
+    indicator: TrayIndicator,
 }
 
 impl Tray {
@@ -91,17 +111,34 @@ impl Tray {
         }));
         let icon = TrayIconBuilder::new()
             .with_tooltip("whisper-local")
-            .with_icon(icon_image(false)?)
+            .with_icon(icon_image(TrayIndicator::Idle)?)
             .with_menu(Box::new(menu))
             .build()
             .map_err(|e| TrayError::Icon(e.to_string()))?;
-        Ok(Self { icon, pause })
+        Ok(Self {
+            icon,
+            pause,
+            indicator: TrayIndicator::Idle,
+        })
     }
 
     pub fn set_paused(&self, paused: bool) {
         self.pause.set_text(if paused { "Resume" } else { "Pause" });
-        if let Ok(i) = icon_image(paused) {
-            let _ = self.icon.set_icon(Some(i));
+    }
+
+    /// Replaces the icon only on a change: the level meter repeats the same state
+    /// twenty times a second.
+    pub fn set_indicator(&mut self, indicator: TrayIndicator) {
+        if indicator == self.indicator {
+            return;
+        }
+        match icon_image(indicator) {
+            Ok(i) => {
+                if self.icon.set_icon(Some(i)).is_ok() {
+                    self.indicator = indicator;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "tray icon"),
         }
     }
 
@@ -146,17 +183,13 @@ pub fn show_about() {
     });
 }
 
-fn icon_image(paused: bool) -> Result<Icon, TrayError> {
-    Icon::from_rgba(icon_rgba(paused), 32, 32).map_err(|e| TrayError::Icon(e.to_string()))
+fn icon_image(indicator: TrayIndicator) -> Result<Icon, TrayError> {
+    Icon::from_rgba(icon_rgba(indicator), 32, 32).map_err(|e| TrayError::Icon(e.to_string()))
 }
 
 /// A microphone glyph, straight (not premultiplied) RGBA.
-pub(crate) fn icon_rgba(paused: bool) -> Vec<u8> {
-    let color: [u8; 3] = if paused {
-        [0x9A, 0x9A, 0xA0]
-    } else {
-        [0x4C, 0xC2, 0x6E]
-    };
+pub(crate) fn icon_rgba(indicator: TrayIndicator) -> Vec<u8> {
+    let color = indicator.rgb();
     let mut out = vec![0u8; 32 * 32 * 4];
     for y in 0..32 {
         for x in 0..32 {
@@ -198,12 +231,27 @@ mod tests {
 
     #[test]
     fn icon_has_a_visible_glyph_and_clear_corners() {
-        let px = icon_rgba(false);
+        let px = icon_rgba(TrayIndicator::Listening);
         assert_eq!(px.len(), 32 * 32 * 4);
         assert_eq!(px[3], 0);
         let opaque = px.chunks_exact(4).filter(|p| p[3] > 200).count();
         assert!((80..600).contains(&opaque), "{opaque}");
         assert!(Icon::from_rgba(px, 32, 32).is_ok());
+    }
+
+    #[test]
+    fn each_indicator_has_its_own_colour() {
+        let all = [
+            TrayIndicator::Idle,
+            TrayIndicator::Listening,
+            TrayIndicator::Busy,
+            TrayIndicator::Error,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.rgb(), b.rgb(), "{a:?} vs {b:?}");
+            }
+        }
     }
 
     #[test]

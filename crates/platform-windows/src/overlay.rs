@@ -24,6 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+use crate::tray::TrayIndicator;
 use crate::util::wide;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +67,31 @@ impl OverlayState {
             | OverlayState::Notice { message }
             | OverlayState::Status { message } => message.clone(),
         }
+    }
+
+    pub fn tray_indicator(&self) -> TrayIndicator {
+        match self {
+            OverlayState::Listening { .. } => TrayIndicator::Listening,
+            OverlayState::Transcribing | OverlayState::Normalizing | OverlayState::Inserting => {
+                TrayIndicator::Busy
+            }
+            OverlayState::Error { .. } => TrayIndicator::Error,
+            OverlayState::Hidden
+            | OverlayState::Done { .. }
+            | OverlayState::Notice { .. }
+            | OverlayState::Status { .. } => TrayIndicator::Idle,
+        }
+    }
+
+    /// Between key-down and the end of insertion.
+    pub fn is_dictating(&self) -> bool {
+        matches!(
+            self,
+            OverlayState::Listening { .. }
+                | OverlayState::Transcribing
+                | OverlayState::Normalizing
+                | OverlayState::Inserting
+        )
     }
 
     fn dot_rgb(&self) -> [u8; 3] {
@@ -138,8 +164,9 @@ pub struct Overlay {
 impl Overlay {
     pub const HIDE_TIMER: usize = 0x5717;
 
-    /// `timer_hwnd` receives the auto-hide `WM_TIMER` and must forward it to
-    /// [`Overlay::on_timer`]; `None` uses the pill window, where nothing handles it.
+    /// `timer_hwnd` receives the auto-hide `WM_TIMER` ([`Overlay::HIDE_TIMER`]), and its
+    /// owner answers it by setting the next state; `None` uses the pill window, where
+    /// nothing handles it.
     pub fn create(config: OverlayConfig, timer_hwnd: Option<HWND>) -> windows::core::Result<Self> {
         // SAFETY: plain FFI query.
         let dpi = unsafe { GetDpiForSystem() }.max(96);
@@ -218,6 +245,10 @@ impl Overlay {
     }
 
     pub fn set(&mut self, state: OverlayState) {
+        // A silent microphone repeats the same level twenty times a second.
+        if self.visible && state == self.state && matches!(state, OverlayState::Listening { .. }) {
+            return;
+        }
         // SAFETY: our own window and timer id; killing a timer that is not set is a no-op.
         let _ = unsafe { KillTimer(Some(self.timer_hwnd), Self::HIDE_TIMER) };
         self.state = state;
@@ -262,15 +293,6 @@ impl Overlay {
                     None,
                 )
             };
-        }
-    }
-
-    pub fn on_timer(&mut self, id: usize) {
-        if id == Self::HIDE_TIMER {
-            // SAFETY: our own window and timer.
-            let _ = unsafe { KillTimer(Some(self.timer_hwnd), Self::HIDE_TIMER) };
-            self.state = OverlayState::Hidden;
-            self.hide();
         }
     }
 
@@ -495,7 +517,7 @@ pub(crate) fn compose(
     };
     let bar_x0 = wf - 88.0 * scale;
     let bar_x1 = wf - 16.0 * scale;
-    let bar_h = 6.0 * scale;
+    let bar_h = 8.0 * scale;
     for y in 0..h {
         for x in 0..w {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -523,9 +545,9 @@ pub(crate) fn compose(
             {
                 let filled = bar_x0 + (bar_x1 - bar_x0) * level;
                 let c = if fx <= filled {
-                    [0x4C, 0xC2, 0x6E]
+                    [0x5C, 0xE0, 0x80]
                 } else {
-                    [0x44, 0x44, 0x4C]
+                    [0x50, 0x50, 0x5A]
                 };
                 blend(c, 1.0);
             }
@@ -586,6 +608,26 @@ mod tests {
                 .count()
         };
         assert!(green(&high) > green(&low) * 3);
+    }
+
+    #[test]
+    fn tray_indicator_follows_the_overlay_state() {
+        use TrayIndicator::*;
+        let msg = || "m".to_string();
+        for (state, want) in [
+            (OverlayState::Hidden, Idle),
+            (OverlayState::Listening { level: 0.4 }, Listening),
+            (OverlayState::Transcribing, Busy),
+            (OverlayState::Normalizing, Busy),
+            (OverlayState::Inserting, Busy),
+            (OverlayState::Done { message: None }, Idle),
+            (OverlayState::Error { message: msg() }, Error),
+            (OverlayState::Notice { message: msg() }, Idle),
+            (OverlayState::Status { message: msg() }, Idle),
+        ] {
+            assert_eq!(state.tray_indicator(), want, "{state:?}");
+            assert_eq!(state.is_dictating(), matches!(want, Listening | Busy));
+        }
     }
 
     #[test]

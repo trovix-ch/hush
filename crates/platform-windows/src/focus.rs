@@ -186,16 +186,20 @@ pub fn self_elevated() -> bool {
 }
 
 pub(crate) fn foreground_is_elevated_over_us() -> bool {
-    if self_elevated() {
-        return false;
-    }
     // SAFETY: plain FFI query.
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0.is_null() {
+    window_is_elevated_over_us(unsafe { GetForegroundWindow() })
+}
+
+/// No UI Automation here: this runs on a timer and must never block on the target.
+pub(crate) fn window_is_elevated_over_us(hwnd: HWND) -> bool {
+    if self_elevated() || hwnd.0.is_null() {
         return false;
     }
-    let (_, pid) = window_thread_pid(hwnd);
-    process_elevated(pid).unwrap_or(true)
+    match window_thread_pid(hwnd) {
+        // The window closed between the two calls.
+        (_, 0) => false,
+        (_, pid) => process_elevated(pid).unwrap_or(true),
+    }
 }
 
 pub fn refocus_raw(raw: isize) -> bool {

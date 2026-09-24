@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use wl_audio::CpalRecorder;
+use wl_audio::display::LevelBallistics;
 use wl_core::UtteranceId;
 use wl_core::cancel::CancelToken;
 use wl_core::config::{Config, GpuPolicy};
@@ -152,6 +153,7 @@ pub struct Driver {
     normalizer: String,
     observer: Option<Sender<Observed>>,
     last_level: Instant,
+    level: LevelBallistics,
 }
 
 pub struct DriverParts {
@@ -185,6 +187,7 @@ impl Driver {
             normalizer: "rules".into(),
             observer: p.observer,
             last_level: Instant::now(),
+            level: LevelBallistics::default(),
         }
     }
 
@@ -209,10 +212,10 @@ impl Driver {
                 break;
             }
             if self.pipeline.is_recording() && self.last_level.elapsed() >= LEVEL_PERIOD {
+                let dt = self.last_level.elapsed();
                 self.last_level = Instant::now();
-                self.notifier.set_state(CoreOverlay::Listening {
-                    level: self.recorder.level(),
-                });
+                let level = self.level.update(self.recorder.level(), dt);
+                self.notifier.set_state(CoreOverlay::Listening { level });
             }
             if let Some(h) = &self.hook {
                 h.set_escape_armed(self.pipeline.is_active());
@@ -466,11 +469,14 @@ impl Driver {
 
     fn execute(&mut self, fx: Effect) -> Option<Event> {
         match fx {
-            Effect::StartRecording(id) => self
-                .recorder
-                .start()
-                .err()
-                .map(|e| Event::Failed(id, Failure::Record(e))),
+            Effect::StartRecording(id) => {
+                self.level.reset();
+                self.last_level = Instant::now();
+                self.recorder
+                    .start()
+                    .err()
+                    .map(|e| Event::Failed(id, Failure::Record(e)))
+            }
             Effect::StopRecording(id) => match self.recorder.stop() {
                 Ok(rec) => {
                     if rec.dropped_frames > 0 || rec.device_lost {
