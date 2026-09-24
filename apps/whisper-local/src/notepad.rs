@@ -1,5 +1,3 @@
-//! A Notepad window as a simulation target, and reading its text back.
-
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -17,7 +15,6 @@ pub struct Notepad {
     pub file: PathBuf,
 }
 
-/// Opens Notepad on an empty scratch file and waits for its window.
 pub fn open() -> Result<Notepad> {
     let file = std::env::temp_dir().join(format!("wl-simulate-{}.txt", std::process::id()));
     std::fs::write(&file, "")?;
@@ -25,9 +22,8 @@ pub fn open() -> Result<Notepad> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // Not `Command`: it creates the child with handle inheritance on, so even with null
-    // stdio Notepad inherits our (inheritable) stdout pipe and keeps a piped caller
-    // waiting for as long as Notepad stays open. ShellExecute inherits nothing.
+    // Not `Command`: it enables handle inheritance, so Notepad inherits our stdout pipe
+    // and keeps a piped caller waiting until it closes. ShellExecute inherits nothing.
     let param: Vec<u16> = format!("\"{}\"", file.display())
         .encode_utf16()
         .chain([0])
@@ -92,8 +88,8 @@ fn find_window_titled(needle: &str) -> Option<HWND> {
     ctx.found
 }
 
-/// Text of every edit-like child of `top`. Works for both the classic and the Windows 11
-/// Notepad (whose editor is a RichEdit class) without UI Automation.
+/// Matching any class containing "edit" covers both classic Notepad and the Windows 11
+/// one (a RichEdit) without UI Automation.
 pub fn text(top: isize) -> Vec<String> {
     unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
         // SAFETY: `lp` is the &mut Vec passed below.

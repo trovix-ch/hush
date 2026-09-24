@@ -1,10 +1,6 @@
-//! Win32 integration. Everything that touches the OS lives here; the pipeline in `core`
-//! only sees the port traits this crate implements.
-//!
-//! Why not one crate-wide event loop: the hook, the clipboard owner and the UI each have
-//! a latency contract of their own (the hook is removed by Windows if it is slow, a paste
-//! blocks the target app until the render answers, the overlay must never stall input),
-//! so each lives on a thread whose only job is that contract.
+//! No crate-wide event loop: the hook is removed if it is slow, a paste blocks the target
+//! until the render answers, and the overlay must never stall input, so each of those
+//! lives on a thread whose only job is its own latency contract.
 
 #![cfg(windows)]
 

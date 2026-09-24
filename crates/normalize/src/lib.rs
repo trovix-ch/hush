@@ -1,5 +1,5 @@
-//! Normalizers implementing `wl_core::normalize::Normalizer`, plus the validation that
-//! gates every LLM output before it can be inserted.
+//! Normalizers, plus the validation that gates every LLM output before it can be
+//! inserted.
 
 pub mod chain;
 mod lang;

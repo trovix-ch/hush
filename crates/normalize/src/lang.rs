@@ -1,31 +1,24 @@
-//! Per-language word lists used by the rule pass, the validator and the LLM gate.
-//!
-//! Every list is deliberately short. A word belongs here only if removing or acting on it
-//! is almost never wrong; ambiguous discourse markers ("like", "so", German "also") are
-//! left for the LLM because deleting them from real content is worse than keeping them.
+//! Per-language word lists. A word belongs here only if acting on it is almost never
+//! wrong; ambiguous discourse markers ("like", "so", German "also") are left for the LLM.
 
 pub(crate) struct Table {
-    /// Single tokens that are never content.
     pub fillers: &'static [&'static str],
-    /// Multi-word fillers that are also ordinary phrases ("you know what I mean"), so they
-    /// are removed only when commas set them off.
+    /// Also ordinary phrases ("you know what I mean"), so removed only when commas set
+    /// them off.
     pub phrase_fillers: &'static [&'static [&'static str]],
     pub cues: &'static [Cue],
     pub commands: &'static [Command],
-    /// Words whose exact doubling is grammatical ("I know that that is true", German
-    /// "die die Zeitung"), or a number being dictated digit by digit.
+    /// Exact doubling is grammatical ("I know that that is true"), or a number is being
+    /// dictated digit by digit.
     pub stutter_keep: &'static [&'static str],
     /// A spoken-punctuation word after one of these is a noun ("the period of time").
     pub not_before_command: &'static [&'static str],
-    /// A spoken-punctuation word before one of these is a noun ("period of", "comma
-    /// separated").
+    /// A spoken-punctuation word before one of these is a noun ("comma separated").
     pub not_after_command: &'static [&'static str],
-    /// German capitalises every noun, so an upper-case next word is no evidence of a
-    /// sentence boundary there.
+    /// False for German, which capitalises every noun.
     pub capital_marks_sentence: bool,
-    /// When a filler sat between two commas, one of them may be grammatical ("It works,
-    /// um, but slowly"; German "Ich glaube, äh, das passt"). A following clause starter is
-    /// the cheap signal that the first comma was real.
+    /// After a filler between two commas, a following clause starter is the cheap signal
+    /// that the first comma was grammatical ("It works, um, but slowly").
     pub clause_starters: &'static [&'static str],
 }
 
@@ -39,10 +32,8 @@ pub(crate) enum CueKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CueDelimit {
-    /// A comma or sentence boundary before or after the cue is enough.
     Either,
-    /// Common in ordinary speech ("I actually like it"), so it must be set off on both
-    /// sides.
+    /// For cues common in ordinary speech ("I actually like it").
     Both,
 }
 
@@ -63,9 +54,8 @@ pub(crate) enum Action {
 pub(crate) struct Command {
     pub words: &'static [&'static str],
     pub action: Action,
-    /// "period" and "Punkt" are ordinary nouns far more often than commands, so they
-    /// need positive evidence of a sentence boundary, not merely the absence of a
-    /// determiner.
+    /// For words like "period" that are nouns far more often than commands: needs positive
+    /// evidence of a sentence boundary, not merely the absence of a determiner.
     pub strict: bool,
 }
 
@@ -96,7 +86,6 @@ pub(crate) static EN: Table = Table {
         cue(&["actually"], CueKind::Replace, CueDelimit::Both),
         cue(&["scratch", "that"], CueKind::Scratch, CueDelimit::Either),
     ],
-    // Longest phrases first so "exclamation point" is not read as something shorter.
     commands: &[
         cmd(&["new", "paragraph"], Action::Break("\n\n"), false),
         cmd(&["new", "line"], Action::Break("\n"), false),
@@ -324,8 +313,8 @@ pub(crate) static DE: Table = Table {
     ],
 };
 
-/// Unknown and missing languages use English: its fillers never collide with content
-/// words of the other supported languages.
+/// Unknown languages use English: its fillers never collide with content words of the
+/// other supported languages.
 pub(crate) fn table(lang: Option<&str>) -> &'static Table {
     match primary(lang).as_deref() {
         Some("de") => &DE,
@@ -333,7 +322,6 @@ pub(crate) fn table(lang: Option<&str>) -> &'static Table {
     }
 }
 
-/// Primary subtag of a BCP-47 tag, lower-cased: `de-AT` and `de_at` are both `de`.
 pub(crate) fn primary(lang: Option<&str>) -> Option<String> {
     let tag = lang?.split(['-', '_']).next()?.trim();
     (!tag.is_empty()).then(|| tag.to_ascii_lowercase())

@@ -1,5 +1,5 @@
-//! The last N utterances (D16), so "paste last" recovers text whose insertion failed even
-//! after a later dictation succeeded.
+//! The last N utterances, so "paste last" recovers text whose insertion failed even after
+//! a later dictation succeeded.
 
 use std::collections::VecDeque;
 
@@ -11,11 +11,9 @@ use crate::normalize::Provenance;
 pub struct HistoryEntry {
     pub id: UtteranceId,
     pub raw: String,
-    /// What was (or was to be) inserted.
     pub text: String,
     pub provenance: Provenance,
-    /// Target executable, so the next utterance only gets this one as context when it
-    /// goes to the same app.
+    /// The next utterance only gets this one as context when it goes to the same app.
     pub exe: Option<String>,
     /// `None` while insertion is in flight, or when it ended in an error.
     pub outcome: Option<InsertOutcome>,
@@ -54,7 +52,6 @@ impl History {
         self.entries.back()
     }
 
-    /// Oldest first.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &HistoryEntry> {
         self.entries.iter()
     }

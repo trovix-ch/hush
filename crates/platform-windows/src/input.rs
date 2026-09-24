@@ -1,20 +1,6 @@
-//! Synthetic input: releasing held modifiers, the paste chord, and Unicode typing (D8).
-//!
-//! Why every event carries `INJECTED_TAG`: our own hook would otherwise see the paste
-//! chord's Ctrl as the hotkey. Why each chord is a single `SendInput` batch: the OS
-//! never interleaves the user's physical keys into one batch, so a key the user presses
-//! mid-paste cannot land between our Ctrl-down and V. Why modifiers are released from
-//! `GetAsyncKeyState` rather than tracked: the user's physical Shift or Alt, still down
-//! from a shortcut, turns `v` into something else and only the async state knows about
-//! keys pressed before we started.
-//!
-//! Why typing is one UTF-16 unit per `SendInput` with a pause between calls, and not the
-//! single batch D8 first planned: measured in the typing spike, Win11 Notepad translates a
-//! queued `VK_PACKET` keystroke with the most recently injected character rather than the
-//! one it carried, so anything queued ahead of the target comes out as copies of the last
-//! character (the "everything after a space became 3" defect). Only one unit per call at
-//! 20-30 ms passed repeatedly; surrogate halves need separate calls too. Typing is
-//! therefore slow by construction and remains the fallback, never the primary path.
+//! Typing is one UTF-16 unit per `SendInput` with a pause, never one batch: Win11 Notepad
+//! translates a queued `VK_PACKET` with the most recently injected character, so a
+//! batched string comes out as copies of its last character.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,16 +19,28 @@ const VK_RETURN: u16 = 0x0D;
 const VK_INSERT: u16 = 0x2D;
 const VK_V: u16 = 0x56;
 const VK_LSHIFT: u16 = 0xA0;
+const VK_RSHIFT: u16 = 0xA1;
 const VK_LCONTROL: u16 = 0xA2;
+const VK_RCONTROL: u16 = 0xA3;
+const VK_LMENU: u16 = 0xA4;
+const VK_RMENU: u16 = 0xA5;
+const VK_LWIN: u16 = 0x5B;
+const VK_RWIN: u16 = 0x5C;
 
-/// Modifiers checked before any injection, left and right separately.
-const MODIFIERS: [u16; 8] = [0xA2, 0xA3, 0xA0, 0xA1, 0xA4, 0xA5, 0x5B, 0x5C];
+const MODIFIERS: [u16; 8] = [
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
+];
 
-/// Pause between typed units. The spike's passing range was 20-30 ms; 25 ms sits inside
-/// it with margin on both sides.
+/// Measured against Notepad, only 20-30 ms per unit passed repeatedly.
 pub const DEFAULT_UNIT_DELAY: Duration = Duration::from_millis(25);
 
-/// Paste chord. Which one an app needs is per-app configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chord {
     CtrlV,
@@ -52,27 +50,22 @@ pub enum Chord {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InputError {
-    /// `SendInput` inserted fewer events than asked. UIPI blocking (elevated target) and
-    /// a session without an input desktop (disconnected, locked) show up like this.
+    /// How UIPI (elevated target) and a locked or disconnected session show up.
     #[error("SendInput inserted {sent} of {expected} events")]
     Blocked { sent: u32, expected: u32 },
-    /// The foreground window changed while typing; the rest was not sent.
     #[error("focus moved after {typed} of {total} units were typed")]
     FocusLost { typed: usize, total: usize },
 }
 
-/// Result of a typing run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeReport {
-    /// `SendInput` calls made: one per UTF-16 unit or Return.
+    /// `SendInput` calls: one per UTF-16 unit or Return.
     pub steps: usize,
     pub elapsed: Duration,
 }
 
-/// Win32 implementation of the input port.
 #[derive(Debug, Clone)]
 pub struct WinInput {
-    /// Pause after each typed unit.
     pub unit_delay: Duration,
     last_chord: Arc<Mutex<Option<Instant>>>,
 }
@@ -91,14 +84,12 @@ impl WinInput {
         Self::default()
     }
 
-    /// When the last paste chord went into `SendInput`; render times are reported
-    /// relative to it.
     pub fn last_chord_at(&self) -> Option<Instant> {
         *self.last_chord.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Sends key-up for every modifier that is physically down. Returns the released
-    /// virtual keys.
+    /// Reads the async key state rather than tracking presses, because a modifier held
+    /// since before we started watching still turns `v` into something else.
     pub fn release_modifiers(&self) -> Result<Vec<u16>, InputError> {
         let held: Vec<u16> = MODIFIERS
             .iter()
@@ -119,9 +110,8 @@ impl WinInput {
         send_all(&events)
     }
 
-    /// Types `text` one unit at a time into whatever is foreground now, stopping if the
-    /// foreground changes. `\n` becomes Return and `\r` is dropped (so `\r\n` is one
-    /// Return). Blocks for about `unit_delay` per UTF-16 unit.
+    /// Stops if the foreground window changes. Blocks for about `unit_delay` per UTF-16
+    /// unit; `\n` becomes Return and `\r` is dropped.
     pub fn type_text(&self, text: &str) -> Result<TypeReport, InputError> {
         let steps = typing_steps(text);
         let start = Instant::now();
@@ -217,7 +207,7 @@ pub(crate) fn vk_event(vk: u16, up: bool) -> INPUT {
     }
     // Insert and the right-hand modifiers are extended keys; without the flag they
     // arrive as their numpad or left-hand twins.
-    if matches!(vk, 0x2D | 0xA3 | 0xA5 | 0x5B | 0x5C) {
+    if matches!(vk, VK_INSERT | VK_RCONTROL | VK_RMENU | VK_LWIN | VK_RWIN) {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
     // SAFETY: plain FFI lookup of the scan code for the active layout.
@@ -225,6 +215,7 @@ pub(crate) fn vk_event(vk: u16, up: bool) -> INPUT {
     kbd(vk, scan, flags)
 }
 
+/// Sent as one batch because the OS never interleaves physical keys into a batch.
 fn chord_events(chord: Chord) -> Vec<INPUT> {
     let (mods, key): (&[u16], u16) = match chord {
         Chord::CtrlV => (&[VK_LCONTROL], VK_V),
@@ -238,7 +229,6 @@ fn chord_events(chord: Chord) -> Vec<INPUT> {
     v
 }
 
-/// One `SendInput` call each: a down+up pair per UTF-16 unit, or a Return press.
 /// `\t` goes out as a Unicode unit, not as VK_TAB, which would move focus in a dialog.
 fn typing_steps(text: &str) -> Vec<[INPUT; 2]> {
     let mut steps = Vec::with_capacity(text.len());

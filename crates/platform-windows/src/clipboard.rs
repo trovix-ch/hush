@@ -1,20 +1,7 @@
-//! Clipboard owner: delayed-rendered paste with a read signal, snapshot and restore (D8).
-//!
-//! Why its own thread instead of the UI thread D10 sketched: a reader that asks for our
-//! delayed text is blocked inside `GetClipboardData` until our window answers
-//! `WM_RENDERFORMAT`, so the owner's message loop must never be busy; and a snapshot of
-//! a *foreign* clipboard makes that app render its own delayed data (an Excel range can
-//! take seconds), which must not freeze the overlay or tray. One dedicated thread with a
-//! message-only window does both jobs, serialises every clipboard operation, and keeps
-//! the render state thread-local.
-//!
-//! Why only `CF_UNICODETEXT` is offered: Windows synthesises `CF_TEXT`, `CF_OEMTEXT` and
-//! `CF_LOCALE` from it and still renders through us, and rich formats would carry
-//! styling into the target. Why a render is reported as "first reader" and nothing more:
-//! measured in the spike, Windows asks the owner exactly once per write; later readers
-//! get the cached copy silently. Why the restore re-checks the sequence number with the
-//! clipboard held open: a render does not advance it but a foreign write does, and the
-//! check must be atomic with the restore or a user's copy in between would be clobbered.
+//! The owner gets a thread of its own because a reader blocks inside `GetClipboardData`
+//! until we answer `WM_RENDERFORMAT`, and snapshotting a foreign clipboard can block for
+//! seconds while that app renders. Windows asks for a render once per write and serves
+//! later readers the cached copy silently, so a render identifies only the first reader.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -47,9 +34,8 @@ use crate::util::{exe_name_of_pid, hwnd_from, hwnd_raw, window_thread_pid};
 pub const CF_TEXT: u32 = 1;
 pub const CF_UNICODETEXT: u32 = 13;
 
-/// Formats never copied into a snapshot: GDI handles, metafile handles, owner-display
-/// and private handle ranges are not `HGLOBAL`s and cannot be byte-copied. Windows
-/// synthesises `CF_DIB` from a bitmap, so images survive through that.
+/// Not `HGLOBAL`s, so they cannot be byte-copied; images still survive through the
+/// `CF_DIB` Windows synthesises from a bitmap.
 fn is_handle_format(f: u32) -> bool {
     matches!(
         f,
@@ -59,7 +45,6 @@ fn is_handle_format(f: u32) -> bool {
     ) || (0x200..=0x3FF).contains(&f)
 }
 
-/// Default bound on what a snapshot copies.
 pub const DEFAULT_SNAPSHOT_CAP: usize = 32 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -75,7 +60,6 @@ pub enum ClipboardError {
     Win32(#[from] windows::core::Error),
 }
 
-/// One saved format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedFormat {
     pub format: u32,
@@ -83,11 +67,9 @@ pub struct SavedFormat {
     pub bytes: Vec<u8>,
 }
 
-/// Previous clipboard contents, bounded best-effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClipboardSnapshot {
     pub formats: Vec<SavedFormat>,
-    /// Formats present but not copied: handle formats, over the size cap, or unreadable.
     pub skipped: Vec<(u32, String)>,
     pub sequence: u32,
     pub truncated: bool,
@@ -98,7 +80,6 @@ impl ClipboardSnapshot {
         self.formats.is_empty()
     }
 
-    /// The saved Unicode text, if any.
     pub fn text(&self) -> Option<String> {
         let f = self.formats.iter().find(|f| f.format == CF_UNICODETEXT)?;
         let units: Vec<u16> = f
@@ -111,31 +92,28 @@ impl ClipboardSnapshot {
     }
 }
 
-/// What `write_delayed` put on the clipboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteReceipt {
-    /// Increments per write; render events carry it.
     pub generation: u64,
-    /// Sequence number right after our write closed.
     pub sequence: u32,
     pub written_at: Instant,
 }
 
-/// A render request: someone read our delayed text.
+/// Someone read our delayed text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderEvent {
     pub generation: u64,
     pub at: Instant,
     pub format: u32,
-    /// Window that has the clipboard open; `None` when the reader opened it with a NULL
-    /// window (Windows Terminal does).
+    /// `None` when the reader opened the clipboard with a NULL window (Windows Terminal
+    /// does).
     pub reader_hwnd: Option<isize>,
     pub reader_pid: Option<u32>,
     pub reader_exe: Option<String>,
 }
 
 impl RenderEvent {
-    /// Milliseconds from `chord_at` to this render; negative means before the chord.
+    /// Negative means the render came before the chord.
     pub fn offset_ms(&self, chord_at: Instant) -> f64 {
         if self.at >= chord_at {
             (self.at - chord_at).as_secs_f64() * 1000.0
@@ -155,11 +133,8 @@ pub enum Waited {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreOutcome {
     Restored,
-    /// Someone wrote to the clipboard after us; their content was left alone.
     SkippedChanged,
 }
-
-// ------------------------------------------------------------------ shared state
 
 #[derive(Default)]
 struct RenderLog {
@@ -171,7 +146,6 @@ struct RenderLog {
 struct Shared {
     log: Mutex<RenderLog>,
     cv: Condvar,
-    /// Sequence number right after our last write.
     our_sequence: AtomicU32,
 }
 
@@ -201,9 +175,8 @@ enum Command {
     Shutdown,
 }
 
-/// A restore waiting for its delay. A snapshot taken before it fires returns *its*
-/// snapshot: the clipboard still holds our previous dictation, and the user's real
-/// contents are the ones this restore would have put back.
+/// A snapshot taken before this fires must return this snapshot instead: the clipboard
+/// still holds our previous dictation, not the user's contents.
 struct Scheduled {
     snapshot: Box<ClipboardSnapshot>,
     if_sequence: u32,
@@ -213,7 +186,6 @@ const RESTORE_TIMER: usize = 0x5752;
 
 const WM_CB_COMMAND: u32 = WM_APP + 0x20;
 
-/// Handle to the clipboard owner thread. Cheap to clone.
 #[derive(Clone)]
 pub struct WinClipboard {
     inner: Arc<Inner>,
@@ -252,7 +224,6 @@ fn wake(hwnd: isize) {
 }
 
 impl WinClipboard {
-    /// Starts the owner thread and its message-only window.
     pub fn start() -> Result<Self, ClipboardError> {
         let shared = Arc::new(Shared {
             log: Mutex::new(RenderLog::default()),
@@ -294,13 +265,12 @@ impl WinClipboard {
             .map_err(|_| ClipboardError::Timeout(COMMAND_TIMEOUT))?
     }
 
-    /// Copies every byte-copyable format, up to `cap` bytes in total.
+    /// `cap` bounds the total bytes copied.
     pub fn snapshot(&self, cap: usize) -> Result<ClipboardSnapshot, ClipboardError> {
         self.call(|reply| Command::Snapshot { cap, reply })
     }
 
-    /// Puts `snapshot` back. With `expected_sequence`, restores only if nobody wrote
-    /// since (checked while holding the clipboard open).
+    /// With `expected_sequence`, restores only if nobody wrote since.
     pub fn restore(
         &self,
         snapshot: &ClipboardSnapshot,
@@ -314,22 +284,20 @@ impl WinClipboard {
         })
     }
 
-    /// Offers `text` as delayed-rendered `CF_UNICODETEXT`, marked so clipboard history
-    /// and cloud sync skip it. Render requests are recorded against the new generation.
+    /// Marked so clipboard history and cloud sync skip it.
     pub fn write_delayed(&self, text: &str) -> Result<WriteReceipt, ClipboardError> {
         let text = text.to_string();
         self.call(|reply| Command::WriteDelayed { text, reply })
     }
 
-    /// Leaves `text` on the clipboard for good (the last-resort path and "copy last").
     /// Returns the sequence number after the write.
     pub fn write_text(&self, text: &str) -> Result<u32, ClipboardError> {
         let text = text.to_string();
         self.call(|reply| Command::WriteEager { text, reply })
     }
 
-    /// Restores `snapshot` after `after` on the owner thread, only if the sequence number
-    /// is still `if_sequence` then. Returns immediately.
+    /// Returns immediately; the restore happens only if the sequence number is still
+    /// `if_sequence` by then.
     pub fn restore_later(&self, snapshot: ClipboardSnapshot, after: Duration, if_sequence: u32) {
         let tx = self.inner.tx.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = tx.as_ref() {
@@ -347,8 +315,7 @@ impl WinClipboard {
         unsafe { GetClipboardSequenceNumber() }
     }
 
-    /// Like [`Self::wait_for_render`], but also ends early when the sequence number moves
-    /// away from our last write (a foreign write replaced ours).
+    /// Also ends early when a foreign write replaces ours.
     pub fn wait_for_render_or_change(&self, timeout: Duration) -> Result<RenderEvent, Waited> {
         let deadline = Instant::now() + timeout;
         let ours = self.inner.shared.our_sequence.load(Ordering::Acquire);
@@ -367,7 +334,6 @@ impl WinClipboard {
         }
     }
 
-    /// Waits for the first render of the current write.
     pub fn wait_for_render(&self, timeout: Duration) -> Option<RenderEvent> {
         let deadline = Instant::now() + timeout;
         let mut log = self
@@ -394,13 +360,11 @@ impl WinClipboard {
         }
     }
 
-    /// First render of the current write, without waiting.
     pub fn first_render(&self) -> Option<RenderEvent> {
         self.wait_for_render(Duration::ZERO)
     }
 
-    /// Render requests seen for the current write. Windows sends one per write; more
-    /// only if something emptied and re-read, which would be worth knowing.
+    /// Windows sends one render per write; more means something emptied and re-read.
     pub fn render_count(&self) -> u32 {
         self.inner
             .shared
@@ -410,7 +374,6 @@ impl WinClipboard {
             .count
     }
 
-    /// Whether our window currently owns the clipboard.
     pub fn we_own(&self) -> bool {
         // SAFETY: plain FFI query.
         unsafe { GetClipboardOwner() }
@@ -418,13 +381,11 @@ impl WinClipboard {
             .is_some_and(|h| hwnd_raw(h) == self.inner.hwnd)
     }
 
-    /// Stops the owner thread. Unrendered text is rendered first so it is not lost.
+    /// Unrendered text is rendered first so it is not lost.
     pub fn shutdown(&self) {
         self.inner.shutdown();
     }
 }
-
-// ------------------------------------------------------------------ core port
 
 impl wl_core::insert::ClipboardPort for WinClipboard {
     type Snapshot = ClipboardSnapshot;
@@ -462,8 +423,6 @@ impl wl_core::insert::ClipboardPort for WinClipboard {
 fn clip_err(e: ClipboardError) -> InsertError {
     InsertError::Clipboard(e.to_string())
 }
-
-// ------------------------------------------------------------------ owner thread
 
 thread_local! {
     static PENDING: RefCell<Option<Arc<Vec<u16>>>> = const { RefCell::new(None) };
@@ -514,8 +473,8 @@ fn owner_thread(
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        // Commands run here, outside any window procedure, so the render handler can be
-        // re-entered by our own clipboard calls without a borrow conflict.
+        // Outside any window procedure, so our own clipboard calls can re-enter the render
+        // handler without a borrow conflict.
         while !quitting && let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Command::Snapshot { cap, reply } => {
@@ -572,12 +531,10 @@ fn owner_thread(
                 }
                 Command::Shutdown => {
                     quitting = true;
-                    // A pending restore would otherwise be lost with the process.
                     if let Some(s) = scheduled.take() {
                         run_scheduled(s);
                     }
-                    // SAFETY: destroying our own window on its thread; WM_RENDERALLFORMATS
-                    // arrives during this call if a delayed format is still pending.
+                    // SAFETY: our own window on its thread; WM_RENDERALLFORMATS arrives inside.
                     let _ = unsafe { DestroyWindow(hwnd) };
                 }
             }
@@ -587,8 +544,7 @@ fn owner_thread(
 }
 
 fn create_owner_window() -> windows::core::Result<HWND> {
-    // SAFETY: registers a class with a 'static window procedure and creates a
-    // message-only window owned by this thread.
+    // SAFETY: a 'static window procedure and a message-only window owned by this thread.
     unsafe {
         let inst = GetModuleHandleW(PCWSTR::null())?;
         let class = w!("wl-clipboard-owner");
@@ -648,8 +604,8 @@ unsafe extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     }
 }
 
-/// Answers a render request. The reader holds the clipboard open and is blocked until we
-/// return, so the data goes out first and the reader is identified afterwards.
+/// The reader is blocked until we return, so the data goes out before the reader is
+/// identified.
 fn render(format: u32) {
     let at = Instant::now();
     // SAFETY: plain FFI query; valid while the reader holds the clipboard open.
@@ -660,9 +616,7 @@ fn render(format: u32) {
         return;
     }
     if let Some(h) = hglobal_from(&utf16_bytes(&text)) {
-        // SAFETY: inside WM_RENDERFORMAT the reader has the clipboard open, which is the
-        // one case SetClipboardData may be called without our own OpenClipboard. On
-        // success the system owns the memory.
+        // SAFETY: WM_RENDERFORMAT permits this without our own open; success hands over `h`.
         if unsafe { SetClipboardData(format, Some(HANDLE(h.0))) }.is_err() {
             // SAFETY: the system did not take ownership, so we free it.
             let _ = unsafe { GlobalFree(Some(h)) };
@@ -721,7 +675,6 @@ fn hglobal_from(bytes: &[u8]) -> Option<HGLOBAL> {
     }
 }
 
-/// Opens the clipboard, retrying briefly while another process holds it.
 fn open_clipboard(hwnd: HWND) -> Result<ClipboardGuard, ClipboardError> {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
@@ -844,7 +797,7 @@ fn exclusion_formats() -> [u32; 3] {
     }
 }
 
-/// Sets eager data. Clipboard must be open and emptied by us.
+/// The clipboard must be open and emptied by us.
 fn set_eager(format: u32, bytes: &[u8]) -> Result<(), ClipboardError> {
     let h = hglobal_from(bytes).ok_or_else(windows::core::Error::from_thread)?;
     // SAFETY: the clipboard is open by us; on success the system owns `h`.
@@ -870,8 +823,9 @@ fn restore_now(
     expected_sequence: Option<u32>,
 ) -> Result<RestoreOutcome, ClipboardError> {
     let _open = open_clipboard(hwnd)?;
-    // SAFETY: plain FFI query while we hold the clipboard, so nobody can write between
-    // this check and the restore.
+    // Checked while we hold the clipboard, so a user's copy cannot land between the check
+    // and the restore. A render does not advance the number; a foreign write does.
+    // SAFETY: plain FFI query.
     let now = unsafe { GetClipboardSequenceNumber() };
     if expected_sequence.is_some_and(|s| s != now) {
         return Ok(RestoreOutcome::SkippedChanged);
@@ -916,9 +870,11 @@ fn write_delayed_now(
             count: 0,
         };
     }
-    // SAFETY: registering delayed rendering. It returns NULL by design, which the
-    // `windows` crate maps to an Err carrying a stale last-error (seen in the spike), so
-    // the result says nothing and is ignored; ownership is checked below instead.
+    // Only CF_UNICODETEXT: Windows synthesises the other text formats through our render,
+    // and rich formats would carry styling into the target. Delayed registration returns
+    // NULL by design, which `windows` maps to an Err with a stale last-error, so it is
+    // ignored.
+    // SAFETY: the clipboard is open and emptied by us.
     let _ = unsafe { SetClipboardData(CF_UNICODETEXT, None) };
     mark_excluded();
     drop(open);
@@ -953,7 +909,6 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    /// Clipboard tests share one global resource; run them one at a time.
     static SERIAL: StdMutex<()> = StdMutex::new(());
 
     fn read_text_as_other_reader() -> Option<String> {
@@ -1013,9 +968,7 @@ mod tests {
             .expect("render event");
         assert_eq!(ev.generation, receipt.generation);
         assert_eq!(ev.format, CF_UNICODETEXT);
-        // Rendering does not advance the sequence number.
         assert_eq!(cb.sequence_number(), receipt.sequence);
-        // A second read is served from the cache: no second render.
         assert_eq!(read_text_as_other_reader().as_deref(), Some("hello ✓ 😀"));
         assert!(cb.render_count() >= 1);
 
@@ -1067,12 +1020,9 @@ mod tests {
         let original = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
         cb.write_text("user text").unwrap();
 
-        // First dictation: snapshot, write, restore in 300 ms.
         let snap1 = ClipboardPort::snapshot(&mut cb).unwrap();
         let seq1 = ClipboardPort::write_delayed(&mut cb, "dictation one").unwrap();
         ClipboardPort::restore(&mut cb, snap1, Duration::from_millis(300), seq1);
-        // Second dictation before that fires: its snapshot must be the user's text,
-        // not dictation one.
         let snap2 = ClipboardPort::snapshot(&mut cb).unwrap();
         assert_eq!(snap2.text().as_deref(), Some("user text"));
         let seq2 = ClipboardPort::write_delayed(&mut cb, "dictation two").unwrap();
@@ -1090,7 +1040,6 @@ mod tests {
             cb.we_own()
         );
 
-        // A foreign write before the delay wins.
         let snap3 = ClipboardPort::snapshot(&mut cb).unwrap();
         let seq3 = ClipboardPort::write_delayed(&mut cb, "dictation three").unwrap();
         ClipboardPort::restore(&mut cb, snap3, Duration::from_millis(100), seq3);
@@ -1109,8 +1058,7 @@ mod tests {
         let cb = WinClipboard::start().expect("owner");
         let before = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
         cb.write_delayed("x").unwrap();
-        // In an RDP session rdpclip may already have rendered; only check the change
-        // path when nothing has read yet.
+        // Under RDP, rdpclip has usually rendered already.
         if cb.first_render().is_none() {
             let other = WinClipboard::start().expect("second owner");
             other.write_text("foreign").unwrap();

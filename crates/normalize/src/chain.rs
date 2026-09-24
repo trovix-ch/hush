@@ -17,8 +17,7 @@ pub struct NormalizerChain {
 }
 
 impl NormalizerChain {
-    /// `stages` are tried in order; the rule pass is appended implicitly and never needs
-    /// to be listed.
+    /// The rule pass is appended implicitly.
     pub fn new(stages: Vec<Box<dyn Normalizer>>) -> Self {
         Self {
             stages,
@@ -32,7 +31,7 @@ impl Normalizer for NormalizerChain {
         "chain"
     }
 
-    /// Warms every stage; one failing stage must not stop the others from loading.
+    /// One failing stage must not stop the others from loading.
     fn warm(&mut self) -> Result<(), NormalizeError> {
         let mut first_err = None;
         for s in &mut self.stages {
@@ -54,8 +53,8 @@ impl Normalizer for NormalizerChain {
                         out.elapsed = start.elapsed();
                         return Ok(out);
                     }
-                    // The user asked to stop; rule-pass text would go nowhere. A deadline
-                    // is different: it falls through, because the rule pass is instant.
+                    // Rule-pass text would go nowhere. A deadline falls through instead,
+                    // because the rule pass is instant.
                     Err(NormalizeError::Cancelled) => return Err(NormalizeError::Cancelled),
                     Err(e) => {
                         tracing::warn!(stage = s.id(), error = %e, "normalizer failed; falling back");
@@ -76,8 +75,6 @@ impl Normalizer for NormalizerChain {
     }
 }
 
-/// Whether an utterance is worth an LLM call. No for very short utterances, and no for
-/// text that is already a well-formed sentence with nothing a cleaner would remove.
 pub fn should_use_llm(transcript: &str) -> bool {
     let t = transcript.trim();
     if t.split_whitespace().count() <= MIN_WORDS_FOR_LLM {
@@ -127,7 +124,6 @@ mod tests {
         }
     }
 
-    /// Lets the test keep a handle on the call counter after the chain takes ownership.
     struct Stage(Arc<Fake>);
 
     impl Normalizer for Stage {
@@ -242,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_gate() {
+    fn llm_is_skipped_for_short_or_well_formed_text() {
         assert!(!should_use_llm("um yes"));
         assert!(!should_use_llm("uh okay sure thing"));
         assert!(!should_use_llm("This sentence is already perfectly fine."));

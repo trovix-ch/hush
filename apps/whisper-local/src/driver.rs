@@ -1,10 +1,5 @@
-//! The driver thread (D10): one channel in, `Pipeline::handle`, effects out.
-//!
-//! Hotkey, tray, timer and worker messages all arrive on one channel, so the state
-//! machine sees a single ordered stream and needs no locks. Effects that block for more
-//! than a few milliseconds go to a worker; recorder start/stop stay here because they are
-//! round trips to the audio thread measured in microseconds when warm and ~25 ms cold,
-//! and their order relative to the next hotkey event matters.
+//! Recorder start/stop run here rather than on a worker: they measured microseconds warm
+//! and ~25 ms cold, and their order relative to the next hotkey event matters.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -36,30 +31,26 @@ use crate::workers::{
     self, EngineLoader, InsertCmd, NormCmd, NormJob, SttJob, Timers, outcome_label,
 };
 
-/// Level meter refresh while recording (~20 Hz).
 const LEVEL_PERIOD: Duration = Duration::from_millis(50);
 
 pub enum Msg {
     Hotkey(HotkeyEvent),
     Tray(TrayEvent),
-    /// Worker results and timers, fed to the pipeline as they are.
     Event(Event),
-    /// The VAD found no speech; the engine was never called (D3, D17).
     NoSpeech(UtteranceId),
     EngineReady(std::result::Result<EngineSummary, String>),
-    /// `Ok(description)` once the LLM stage is warm, `Err(why)` when it stays rules-only.
+    /// `Err` means the app stays rules-only.
     NormalizerReady(std::result::Result<String, String>),
     PasteLastDone(std::result::Result<InsertOutcome, InsertError>),
-    /// A condition to show until replaced, e.g. a model download.
+    /// Shown until replaced, unlike a toast.
     Status(String),
     Quit,
 }
 
-/// What a simulation run watches for; the live app has no observer. Carries no ids
-/// because a simulation runs one utterance at a time.
+/// Carries no ids because a simulation runs one utterance at a time.
 #[derive(Debug, Clone)]
 pub enum Observed {
-    /// The hotkey-up that ended a recording was handled (the recording is stopped).
+    /// The recording is already stopped when this is sent.
     Released,
     Transcript {
         text: String,
@@ -72,7 +63,7 @@ pub enum Observed {
     Inserted {
         outcome: InsertOutcome,
     },
-    /// A normalizer failure is not the end: the pipeline retries rules-only.
+    /// Not terminal for a normalizer failure: the pipeline retries rules-only.
     Failed {
         stage: Stage,
         error: String,
@@ -90,7 +81,7 @@ pub struct Workers {
 }
 
 impl Workers {
-    /// Starts every worker. `load` runs on the speech worker before its first job.
+    /// `load` runs on the speech worker before its first job.
     pub fn spawn(
         config: &Config,
         ui: &UiHandle,
@@ -118,8 +109,7 @@ impl Workers {
     }
 }
 
-/// Starts the LLM stage in the background when the config asks for one. The app is
-/// rules-only until (and unless) it reports ready.
+/// The app is rules-only until (and unless) this reports ready.
 pub fn spawn_normalizer_upgrade(config: &Config, norm: Sender<NormCmd>, tx: Sender<Msg>) {
     let Some(http) = engines::http_config(&config.normalizer) else {
         let _ = tx.send(Msg::NormalizerReady(Err(
@@ -198,7 +188,6 @@ impl Driver {
         }
     }
 
-    /// Runs until Quit, then shuts everything it owns down in order.
     pub fn run(mut self) {
         loop {
             let msg = if self.pipeline.is_recording() {
@@ -251,7 +240,7 @@ impl Driver {
             Msg::NoSpeech(id) => {
                 tracing::info!(%id, "no speech detected; nothing to insert");
                 self.observe(Observed::NoSpeech);
-                // Escape removed the token: the user already moved on, say nothing.
+                // Escape removed the token; the user has moved on, so say nothing.
                 let live = self.tokens.contains_key(&id);
                 self.feed(Event::TranscriptReady(
                     id,
@@ -325,8 +314,8 @@ impl Driver {
     fn on_hotkey(&mut self, h: HotkeyEvent) {
         match h {
             HotkeyEvent::Down { at } => {
-                // Paused: the hook stays installed and still swallows the key, so the
-                // hold does nothing rather than typing a stray Ctrl into the target.
+                // The hook stays installed while paused so the key is still swallowed
+                // rather than typing a stray Ctrl into the target.
                 if self.paused {
                     return;
                 }
@@ -425,7 +414,7 @@ impl Driver {
                 );
                 self.engine = Some(s.short());
                 let message = match &s.fallback {
-                    // D13: a GPU product never silently becomes a CPU product.
+                    // A GPU product never silently becomes a CPU product.
                     Some(why) => {
                         tracing::warn!(reason = %why, "speech runs on the CPU");
                         OverlayState::Notice {
@@ -459,7 +448,6 @@ impl Driver {
             .set_tooltip(format!("whisper-local · {engine} · {}", self.normalizer));
     }
 
-    /// Feeds one event and every event its effects produce synchronously.
     fn feed(&mut self, ev: Event) {
         let mut queue = VecDeque::from([ev]);
         while let Some(ev) = queue.pop_front() {
@@ -476,7 +464,6 @@ impl Driver {
         self.tokens.entry(id).or_default().clone()
     }
 
-    /// Runs one effect. Returns the event it produced synchronously, if any.
     fn execute(&mut self, fx: Effect) -> Option<Event> {
         match fx {
             Effect::StartRecording(id) => self
@@ -503,8 +490,8 @@ impl Driver {
                 None
             }
             Effect::Transcribe { id, pcm } => {
-                // Utterances are processed in id order, one at a time: older tokens can
-                // never be needed again.
+                // Utterances are transcribed in id order, so older tokens are never needed
+                // again.
                 self.tokens.retain(|k, _| *k >= id);
                 let cancel = self.token(id);
                 self.workers
@@ -582,8 +569,7 @@ impl Driver {
         }
     }
 
-    /// D7 order: stop producing events (unhook), cancel in-flight work, stop workers,
-    /// release the microphone, then the UI.
+    /// The order is deliberate: unhook first so no new events arrive, the UI last.
     fn shutdown(self) {
         let Self {
             hook,
@@ -611,8 +597,8 @@ impl Driver {
         for j in joins {
             let _ = j.join();
         }
-        // A speech worker still loading (or downloading gigabytes) cannot be interrupted;
-        // waiting for it would make Quit hang, and process exit reclaims it anyway.
+        // A speech worker still loading or downloading cannot be interrupted; waiting for
+        // it would make Quit hang, and process exit reclaims it anyway.
         if engine.is_some() {
             let _ = stt_join.join();
         }
@@ -621,8 +607,6 @@ impl Driver {
         tracing::info!("shut down");
     }
 }
-
-// ------------------------------------------------------------------ the app
 
 pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
     let (config, created) = setup::load_config(&paths.config_file)?;
@@ -668,8 +652,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
 
     let (tx, rx) = mpsc::channel::<Msg>();
     {
-        // Ctrl+C in the console takes the same orderly path as tray -> Quit; the default
-        // handler would kill the process with the microphone and hook still open.
+        // The default handler would kill the process with the microphone and hook open.
         let tx = tx.clone();
         if let Err(e) = ctrlc::set_handler(move || {
             let _ = tx.send(Msg::Quit);
@@ -731,7 +714,6 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
     Ok(std::process::ExitCode::SUCCESS)
 }
 
-/// Moves messages from a platform receiver onto the driver channel.
 pub fn forward<T: Send + 'static>(
     rx: Receiver<T>,
     tx: Sender<Msg>,

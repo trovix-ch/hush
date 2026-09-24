@@ -130,7 +130,7 @@ fn median(v: &[Duration]) -> Duration {
     }
 }
 
-/// Builds the engine and returns it with lines describing the runtime.
+/// The lines describe the runtime that actually loaded.
 fn build_engine(
     args: &Args,
     backend: Backend,

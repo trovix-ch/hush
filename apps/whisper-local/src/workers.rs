@@ -1,9 +1,5 @@
-//! Blocking workers the driver hands effects to (D10): one thread per engine so a slow
-//! transcription never delays a normalization or an insertion, and none of them ever
-//! runs on the UI or hook threads.
-//!
-//! Every worker answers every job it accepts with exactly one message, and turns a panic
-//! into a `Failed` event: the pipeline would otherwise wait forever for a result.
+//! Every worker turns a panic into a `Failed` event; the pipeline would otherwise wait
+//! forever for a result.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -27,7 +23,6 @@ use wl_platform_windows::input::WinInput;
 use crate::driver::Msg;
 use crate::engines::EngineSummary;
 
-/// Padding kept around detected speech (D3).
 const VAD_PAD: Duration = Duration::from_millis(200);
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -41,8 +36,6 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> std::io::Result<JoinH
     std::thread::Builder::new().name(name.into()).spawn(f)
 }
 
-// ------------------------------------------------------------------ speech
-
 pub struct SttJob {
     pub id: UtteranceId,
     pub pcm: Vec<f32>,
@@ -52,8 +45,8 @@ pub struct SttJob {
 pub type EngineLoader =
     Box<dyn FnOnce() -> anyhow::Result<(Box<dyn SttEngine>, EngineSummary)> + Send>;
 
-/// Loads the engine first, then serves jobs. Jobs sent while it loads wait in the
-/// channel; the app is usable meanwhile, the first dictation just takes longer.
+/// Jobs sent while the engine loads wait in the channel, so the first dictation is only
+/// slower, not lost.
 pub fn spawn_stt(
     load: EngineLoader,
     out: Sender<Msg>,
@@ -130,8 +123,6 @@ pub fn spawn_stt(
     Ok((tx, join))
 }
 
-// ------------------------------------------------------------------ normalize
-
 pub struct NormJob {
     pub id: UtteranceId,
     pub transcript: String,
@@ -141,7 +132,6 @@ pub struct NormJob {
 
 pub enum NormCmd {
     Job(NormJob),
-    /// The LLM stage finished warming up; use it from the next job on.
     Upgrade(Box<dyn Normalizer>),
 }
 
@@ -184,8 +174,8 @@ pub fn spawn_normalizer(
                 Ok(Ok(o)) => Event::NormalizedReady(id, o),
                 Ok(Err(e)) => Event::Failed(id, Failure::Normalize(e)),
                 Err(p) => {
-                    // The pipeline retries rules-only, which never touches `full` again
-                    // for this utterance; drop it so the next one is not hit too.
+                    // The retry is rules-only anyway; dropping `full` spares the next
+                    // utterance.
                     full = None;
                     Event::Failed(
                         id,
@@ -201,8 +191,6 @@ pub fn spawn_normalizer(
     Ok((tx, join))
 }
 
-// ------------------------------------------------------------------ insert
-
 pub enum InsertCmd {
     Insert {
         id: UtteranceId,
@@ -210,12 +198,13 @@ pub enum InsertCmd {
         target: FocusContext,
         cancel: CancelToken,
     },
-    /// Tray "paste last": into whatever has focus once the tray menu has closed.
-    PasteLast { text: String },
+    PasteLast {
+        text: String,
+    },
 }
 
-/// The tray menu is a foreground window of ours until it closes; the chain refocuses
-/// the captured window only when the foreground is ours, so capture after it is gone.
+/// The tray menu stays our foreground window until it closes, so focus is captured only
+/// after it is gone.
 const PASTE_LAST_SETTLE: Duration = Duration::from_millis(250);
 
 pub fn spawn_inserter(
@@ -262,15 +251,13 @@ pub fn spawn_inserter(
     Ok((tx, join))
 }
 
-/// For logs: what an outcome means, without the text.
+/// Without the dictated text.
 pub fn outcome_label(o: &Result<InsertOutcome, InsertError>) -> String {
     match o {
         Ok(o) => format!("{o:?}"),
         Err(e) => format!("error: {e}"),
     }
 }
-
-// ------------------------------------------------------------------ timers
 
 struct Armed {
     at: Instant,
@@ -302,8 +289,7 @@ pub fn spawn_timers(out: Sender<Msg>) -> std::io::Result<(Timers, JoinHandle<()>
 }
 
 fn timer_loop(rx: &Receiver<Armed>, out: &Sender<Msg>) {
-    // A handful at most (one tap window, one maximum duration), so a sorted deque beats
-    // a heap for clarity.
+    // A handful at most, so a sorted deque beats a heap for clarity.
     let mut pending: VecDeque<Armed> = VecDeque::new();
     loop {
         let now = Instant::now();

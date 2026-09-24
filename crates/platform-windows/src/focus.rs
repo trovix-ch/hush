@@ -1,14 +1,5 @@
-//! Focus context at hotkey-down, and getting back to that window before inserting (D9).
-//!
-//! Why not UI Automation on the calling thread: UIA calls marshal into the target
-//! process and block for seconds on a hung app, so the password query runs on its own
-//! multithreaded-apartment worker and the caller waits at most `UIA_TIMEOUT`; a late
-//! answer is dropped. Why "cannot open the token" counts as elevated: the only processes
-//! a medium-integrity caller cannot query are the ones that would also ignore its input,
-//! so assuming the opposite would send keystrokes into the void. Why the
-//! `AttachThreadInput` dance is only a fallback: attaching input queues merges key state
-//! with another thread for the duration and has caused stuck-modifier bugs in prior
-//! art, so it is used only when a plain `SetForegroundWindow` was refused.
+//! UI Automation marshals into the target process and blocks for seconds on a hung app,
+//! so the password query runs on its own MTA worker and a late answer is dropped.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -33,33 +24,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::util::{exe_name_of_pid, hwnd_from, hwnd_raw, window_thread_pid};
 
-/// How long the password query may take before we give up and assume "not a password".
 pub const UIA_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// Everything captured about the foreground window at hotkey-down.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FocusSnapshot {
-    /// Raw HWND; zero when there was no foreground window (desktop switch, lock screen).
+    /// Zero when there was no foreground window (desktop switch, lock screen).
     pub hwnd: isize,
     pub thread_id: u32,
     pub pid: u32,
-    /// Lower-cased executable file name.
     pub exe: Option<String>,
     pub title: Option<String>,
-    /// Target runs elevated (or cannot be inspected) while we do not: the OS will drop
-    /// our input and hide its keys from our hook.
+    /// Target runs elevated (or cannot be inspected) while we do not: the OS drops our
+    /// input and hides its keys from our hook.
     pub elevated: bool,
     pub self_elevated: bool,
-    /// We are inside a Remote Desktop session (`SM_REMOTESESSION`).
     pub remote_session: bool,
-    /// The focused element reports `IsPassword`. False on UIA timeout or error.
+    /// False on UIA timeout or error.
     pub is_password: bool,
-    /// The UIA query did not answer in time; `is_password` is a guess.
     pub uia_timed_out: bool,
 }
 
 impl FocusSnapshot {
-    /// The platform-neutral view the pipeline carries around.
     pub fn to_core(&self) -> wl_core::context::FocusContext {
         wl_core::context::FocusContext {
             window: self.hwnd as usize,
@@ -71,7 +56,7 @@ impl FocusSnapshot {
     }
 }
 
-/// Focus capture and refocus. Cheap to clone; all clones share one UIA worker.
+/// All clones share one UIA worker.
 #[derive(Clone)]
 pub struct WinFocus {
     uia: Arc<UiaWorker>,
@@ -90,7 +75,7 @@ impl WinFocus {
         }
     }
 
-    /// Captures the foreground window. Never blocks longer than about `UIA_TIMEOUT`.
+    /// Never blocks longer than about `UIA_TIMEOUT`.
     pub fn capture(&self) -> FocusSnapshot {
         let mut snap = capture_without_uia();
         if snap.hwnd != 0 {
@@ -109,20 +94,17 @@ impl WinFocus {
         snap
     }
 
-    /// True when the foreground window is still the captured one.
     pub fn is_still(&self, target: &FocusSnapshot) -> bool {
         // SAFETY: plain FFI query.
         target.hwnd != 0 && hwnd_raw(unsafe { GetForegroundWindow() }) == target.hwnd
     }
 
-    /// Brings the captured window back to the foreground. Returns whether it is
-    /// foreground afterwards.
+    /// Returns whether the window is foreground afterwards.
     pub fn refocus(&self, target: &FocusSnapshot) -> bool {
         refocus_hwnd(target.hwnd)
     }
 }
 
-/// The part of the capture that needs no COM: handle, process, title, elevation.
 pub fn capture_without_uia() -> FocusSnapshot {
     // SAFETY: plain FFI query.
     let hwnd = unsafe { GetForegroundWindow() };
@@ -136,6 +118,7 @@ pub fn capture_without_uia() -> FocusSnapshot {
         };
     }
     let (thread_id, pid) = window_thread_pid(hwnd);
+    // The processes we cannot query are exactly the ones that would ignore our input.
     let target_elevated = process_elevated(pid).unwrap_or(true);
     FocusSnapshot {
         hwnd: hwnd_raw(hwnd),
@@ -164,8 +147,7 @@ fn window_title(hwnd: HWND) -> Option<String> {
     (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
 }
 
-/// `Some(elevated)` when the token could be read, `None` when the process or its token
-/// cannot be opened.
+/// `None` when the process or its token cannot be opened.
 pub fn process_elevated(pid: u32) -> Option<bool> {
     // SAFETY: plain FFI call; the handle is closed below.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
@@ -203,8 +185,6 @@ pub fn self_elevated() -> bool {
     *SELF.get_or_init(|| token_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false))
 }
 
-/// Whether the foreground window belongs to a process that would hide its input from
-/// our hook. Used by the hook watchdog so UIPI blindness is not mistaken for a dead hook.
 pub(crate) fn foreground_is_elevated_over_us() -> bool {
     if self_elevated() {
         return false;
@@ -218,7 +198,6 @@ pub(crate) fn foreground_is_elevated_over_us() -> bool {
     process_elevated(pid).unwrap_or(true)
 }
 
-/// [`WinFocus::refocus`] for a raw window handle.
 pub fn refocus_raw(raw: isize) -> bool {
     refocus_hwnd(raw)
 }
@@ -243,6 +222,8 @@ pub(crate) fn refocus_hwnd(raw: isize) -> bool {
         if SetForegroundWindow(target).as_bool() && GetForegroundWindow() == target {
             return true;
         }
+        // Only now: attaching input queues shares key state with the other thread and
+        // has caused stuck modifiers.
         let fg = GetForegroundWindow();
         let (fg_tid, _) = window_thread_pid(fg);
         let me = GetCurrentThreadId();
@@ -263,9 +244,8 @@ impl wl_core::insert::FocusPort for WinFocus {
         hwnd_raw(unsafe { GetForegroundWindow() }) as usize
     }
 
-    /// Refocuses only when nothing else took the foreground: no foreground window at
-    /// all, or one of ours (a tray menu, a message box). A window the user moved to is
-    /// never taken away from them.
+    /// Refocuses only when nothing or one of our own windows took the foreground; a
+    /// window the user moved to is never taken away from them.
     fn is_still(&mut self, target: &wl_core::context::FocusContext) -> bool {
         if target.window == 0 {
             return false;
@@ -282,8 +262,6 @@ impl wl_core::insert::FocusPort for WinFocus {
         is_remote_session()
     }
 }
-
-// ------------------------------------------------------------------ UIA worker
 
 struct UiaRequest {
     reply: SyncSender<bool>,
@@ -313,7 +291,6 @@ impl UiaWorker {
         }
     }
 
-    /// `None` on timeout or when a previous query is still stuck.
     fn is_password(&self, timeout: Duration) -> Option<bool> {
         if self.busy.load(Ordering::Acquire) {
             return None;
@@ -378,9 +355,9 @@ mod tests {
     }
 
     #[test]
-    fn unopenable_process_is_unknown() {
-        // PID 4 is the System process; a limited query token open is refused.
-        assert_eq!(process_elevated(4), None);
+    fn system_process_elevation_is_unknown() {
+        const SYSTEM_PID: u32 = 4;
+        assert_eq!(process_elevated(SYSTEM_PID), None);
     }
 
     #[test]

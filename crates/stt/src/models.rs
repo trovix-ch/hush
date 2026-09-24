@@ -1,7 +1,4 @@
-//! Model manifest and download.
-//!
-//! The manifest is compiled into the binary so the set of URLs the app may fetch is fixed
-//! at build time; nothing outside it is ever downloaded.
+//! The manifest is compiled in so the set of URLs the app may fetch is fixed at build time.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -14,9 +11,8 @@ use sha2::{Digest, Sha256};
 
 const MANIFEST_JSON: &str = include_str!("models.json");
 
-/// Suffix of a file that is still being downloaded. A file without it has passed the size
-/// and hash checks, so presence alone is trusted on later starts: re-hashing 2.4 GB on
-/// every launch would cost seconds of startup.
+/// A file without this suffix has passed the size and hash checks, so later starts trust
+/// presence and size alone: re-hashing 2.4 GB would cost seconds of startup.
 const PART_SUFFIX: &str = ".part";
 
 #[derive(Debug, thiserror::Error)]
@@ -59,26 +55,22 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> ModelError + '_ {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelFile {
-    /// File name inside the model directory.
     pub name: String,
     pub url: String,
-    /// Exact size in bytes.
     pub size: u64,
-    /// Lower-case hex SHA-256, when known.
     pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelManifest {
-    /// Stable id, also the directory name under the models root.
+    /// Also the directory name under the models root.
     pub id: String,
-    /// Which engine implementation can load these files.
     pub engine: String,
     pub description: String,
     /// SPDX identifier.
     pub license: String,
-    /// Text that must be shown to the user where the license requires attribution.
+    /// Must be shown to the user where the license requires attribution.
     pub attribution: String,
     pub files: Vec<ModelFile>,
 }
@@ -88,7 +80,6 @@ impl ModelManifest {
         self.files.iter().map(|f| f.size).sum()
     }
 
-    /// True when every file is present at its final name with the expected size.
     pub fn is_present(&self, dir: &Path) -> bool {
         self.files.iter().all(|f| {
             fs::metadata(dir.join(&f.name))
@@ -97,8 +88,7 @@ impl ModelManifest {
         })
     }
 
-    /// Path of the file an engine opens: the single file of a one-file model, or the
-    /// directory for multi-file models (ONNX encoder + joint + vocab).
+    /// The single file of a one-file model, or the directory of a multi-file one.
     pub fn load_path(&self, dir: &Path) -> PathBuf {
         match self.files.as_slice() {
             [only] => dir.join(&only.name),
@@ -107,7 +97,6 @@ impl ModelManifest {
     }
 }
 
-/// Id of the model a default build uses.
 pub const DEFAULT_MODEL_ID: &str = "parakeet-tdt-0.6b-v3-f16-gguf";
 
 #[derive(Deserialize)]
@@ -116,7 +105,6 @@ struct ManifestDoc {
     models: Vec<ModelManifest>,
 }
 
-/// Parse and validate a manifest document.
 pub fn parse_manifest(json: &str) -> Result<Vec<ModelManifest>, ModelError> {
     let doc: ManifestDoc =
         serde_json::from_str(json).map_err(|e| ModelError::Manifest(e.to_string()))?;
@@ -163,7 +151,6 @@ pub fn parse_manifest(json: &str) -> Result<Vec<ModelManifest>, ModelError> {
     Ok(doc.models)
 }
 
-/// A manifest file name must not escape the model directory.
 fn is_safe_file_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -172,7 +159,6 @@ fn is_safe_file_name(name: &str) -> bool {
         && !name.ends_with(PART_SUFFIX)
 }
 
-/// Every model this build knows about.
 pub fn manifest() -> &'static [ModelManifest] {
     static MODELS: OnceLock<Vec<ModelManifest>> = OnceLock::new();
     MODELS.get_or_init(|| parse_manifest(MANIFEST_JSON).expect("embedded manifest is valid"))
@@ -185,16 +171,14 @@ pub fn find(id: &str) -> Result<&'static ModelManifest, ModelError> {
         .ok_or_else(|| ModelError::UnknownModel(id.to_string()))
 }
 
-/// `%LOCALAPPDATA%\whisper-local\models` on Windows. Local, not Roaming: these are
-/// gigabytes and must never sync with a roaming profile.
+/// Local, not Roaming: these are gigabytes and must never sync with a roaming profile.
 pub fn default_models_root() -> Result<PathBuf, ModelError> {
     let dirs =
         directories::ProjectDirs::from("", "", "whisper-local").ok_or(ModelError::NoDataDir)?;
     Ok(models_root_from_data_local(dirs.data_local_dir()))
 }
 
-/// `ProjectDirs` appends a `data` component on Windows only; strip it so the models sit
-/// beside the app's other folders rather than inside `data`.
+/// `ProjectDirs` appends a `data` component on Windows only.
 fn models_root_from_data_local(data_local: &Path) -> PathBuf {
     let base = if cfg!(windows) && data_local.file_name().is_some_and(|n| n == "data") {
         data_local.parent().unwrap_or(data_local)
@@ -208,8 +192,7 @@ pub fn default_model_dir(model_id: &str) -> Result<PathBuf, ModelError> {
     Ok(default_models_root()?.join(model_id))
 }
 
-/// Download every missing file of `model` into `dir`, resuming partial downloads, and
-/// verify size and hash. Blocking. Returns immediately when everything is present.
+/// Blocking; resumes partial downloads.
 pub fn ensure_downloaded(model: &ModelManifest, dir: &Path) -> Result<(), ModelError> {
     fs::create_dir_all(dir).map_err(io_err(dir))?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -255,8 +238,7 @@ fn download_file(agent: &ureq::Agent, file: &ModelFile, dest: &Path) -> Result<(
         let status = resp.status().as_u16();
         let append = match status {
             206 => true,
-            // A server that ignores Range sends the whole body; start over rather than
-            // appending a second copy.
+            // A server that ignores Range sends the whole body.
             200 => false,
             s => return Err(http_err(format!("unexpected HTTP status {s}"))),
         };
@@ -337,7 +319,7 @@ fn copy_with_progress(
     Ok(())
 }
 
-/// Lower-case hex SHA-256 of a file.
+/// Lower-case hex.
 pub fn sha256_file(path: &Path) -> Result<String, ModelError> {
     let mut f = File::open(path).map_err(io_err(path))?;
     let mut hasher = Sha256::new();

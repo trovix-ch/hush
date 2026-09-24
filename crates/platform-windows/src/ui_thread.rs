@@ -1,13 +1,6 @@
-//! The UI thread (D10): overlay pill and tray on one message loop, plus the process-wide
-//! bits that belong next to them: single-instance guard, app paths, opening files.
-//!
-//! Why commands go through a channel and a posted wake-up, drained inside a window
-//! procedure: posting a boxed pointer per message leaks when the window is gone, and
-//! draining in the window procedure (not in our own loop) keeps commands flowing while a
-//! tray menu runs its modal loop. Why the clipboard owner is started here but runs on its
-//! own thread: see the clipboard module; the UI loop must never be what a paste waits
-//! on. Why a named mutex in `Local\`: one instance per session is the contract (a second
-//! hook would double every hotkey), while another user's session may run its own.
+//! Commands travel on a channel and are drained inside the window procedure: a boxed
+//! pointer per posted message leaks once the window is gone, and draining in our own loop
+//! would stall while a tray menu runs its modal loop.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -32,6 +25,8 @@ use crate::overlay::{Overlay, OverlayConfig, OverlayState};
 use crate::tray::{Tray, TrayEvent};
 use crate::util::{hwnd_from, hwnd_raw, wide};
 
+/// Per session: a second hook in one session would double every hotkey, but another
+/// user's session may run its own instance.
 pub const INSTANCE_MUTEX: &str = r"Local\whisper-local";
 const APP_DIR: &str = "whisper-local";
 
@@ -47,13 +42,9 @@ pub enum UiError {
     Win32(#[from] windows::core::Error),
 }
 
-// ------------------------------------------------------------------ single instance
-
-/// Held for the life of the process; dropping it lets a new instance start.
 pub struct InstanceGuard(HANDLE);
 
-// SAFETY: a mutex handle is a process-wide kernel object reference, usable from any
-// thread; we only close it.
+// SAFETY: a mutex handle is a process-wide kernel object reference usable from any thread.
 unsafe impl Send for InstanceGuard {}
 
 impl Drop for InstanceGuard {
@@ -66,11 +57,9 @@ impl Drop for InstanceGuard {
     }
 }
 
-/// Claims the named mutex `name`, or reports that another instance holds it.
 pub fn acquire_single_instance(name: &str) -> Result<InstanceGuard, UiError> {
     let wname = wide(name);
-    // SAFETY: `wname` is NUL-terminated and outlives the call; the handle is owned by
-    // the guard or closed here.
+    // SAFETY: `wname` outlives the call; the handle is closed here or owned by the guard.
     unsafe {
         let h = CreateMutexW(None, true, PCWSTR(wname.as_ptr()))?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -81,18 +70,12 @@ pub fn acquire_single_instance(name: &str) -> Result<InstanceGuard, UiError> {
     }
 }
 
-// ------------------------------------------------------------------ paths
-
-/// Where the app keeps its files. Config roams; models and history do not (D11).
+/// Config roams; models and history do not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
-    /// `%APPDATA%\whisper-local`
     pub config_dir: PathBuf,
-    /// `%APPDATA%\whisper-local\config.toml`
     pub config_file: PathBuf,
-    /// `%LOCALAPPDATA%\whisper-local`
     pub data_dir: PathBuf,
-    /// `%LOCALAPPDATA%\whisper-local\models`
     pub models_dir: PathBuf,
 }
 
@@ -114,8 +97,7 @@ impl AppPaths {
     }
 }
 
-/// Opens a file with its associated program, falling back to Notepad for files without
-/// an association (a fresh machine has none for `.toml`).
+/// Falls back to Notepad because a fresh machine has no association for `.toml`.
 pub fn open_path(path: &Path) -> std::io::Result<()> {
     let file = wide(&path.to_string_lossy());
     // SAFETY: NUL-terminated buffers that outlive the call.
@@ -138,8 +120,6 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-// ------------------------------------------------------------------ UI thread
-
 enum UiCommand {
     Overlay(OverlayState),
     Paused(bool),
@@ -153,11 +133,9 @@ const WM_UI_WAKE: u32 = WM_APP + 0x40;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UiOptions {
     pub overlay: OverlayConfig,
-    /// Build the tray icon. Off in tests that must not touch the notification area.
     pub tray: bool,
 }
 
-/// Send-able handle to the UI thread.
 #[derive(Clone)]
 pub struct UiHandle {
     inner: Arc<UiInner>,
@@ -171,8 +149,6 @@ struct UiInner {
 }
 
 impl UiHandle {
-    /// Starts the UI thread and the clipboard owner. Tray menu clicks arrive on the
-    /// returned receiver.
     pub fn start(options: UiOptions) -> Result<(Self, Receiver<TrayEvent>), UiError> {
         let clipboard = WinClipboard::start()?;
         let (tx, rx) = mpsc::channel();
@@ -221,8 +197,7 @@ impl UiHandle {
         self.post(UiCommand::Paused(paused));
     }
 
-    /// Tray tooltip, e.g. which backend the speech engine loaded on. " (paused)" is
-    /// appended while paused.
+    /// " (paused)" is appended while paused.
     pub fn set_tooltip(&self, text: impl Into<String>) {
         self.post(UiCommand::Tooltip(text.into()));
     }
@@ -235,7 +210,6 @@ impl UiHandle {
         &self.inner.clipboard
     }
 
-    /// Tears down tray and overlay, stops the clipboard owner and joins both threads.
     pub fn shutdown(&self) {
         self.post(UiCommand::Shutdown);
         let join = self
@@ -251,7 +225,7 @@ impl UiHandle {
     }
 }
 
-/// Core's `Notifier` over the UI thread: every call posts or plays asynchronously.
+/// Every call returns without waiting.
 pub struct WinNotifier {
     ui: UiHandle,
 }
@@ -360,8 +334,7 @@ fn ui_thread(
 }
 
 fn create_control_window() -> windows::core::Result<HWND> {
-    // SAFETY: registers a class with a 'static procedure and creates a message-only
-    // window owned by this thread.
+    // SAFETY: a 'static window procedure and a message-only window owned by this thread.
     unsafe {
         let inst = GetModuleHandleW(PCWSTR::null())?;
         let class = w!("wl-ui-control");

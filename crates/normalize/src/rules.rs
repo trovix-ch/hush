@@ -1,9 +1,5 @@
-//! Deterministic, zero-latency cleanup. Always available, and the fallback for every
-//! other normalizer.
-//!
-//! Every rule here must be safe to apply without understanding the sentence, so each one
-//! demands positive evidence before it fires and otherwise leaves the text alone. A
-//! missed filler costs the user a keystroke; a deleted content word costs them trust.
+//! Deterministic cleanup. Every rule demands positive evidence before it fires: a missed
+//! filler costs the user a keystroke, a deleted content word costs them trust.
 
 use std::time::Instant;
 
@@ -13,7 +9,6 @@ use wl_core::normalize::{
 
 use crate::lang::{self, Action, CueDelimit, CueKind, Table};
 
-/// Correction cues never reach back further than this many words.
 const MAX_CORRECTION_WINDOW: usize = 6;
 const FUZZY_MIN_CHARS: usize = 5;
 const FUZZY_MIN_SIMILARITY: f64 = 0.92;
@@ -39,8 +34,8 @@ impl Normalizer for RuleNormalizer {
         "rules"
     }
 
-    /// Ignores cancellation and deadlines: it takes microseconds, and it is the fallback
-    /// that must still produce text when everything else ran out of time.
+    /// Ignores cancellation and deadlines: it is the fallback that must still produce text
+    /// when everything else ran out of time.
     fn normalize(&mut self, req: &NormalizeRequest<'_>) -> Result<NormalizeOutput, NormalizeError> {
         let start = Instant::now();
         let text = self.clean_request(req);
@@ -53,9 +48,8 @@ impl Normalizer for RuleNormalizer {
     }
 }
 
-/// Runs the whole rule pass. `Style::Code` and `Style::None` get only filler removal,
-/// explicit corrections and the dictionary: in a terminal "period" may be an argument
-/// and capitalisation breaks commands.
+/// Non-prose styles skip stutters, spoken commands and casing: in a terminal "period" may
+/// be an argument and capitalisation breaks commands.
 pub fn clean(
     transcript: &str,
     language: Option<&str>,
@@ -76,9 +70,8 @@ pub fn clean(
     join(&toks)
 }
 
-/// True when the text contains something only a cleaner would remove: a filler, a
-/// stutter, a correction cue, or a spoken command. Checks every supported language,
-/// because the STT's language guess is not reliable on short utterances.
+/// Checks every supported language, because the STT's language guess is not reliable on
+/// short utterances.
 pub(crate) fn has_disfluency(text: &str) -> bool {
     let toks = tokenize(text);
     let tables = [&lang::EN, &lang::DE];
@@ -146,8 +139,8 @@ const ABBREVIATIONS: &[&str] = &[
     "mr", "mrs", "ms", "dr", "st", "vs", "etc", "approx", "bzw", "usw", "ca", "nr",
 ];
 
-/// Splits a token into leading punctuation, core, and trailing punctuation. Only
-/// sentence punctuation is stripped, so "C++", "C#" and "node.js" keep their shape.
+/// (leading punctuation, core, trailing punctuation). Only sentence punctuation is
+/// stripped, so "C++", "C#" and "node.js" keep their shape.
 fn parts(s: &str) -> (&str, &str, &str) {
     let rest = s.trim_start_matches(LEAD);
     let lead = &s[..s.len() - rest.len()];
@@ -233,9 +226,8 @@ fn starts_sentence(toks: &[Tok], i: usize) -> bool {
         }
 }
 
-/// Matches `words` at `i` by key. Inner tokens must carry no punctuation, so "new,
-/// line" is two thoughts rather than one command; `inner_commas` relaxes that for cues,
-/// which recognisers write as "no, wait,".
+/// Inner tokens must carry no punctuation, so "new, line" is two thoughts rather than one
+/// command; `inner_commas` relaxes that for cues, which recognisers write as "no, wait,".
 fn matches_words(toks: &[Tok], i: usize, words: &[&str], inner_commas: bool) -> bool {
     if i + words.len() > toks.len() {
         return false;
@@ -252,8 +244,8 @@ fn matches_words(toks: &[Tok], i: usize, words: &[&str], inner_commas: bool) -> 
     })
 }
 
-/// Deletes `n` tokens at `at`, moving the punctuation they carried onto the neighbours
-/// so a sentence end or a quote is never lost with the filler.
+/// Moves the punctuation the removed tokens carried onto the neighbours, so a sentence
+/// end or a quote is never lost with the filler.
 fn remove_span(toks: &mut Vec<Tok>, at: usize, n: usize, table: &Table) {
     let first = toks[at].text().unwrap_or_default().to_owned();
     let last = toks[at + n - 1].text().unwrap_or_default().to_owned();
@@ -310,8 +302,6 @@ fn remove_fillers(toks: &mut Vec<Tok>, table: &Table) {
     }
 }
 
-/// "You know" is a filler only when set off by commas; unpunctuated it is usually
-/// content ("you know the answer").
 fn phrase_filler_at(toks: &[Tok], i: usize, table: &Table) -> Option<usize> {
     table.phrase_fillers.iter().find_map(|p| {
         let n = p.len();
@@ -453,9 +443,8 @@ fn apply_corrections(toks: &mut Vec<Tok>, table: &Table) {
     }
 }
 
-/// Returns the token range to delete for the cue at `j`: the part being corrected plus
-/// the cue itself. `None` whenever the evidence is thin; the LLM or the user can still
-/// fix what the rules leave.
+/// The corrected part plus the cue. `None` whenever the evidence is thin; the LLM or the
+/// user can still fix what the rules leave.
 fn correction_span(toks: &[Tok], j: usize, cue: &lang::Cue) -> Option<(usize, usize)> {
     let n = cue.words.len();
     let before = toks.get(j.checked_sub(1)?)?.text()?;
@@ -469,7 +458,6 @@ fn correction_span(toks: &[Tok], j: usize, cue: &lang::Cue) -> Option<(usize, us
         return None;
     }
 
-    // The corrected part: back to the previous clause punctuation, at most N words.
     let mut ws = j - 1;
     while ws > 0 && j - ws < MAX_CORRECTION_WINDOW {
         match toks[ws - 1].text() {
@@ -504,9 +492,8 @@ fn correction_span(toks: &[Tok], j: usize, cue: &lang::Cue) -> Option<(usize, us
             {
                 return Some((a, r));
             }
-            // "Tuesday, no wait, Wednesday" and "eggs, I mean, flour": a like-for-like
-            // swap of one word. Longer repairs without an anchor are ambiguous about how
-            // much they replace, so they are left alone.
+            // A like-for-like one-word swap ("eggs, I mean, flour"). Longer unanchored
+            // repairs are ambiguous about how much they replace.
             if same_kind(before, repair_first) || repair_len == 1 {
                 return Some((j - 1, r));
             }
@@ -570,8 +557,7 @@ fn apply_vocabulary(toks: &mut Vec<Tok>, vocabulary: &[String]) {
     }
 }
 
-/// Upper-cases the first letter of an all-lower-case word. Mixed-case words ("iPhone",
-/// "eBay") are identifiers and keep their spelling.
+/// Mixed-case words ("iPhone", "eBay") are identifiers and keep their spelling.
 fn capitalize_first(w: &mut String) {
     let core = parts(w).1;
     if core.chars().any(char::is_uppercase) {
@@ -649,8 +635,6 @@ mod tests {
         clean(s, Some("en"), Style::Formal, &v)
     }
 
-    // Whitespace
-
     #[test]
     fn whitespace_is_collapsed_and_spaced_punctuation_reattached() {
         assert_eq!(code("  hello   world ,  again \t"), "hello world, again");
@@ -661,8 +645,6 @@ mod tests {
         assert_eq!(formal(""), "");
         assert_eq!(formal("   "), "");
     }
-
-    // Stutters
 
     #[test]
     fn stutters_collapse() {
@@ -693,8 +675,6 @@ mod tests {
     fn stutters_are_left_alone_in_code() {
         assert_eq!(code("echo the the"), "echo the the");
     }
-
-    // Fillers
 
     #[test]
     fn standalone_fillers_are_removed() {
@@ -773,8 +753,6 @@ mod tests {
     fn fillers_are_removed_in_code_style() {
         assert_eq!(code("Um, git status"), "git status");
     }
-
-    // Spoken commands
 
     #[test]
     fn spoken_punctuation_and_layout() {
@@ -868,8 +846,6 @@ mod tests {
         );
     }
 
-    // Corrections
-
     #[test]
     fn like_for_like_correction() {
         assert_eq!(
@@ -945,8 +921,6 @@ mod tests {
         );
     }
 
-    // Vocabulary
-
     #[test]
     fn vocabulary_exact_match_is_case_insensitive() {
         let v = vec!["Kubernetes".to_string(), "gRPC".to_string()];
@@ -1005,8 +979,6 @@ mod tests {
         );
     }
 
-    // Style
-
     #[test]
     fn formal_adds_terminal_period_and_capitalises() {
         assert_eq!(formal("hello there"), "Hello there.");
@@ -1040,8 +1012,6 @@ mod tests {
     fn unknown_language_uses_english_tables() {
         assert_eq!(clean("um hello", Some("fr"), Style::Formal, &[]), "Hello.");
     }
-
-    // Disfluency detection
 
     #[test]
     fn disfluency_detection() {

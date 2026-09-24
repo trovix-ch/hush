@@ -1,62 +1,46 @@
-//! Voice activity detection on the 16 kHz stream.
-//!
-//! [`EnergyVad`] is the always-available baseline. A neural detector (Silero) is the
-//! intended default once ONNX Runtime is in the build; it is deliberately not here,
-//! because this crate must not pull a second native runtime into default builds. It
-//! plugs in by implementing [`Vad`]:
-//!
-//! - it lives next to whichever engine already links ONNX Runtime, behind the same
-//!   non-default feature, so the single-runtime rule holds;
-//! - Silero consumes fixed 512-sample windows at 16 kHz, while [`Vad::push`] takes any
-//!   length, so the implementation buffers the remainder between calls;
-//! - it keeps its recurrent state across `push` calls and clears it in [`Vad::reset`];
-//! - it reports times with the same origin as here: samples since the last reset.
-//!
-//! [`trim_silence`] and [`has_speech`] work on the event list alone, so they do not care
-//! which detector produced it.
+//! A neural detector is deliberately not in this crate: it must not pull a second native
+//! runtime into default builds.
 
 use std::time::Duration;
 
 use wl_core::stt::SAMPLE_RATE;
 
+/// Offsets count from the first sample pushed since the last reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VadEvent {
-    /// Speech begins at this offset from the first sample pushed since the last reset.
-    SpeechStart { at: Duration },
-    /// Speech ended at this offset (end of the last speech frame, before hangover).
-    SpeechEnd { at: Duration },
+    SpeechStart {
+        at: Duration,
+    },
+    /// End of the last speech frame, before hangover.
+    SpeechEnd {
+        at: Duration,
+    },
 }
 
 pub trait Vad: Send {
-    /// Feed 16 kHz mono samples; returns boundaries that became certain during this call.
-    /// A start is reported only after enough speech to confirm it, and an end only after
-    /// the hangover, so events lag the audio but their `at` is exact.
+    /// Returns boundaries that became certain during this call: events lag the audio by
+    /// the confirmation time or hangover, but their `at` is exact.
     fn push(&mut self, pcm16k: &[f32]) -> Vec<VadEvent>;
-    /// Forget all state; the next sample pushed is time zero.
     fn reset(&mut self);
 }
 
-/// Tuning for [`EnergyVad`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnergyVadConfig {
-    /// Analysis frame length.
     pub frame: Duration,
-    /// Speech threshold as a multiple of the tracked noise floor RMS.
+    /// Multiple of the tracked noise-floor RMS.
     pub ratio: f32,
-    /// Absolute RMS below which nothing counts as speech, whatever the floor: a
-    /// digitally silent input would otherwise make the ratio trigger on dither.
+    /// Without it a digitally silent input would make the ratio trigger on dither.
     pub min_rms: f32,
-    /// Speech needed above threshold before a start is declared. Rejects clicks and
-    /// keyboard taps.
+    /// Rejects clicks and keyboard taps.
     pub min_speech: Duration,
-    /// Silence needed before an end is declared. Short enough to split sentences for
-    /// segment pre-transcription, long enough not to split words at plosive closures.
+    /// Short enough to split sentences for segment pre-transcription, long enough not to
+    /// split words at plosive closures.
     pub hangover: Duration,
-    /// Per-frame fraction by which the floor rises towards a louder non-speech frame.
-    /// Falling is immediate, so a quiet room is learned at once; rising is slow, so a
-    /// long utterance is not learned as noise.
+    /// The floor falls at once but rises by this fraction per frame, so a long utterance
+    /// is not learned as noise.
     pub floor_rise: f32,
-    /// Upper bound on the floor learned from the very first frame.
+    /// Caps the first learned floor so a take that opens mid-word (cold start, no
+    /// pre-roll) does not learn speech as noise.
     pub max_initial_floor: f32,
 }
 
@@ -74,7 +58,6 @@ impl Default for EnergyVadConfig {
     }
 }
 
-/// Adaptive-threshold RMS detector with hangover.
 #[derive(Debug, Clone)]
 pub struct EnergyVad {
     cfg: EnergyVadConfig,
@@ -85,11 +68,9 @@ pub struct EnergyVad {
     frames_seen: usize,
     floor: Option<f32>,
     in_speech: bool,
-    /// Consecutive loud frames while not in speech, and where they began.
-    run: usize,
-    run_start: usize,
-    /// Consecutive quiet frames while in speech, and the frame after the last loud one.
-    quiet: usize,
+    loud_run: usize,
+    loud_run_start: usize,
+    quiet_run: usize,
     last_loud_end: usize,
 }
 
@@ -112,15 +93,14 @@ impl EnergyVad {
             frames_seen: 0,
             floor: None,
             in_speech: false,
-            run: 0,
-            run_start: 0,
-            quiet: 0,
+            loud_run: 0,
+            loud_run_start: 0,
+            quiet_run: 0,
             last_loud_end: 0,
         }
     }
 
-    /// Close an open segment at the end of input. Not part of [`Vad`] because
-    /// [`trim_silence`] already treats an unmatched start as running to the end.
+    /// Not on [`Vad`] because an unmatched start already runs to the end of the take.
     pub fn finish(&mut self) -> Vec<VadEvent> {
         if self.in_speech {
             self.in_speech = false;
@@ -143,26 +123,23 @@ impl EnergyVad {
     fn frame(&mut self, rms: f32, out: &mut Vec<VadEvent>) {
         let idx = self.frames_seen;
         self.frames_seen += 1;
-        // Digital silence (a stream's first buffers, dropouts on virtual devices) says
-        // nothing about the room. Learning it as the floor would pin the threshold to
-        // `min_rms` and make ordinary background noise read as speech, observed live on
-        // an RDP-redirected microphone.
+        // Learning digital silence (first buffers, virtual-device dropouts) as the floor
+        // pins the threshold to `min_rms`; observed on an RDP microphone as noise read as
+        // speech.
         let digital_silence = rms < DIGITAL_SILENCE;
         if self.floor.is_none() && !digital_silence {
-            // The first real frame seeds the floor, capped so that a recording which opens
-            // mid-word (cold start, no pre-roll) does not learn speech as the noise floor.
             self.floor = Some(rms.min(self.cfg.max_initial_floor));
         }
         let loud = rms > self.threshold();
         if self.in_speech {
             if loud {
-                self.quiet = 0;
+                self.quiet_run = 0;
                 self.last_loud_end = idx + 1;
             } else {
-                self.quiet += 1;
-                if self.quiet >= self.hangover_frames {
+                self.quiet_run += 1;
+                if self.quiet_run >= self.hangover_frames {
                     self.in_speech = false;
-                    self.quiet = 0;
+                    self.quiet_run = 0;
                     out.push(VadEvent::SpeechEnd {
                         at: self.at(self.last_loud_end),
                     });
@@ -171,22 +148,22 @@ impl EnergyVad {
             return;
         }
         if loud {
-            if self.run == 0 {
-                self.run_start = idx;
+            if self.loud_run == 0 {
+                self.loud_run_start = idx;
             }
-            self.run += 1;
-            if self.run >= self.min_speech_frames {
+            self.loud_run += 1;
+            if self.loud_run >= self.min_speech_frames {
                 self.in_speech = true;
-                self.run = 0;
-                self.quiet = 0;
+                self.loud_run = 0;
+                self.quiet_run = 0;
                 self.last_loud_end = idx + 1;
                 out.push(VadEvent::SpeechStart {
-                    at: self.at(self.run_start),
+                    at: self.at(self.loud_run_start),
                 });
             }
             return;
         }
-        self.run = 0;
+        self.loud_run = 0;
         if digital_silence {
             return;
         }
@@ -241,17 +218,16 @@ fn rms(x: &[f32]) -> f32 {
     (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
 }
 
-/// True if any speech was detected. A recording without speech must not reach an
-/// engine: Whisper and the int8 Parakeet variant both invent text on silence.
+/// A recording without speech must not reach an engine: Whisper and the int8 Parakeet
+/// variant both invent text on silence.
 pub fn has_speech(events: &[VadEvent]) -> bool {
     events
         .iter()
         .any(|e| matches!(e, VadEvent::SpeechStart { .. }))
 }
 
-/// Cut leading and trailing silence, keeping `pad` around the speech. Pauses between
-/// segments are kept: engines use them as punctuation cues. An unmatched start runs to
-/// the end of `pcm`. Returns an empty vector when there is no speech.
+/// Pauses between segments are kept because engines use them as punctuation cues. An
+/// unmatched start runs to the end of `pcm`; no speech gives an empty vector.
 pub fn trim_silence(pcm: &[f32], events: &[VadEvent], pad: Duration) -> Vec<f32> {
     let to_idx = |d: Duration| (d.as_secs_f64() * SAMPLE_RATE as f64).round() as usize;
     let first = events.iter().find_map(|e| match e {
@@ -291,7 +267,6 @@ mod tests {
 
     const SR: usize = SAMPLE_RATE as usize;
 
-    /// Low-level noise, deterministic.
     fn noise(n: usize, amp: f32, seed: &mut u32) -> Vec<f32> {
         (0..n)
             .map(|_| {
@@ -315,7 +290,6 @@ mod tests {
         Duration::from_millis(ms)
     }
 
-    /// 500 ms noise, 800 ms tone, 600 ms noise, 400 ms tone, 1000 ms noise.
     fn bursts() -> Vec<f32> {
         let mut s = 7;
         let mut v = noise(ms(500), 0.003, &mut s);
@@ -393,7 +367,6 @@ mod tests {
 
     #[test]
     fn leading_digital_silence_does_not_pin_the_floor() {
-        // Background just above `min_rms`, after a cold stream's zero buffers.
         let mut s = 11;
         let mut v = vec![0.0; ms(200)];
         v.extend(noise(ms(1500), 0.009, &mut s));
@@ -406,8 +379,6 @@ mod tests {
 
     #[test]
     fn floor_adapts_to_louder_room() {
-        // Steady fan noise well above min_rms must not read as speech, and speech over it
-        // must still be found.
         let mut s = 9;
         let mut v = noise(ms(1000), 0.03, &mut s);
         v.extend(tone(ms(500), 0.3));
@@ -439,7 +410,6 @@ mod tests {
         let t = trim_silence(&pcm, &ev, d(200));
         assert_eq!(t.first().copied(), Some(ms(300) as f32));
         assert_eq!(t.len(), ms(2500) - ms(300));
-        // Padding beyond the buffer clamps rather than panicking.
         let t = trim_silence(&pcm, &ev[..2], d(1000));
         assert_eq!(t.len(), ms(2300));
         assert_eq!(t[0], 0.0);
@@ -459,7 +429,6 @@ mod tests {
 
     #[test]
     fn resampled_sine_through_vad() {
-        // The synthetic end-to-end path: 48 kHz capture, resampled, then detected.
         use crate::resample::StreamResampler;
         let rate = 48_000usize;
         let mut input = vec![0.0f32; rate / 2];

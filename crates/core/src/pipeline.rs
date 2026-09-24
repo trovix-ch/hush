@@ -1,13 +1,5 @@
-//! The dictation state machine of §3 and D10.
-//!
-//! Hermetic and synchronous: it owns no threads, clocks or devices. The driver feeds it
-//! [`Event`]s (with the time they happened) and executes the [`Effect`]s it returns, in
-//! order, feeding results back as events. Every decision about what happens next lives
-//! here, where a test can drive it; the driver only does I/O.
-//!
-//! Capture and processing overlap: a new recording may start while the previous
-//! utterance is still being transcribed, normalized or inserted, but only one utterance
-//! is processed at a time and finished recordings wait their turn in order.
+//! The dictation state machine: owns no threads, clocks or devices, takes events and
+//! returns effects for the caller to execute in order.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -25,12 +17,11 @@ use crate::stt::{SttError, Transcript};
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineConfig {
     pub hands_free_double_tap: bool,
-    /// A press shorter than this is a tap, and may be the first half of a tap pair.
     pub tap_max: Duration,
-    /// The second tap must go down within this of the first one's release.
+    /// Measured from the first tap's release to the second tap's key-down.
     pub tap_pair_window: Duration,
-    /// A lone press shorter than this is discarded rather than transcribed. At or above
-    /// `tap_max`, so a genuine short utterance never waits out the tap window.
+    /// Keep at or above `tap_max`, so a genuine short utterance never waits out the tap
+    /// window.
     pub min_press: Duration,
     pub max_recording: Duration,
     pub history_len: usize,
@@ -63,7 +54,6 @@ impl PipelineConfig {
     }
 }
 
-/// What the user would say the app is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Idle,
@@ -119,8 +109,8 @@ impl std::fmt::Display for Failure {
 
 #[derive(Debug)]
 pub enum Event {
-    /// `focus` is snapshotted at key-down: the target is where the cursor was when the
-    /// user started speaking, not where it is when the text is ready.
+    /// The target is where the cursor was when the user started speaking, not where it is
+    /// when the text is ready.
     HotkeyDown {
         at: Instant,
         focus: FocusContext,
@@ -131,7 +121,6 @@ pub enum Event {
     Escape,
     MaxDurationReached(UtteranceId),
     TapWindowElapsed(UtteranceId),
-    /// Result of `StopRecording`.
     Recorded(UtteranceId, Recording),
     TranscriptReady(UtteranceId, Transcript),
     NormalizedReady(UtteranceId, NormalizeOutput),
@@ -143,10 +132,8 @@ pub enum Event {
 pub struct NormalizeContext {
     pub app: AppContext,
     pub language: Option<String>,
-    /// The text inserted by the previous utterance into the same app.
     pub previous: Option<String>,
-    /// Skip every LLM stage. Set when the first attempt failed, so the retry cannot fail
-    /// the same way (D4.4).
+    /// Set on the retry after a failure, so it cannot fail the same way.
     pub rules_only: bool,
 }
 
@@ -154,10 +141,10 @@ pub struct NormalizeContext {
 pub enum Effect {
     StartRecording(UtteranceId),
     StopRecording(UtteranceId),
-    /// Drop the current recording without a `Recorded` event.
+    /// No `Recorded` event follows.
     DiscardRecording(UtteranceId),
-    /// Fire the matching event after `after`. Never disarmed: a timer for an utterance
-    /// the machine has moved past is ignored by id when it fires.
+    /// Never disarmed: a timer for an utterance the machine has moved past is ignored by
+    /// id when it fires.
     ArmTimer {
         id: UtteranceId,
         timer: Timer,
@@ -177,8 +164,7 @@ pub enum Effect {
         text: String,
         target: FocusContext,
     },
-    /// Cancel the token of an in-flight transcribe, normalize or insert. Its result, if
-    /// one still arrives, is ignored.
+    /// A result that still arrives afterwards is ignored.
     CancelInflight(UtteranceId),
     Notify(OverlayState),
     Play(Sound),
@@ -244,8 +230,7 @@ pub struct Pipeline {
     cfg: PipelineConfig,
     next_id: UtteranceId,
     capture: Capture,
-    /// `StopRecording` issued, `Recorded` not yet back.
-    stopped: Vec<Waiting>,
+    awaiting_recorded: Vec<Waiting>,
     queue: VecDeque<Queued>,
     inflight: Option<Inflight>,
     history: History,
@@ -259,7 +244,7 @@ impl Pipeline {
             cfg,
             next_id: UtteranceId::FIRST,
             capture: Capture::Idle,
-            stopped: Vec::new(),
+            awaiting_recorded: Vec::new(),
             queue: VecDeque::new(),
             inflight: None,
             shown: OverlayState::Idle,
@@ -274,7 +259,9 @@ impl Pipeline {
                 Stage::Inserting => State::Inserting,
             },
             None if self.is_recording() => State::Recording,
-            None if !self.stopped.is_empty() || !self.queue.is_empty() => State::Transcribing,
+            None if !self.awaiting_recorded.is_empty() || !self.queue.is_empty() => {
+                State::Transcribing
+            }
             None => State::Idle,
         }
     }
@@ -283,8 +270,7 @@ impl Pipeline {
         !matches!(self.capture, Capture::Idle)
     }
 
-    /// Whether Escape means something now. The hook swallows Escape only while this holds,
-    /// so an idle app never steals it from the user.
+    /// Escape is swallowed only while this holds, so an idle app never steals it.
     pub fn is_active(&self) -> bool {
         self.state() != State::Idle
     }
@@ -325,8 +311,7 @@ impl Pipeline {
         }
     }
 
-    /// Stage changes of the in-flight utterance are not shown over an active recording:
-    /// what the user is doing right now matters more.
+    /// An active recording matters more to the user than a stage change behind it.
     fn show_stage(&mut self, fx: &mut Vec<Effect>, state: OverlayState) {
         if !self.is_recording() {
             self.notify(fx, state);
@@ -338,7 +323,7 @@ impl Pipeline {
             Some(Stage::Normalizing) => OverlayState::Normalizing,
             Some(Stage::Inserting) => OverlayState::Inserting,
             Some(_) => OverlayState::Transcribing,
-            None if !self.stopped.is_empty() || !self.queue.is_empty() => {
+            None if !self.awaiting_recorded.is_empty() || !self.queue.is_empty() => {
                 OverlayState::Transcribing
             }
             None => OverlayState::Idle,
@@ -351,12 +336,10 @@ impl Pipeline {
             .filter(|i| i.id == id && i.stage == stage)
     }
 
-    // Capture side.
-
     fn on_down(&mut self, at: Instant, focus: FocusContext, fx: &mut Vec<Effect>) {
         match self.capture.clone() {
             Capture::Idle => self.start_capture(at, focus, fx),
-            // Auto-repeat; the hook drops it, but a repeat must never restart a recording.
+            // Auto-repeat must never restart a recording.
             Capture::Holding { .. } => {}
             Capture::TapPending {
                 id,
@@ -380,8 +363,7 @@ impl Pipeline {
     }
 
     fn on_up(&mut self, at: Instant, fx: &mut Vec<Effect>) {
-        // Key-ups in any other capture state belong to presses already accounted for: the
-        // second tap of a pair, or the tap that ended hands-free.
+        // Any other key-up is the second tap of a pair or the tap that ended hands-free.
         let Capture::Holding { id, down_at, focus } = self.capture.clone() else {
             return;
         };
@@ -463,16 +445,16 @@ impl Pipeline {
         fx.push(Effect::Play(Sound::Stop));
         fx.push(Effect::StopRecording(id));
         self.capture = Capture::Idle;
-        self.stopped.push(Waiting { id, focus });
+        self.awaiting_recorded.push(Waiting { id, focus });
         let s = self.inflight_overlay();
         self.notify(fx, s);
     }
 
     fn on_recorded(&mut self, id: UtteranceId, rec: Recording, fx: &mut Vec<Effect>) {
-        let Some(pos) = self.stopped.iter().position(|w| w.id == id) else {
+        let Some(pos) = self.awaiting_recorded.iter().position(|w| w.id == id) else {
             return;
         };
-        let Waiting { id, focus } = self.stopped.remove(pos);
+        let Waiting { id, focus } = self.awaiting_recorded.remove(pos);
         if rec.pcm.is_empty() {
             let s = self.inflight_overlay();
             self.show_stage(fx, s);
@@ -485,8 +467,6 @@ impl Pipeline {
         });
         self.pump(fx);
     }
-
-    // Processing side.
 
     fn pump(&mut self, fx: &mut Vec<Effect>) {
         if self.inflight.is_some() {
@@ -576,7 +556,6 @@ impl Pipeline {
         let Some(i) = self.inflight.as_mut() else {
             return;
         };
-        // Everything a filler-only utterance had was cleaned away.
         if text.trim().is_empty() {
             self.finish(fx);
             return;
@@ -584,8 +563,7 @@ impl Pipeline {
         i.stage = Stage::Inserting;
         i.hint = ProvenanceHint::from(&provenance);
         let (id, target, raw) = (i.id, i.focus.clone(), i.raw.clone());
-        // Recorded before the attempt, so a refused or failed insertion is still
-        // recoverable with "paste last" (D16).
+        // Before the attempt, so a refused or failed insertion is still recoverable.
         self.history.push(HistoryEntry {
             id,
             raw,
@@ -623,14 +601,15 @@ impl Pipeline {
     fn on_failed(&mut self, id: UtteranceId, failure: Failure, fx: &mut Vec<Effect>) {
         match failure {
             Failure::Record(e) => {
-                let ours = self.capture.id() == Some(id) || self.stopped.iter().any(|w| w.id == id);
+                let ours = self.capture.id() == Some(id)
+                    || self.awaiting_recorded.iter().any(|w| w.id == id);
                 if !ours {
                     return;
                 }
                 if self.capture.id() == Some(id) {
                     self.capture = Capture::Idle;
                 }
-                self.stopped.retain(|w| w.id != id);
+                self.awaiting_recorded.retain(|w| w.id != id);
                 self.error(fx, Failure::Record(e).to_string());
                 if self.inflight.is_none() {
                     self.pump(fx);
@@ -651,8 +630,7 @@ impl Pipeline {
                     return;
                 };
                 if i.rules_only {
-                    // Even the rule pass failed: the raw transcript is still better than
-                    // nothing reaching the target.
+                    // The raw transcript beats nothing reaching the target.
                     let raw = i.raw.clone();
                     let error = i.llm_error.clone().unwrap_or_else(|| e.to_string());
                     self.begin_insert(
@@ -689,13 +667,12 @@ impl Pipeline {
         self.notify(fx, OverlayState::Error { message });
     }
 
-    /// The in-flight utterance is done, one way or another; start the next one.
     fn finish(&mut self, fx: &mut Vec<Effect>) {
         self.inflight = None;
         self.pump(fx);
         if self.is_recording() {
             self.notify(fx, OverlayState::Listening { level: 0.0 });
-        } else if self.inflight.is_none() && self.stopped.is_empty() {
+        } else if self.inflight.is_none() && self.awaiting_recorded.is_empty() {
             // Done and Error stay up until the overlay fades them itself.
             if !matches!(
                 self.shown,
@@ -706,7 +683,6 @@ impl Pipeline {
         }
     }
 
-    /// Escape cancels everything that has not reached the target yet.
     fn on_escape(&mut self, fx: &mut Vec<Effect>) {
         let mut any = false;
         if let Some(id) = self.capture.id() {
@@ -714,8 +690,8 @@ impl Pipeline {
             self.capture = Capture::Idle;
             any = true;
         }
-        any |= !self.stopped.is_empty() || !self.queue.is_empty();
-        self.stopped.clear();
+        any |= !self.awaiting_recorded.is_empty() || !self.queue.is_empty();
+        self.awaiting_recorded.clear();
         self.queue.clear();
         if let Some(i) = self.inflight.take() {
             fx.push(Effect::CancelInflight(i.id));
@@ -802,8 +778,6 @@ mod tests {
             self.p.handle(Event::InsertDone(UtteranceId(id), outcome))
         }
 
-        /// Hold for a second, release, and get the recording back: utterance 1 is then
-        /// being transcribed.
         fn reach_transcribing(&mut self) {
             self.down(0);
             self.up(1000);

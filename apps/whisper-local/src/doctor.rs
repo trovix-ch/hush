@@ -1,6 +1,3 @@
-//! `whisper-local doctor`: everything the app depends on, checked in the order it is
-//! needed, printed for a human.
-
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -20,8 +17,8 @@ fn row(label: &str, value: impl std::fmt::Display) {
     println!("{label:<14}{value}");
 }
 
-/// Whether this session has an unlocked, interactive input desktop. Without one,
-/// `SendInput` is refused and no hotkey reaches the hook: dictation cannot work.
+/// Without an unlocked input desktop `SendInput` is refused and no hotkey reaches the
+/// hook.
 pub fn input_desktop_unlocked() -> bool {
     // SAFETY: plain FFI; the handle is closed below. SwitchDesktop to the current input
     // desktop is a no-op that fails exactly when the workstation is locked.

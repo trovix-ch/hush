@@ -1,14 +1,7 @@
-//! The status pill near the bottom of the primary monitor (§2).
-//!
-//! Why a layered, click-through, no-activate tool window: the pill must never take focus
-//! from the app we are about to paste into, never intercept a click, and never appear
-//! in Alt+Tab. `SW_SHOWNOACTIVATE` alone is not enough; `WS_EX_NOACTIVATE` stops a click
-//! from activating it and `WS_EX_TRANSPARENT` lets the click through.
-//! Why pixels are composed in Rust and GDI only draws text into a mask: GDI ignores the
-//! alpha channel, so text drawn straight into a premultiplied BGRA surface for
-//! `UpdateLayeredWindow` comes out transparent or fringed. Why this type is not `Send`:
-//! it owns a window and must be driven from the thread that created it; other threads
-//! go through the UI thread's command queue.
+//! The pill must never take focus from the paste target, and `SW_SHOWNOACTIVATE` alone
+//! does not stop a click from activating it, hence the no-activate click-through styles.
+//! GDI ignores alpha, so it only draws text into a coverage mask and pixels are composed
+//! here.
 
 use std::time::Duration;
 
@@ -33,31 +26,28 @@ use windows::core::{PCWSTR, w};
 
 use crate::util::wide;
 
-/// What the pill shows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayState {
     Hidden,
-    /// Recording; `level` is the input level in 0..=1.
+    /// `level` is in 0..=1.
     Listening {
         level: f32,
     },
     Transcribing,
     Normalizing,
     Inserting,
-    /// Text inserted (or placed on the clipboard); `message` overrides the default text.
+    /// `message` overrides the default text.
     Done {
         message: Option<String>,
     },
     Error {
         message: String,
     },
-    /// Information that is not an error, e.g. "text is on the clipboard". Hides like an
-    /// error.
+    /// Not an error, but hides like one.
     Notice {
         message: String,
     },
-    /// A condition that lasts until the app replaces it, e.g. "loading model". Does not
-    /// hide by itself.
+    /// Does not hide by itself.
     Status {
         message: String,
     },
@@ -78,8 +68,7 @@ impl OverlayState {
         }
     }
 
-    /// Straight RGB of the status dot.
-    fn accent(&self) -> [u8; 3] {
+    fn dot_rgb(&self) -> [u8; 3] {
         match self {
             OverlayState::Hidden => [0, 0, 0],
             OverlayState::Listening { .. } => [0xF0, 0x4A, 0x4A],
@@ -102,7 +91,7 @@ impl From<wl_core::notify::OverlayState> for OverlayState {
             C::Transcribing => OverlayState::Transcribing,
             C::Normalizing => OverlayState::Normalizing,
             C::Inserting => OverlayState::Inserting,
-            // D4: an LLM fallback gets a subtle indicator, never an error.
+            // An LLM fallback gets a subtle indicator, never an error.
             C::Done { provenance_hint } => OverlayState::Done {
                 message: (provenance_hint == ProvenanceHint::LlmFallback)
                     .then(|| "Done · rules only".to_string()),
@@ -112,12 +101,11 @@ impl From<wl_core::notify::OverlayState> for OverlayState {
     }
 }
 
-/// Timings for the pill.
 #[derive(Debug, Clone, Copy)]
 pub struct OverlayConfig {
     pub done_timeout: Duration,
     pub error_timeout: Duration,
-    /// Distance from the bottom of the work area, in logical pixels.
+    /// Logical pixels above the bottom of the work area.
     pub bottom_margin: i32,
 }
 
@@ -134,10 +122,9 @@ impl Default for OverlayConfig {
 const BASE_W: i32 = 260;
 const BASE_H: i32 = 40;
 
-/// The pill window. Create and drive it on one thread with a message loop.
+/// Must be created and driven on one thread with a message loop.
 pub struct Overlay {
     hwnd: HWND,
-    /// Window that receives the auto-hide `WM_TIMER`; its owner calls `on_timer`.
     timer_hwnd: HWND,
     config: OverlayConfig,
     scale: f32,
@@ -149,20 +136,17 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    /// Timer id of the auto-hide after `Done` / `Error`.
     pub const HIDE_TIMER: usize = 0x5717;
 
-    /// Creates the (hidden) pill. `timer_hwnd` receives the auto-hide `WM_TIMER` with id
-    /// [`Overlay::HIDE_TIMER`] and must forward it to [`Overlay::on_timer`]; `None` uses
-    /// the pill window itself, where nothing handles it.
+    /// `timer_hwnd` receives the auto-hide `WM_TIMER` and must forward it to
+    /// [`Overlay::on_timer`]; `None` uses the pill window, where nothing handles it.
     pub fn create(config: OverlayConfig, timer_hwnd: Option<HWND>) -> windows::core::Result<Self> {
         // SAFETY: plain FFI query.
         let dpi = unsafe { GetDpiForSystem() }.max(96);
         let scale = dpi as f32 / 96.0;
         let width = (BASE_W as f32 * scale).round() as i32;
         let height = (BASE_H as f32 * scale).round() as i32;
-        // SAFETY: registers a class with a 'static procedure and creates a popup owned by
-        // this thread; nothing is shown yet.
+        // SAFETY: a 'static window procedure and a hidden popup owned by this thread.
         let hwnd = unsafe {
             let inst = GetModuleHandleW(PCWSTR::null())?;
             let class = w!("wl-overlay-pill");
@@ -246,8 +230,7 @@ impl Overlay {
             return;
         }
         if !self.visible {
-            // SAFETY: shows our own window without activating it and keeps it topmost
-            // without taking focus.
+            // SAFETY: our own window, shown and raised without activation.
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 let _ = SetWindowPos(
@@ -282,7 +265,6 @@ impl Overlay {
         }
     }
 
-    /// Called by the UI loop for `WM_TIMER` on the pill window.
     pub fn on_timer(&mut self, id: usize) {
         if id == Self::HIDE_TIMER {
             // SAFETY: our own window and timer.
@@ -340,14 +322,12 @@ impl Overlay {
         self.blit(&pixels)
     }
 
-    /// Renders `text` white-on-black with grey antialiasing and returns per-pixel
-    /// coverage (0..=255).
+    /// Per-pixel coverage (0..=255).
     fn text_mask(&self, text: &str, left: i32, right: i32) -> windows::core::Result<Vec<u8>> {
         let (w, h) = (self.width, self.height);
         let surface = DibSurface::new(w, h)?;
         let mut units: Vec<u16> = text.encode_utf16().collect();
-        // SAFETY: drawing into our own memory DC with a font we own; the rect and text
-        // buffers outlive the calls.
+        // SAFETY: our own memory DC and font; the rect and text outlive the calls.
         unsafe {
             let old_font = SelectObject(surface.dc, self.font.into());
             SetBkMode(surface.dc, TRANSPARENT);
@@ -388,8 +368,7 @@ impl Overlay {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        // SAFETY: the screen DC is released below; every pointer refers to a local that
-        // outlives the call; the source DC holds a premultiplied 32-bit DIB.
+        // SAFETY: every pointer is a local that outlives the call; the screen DC is released.
         unsafe {
             let screen = GetDC(None);
             let r = UpdateLayeredWindow(
@@ -420,15 +399,14 @@ impl Drop for Overlay {
 }
 
 unsafe extern "system" fn overlay_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    const HTTRANSPARENT: isize = -1;
     if msg == WM_NCHITTEST {
-        // HTTRANSPARENT: never the target of a click.
-        return LRESULT(-1);
+        return LRESULT(HTTRANSPARENT);
     }
     // SAFETY: default handling for everything else.
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-/// A 32-bit top-down DIB selected into a memory DC.
 struct DibSurface {
     dc: HDC,
     bitmap: HBITMAP,
@@ -452,8 +430,7 @@ impl DibSurface {
             ..Default::default()
         };
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: creates a memory DC and a DIB section whose memory is owned by the
-        // bitmap; both are released in Drop.
+        // SAFETY: the DC and the DIB (which owns its memory) are released in Drop.
         unsafe {
             let dc = CreateCompatibleDC(None);
             let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
@@ -496,9 +473,7 @@ impl Drop for DibSurface {
     }
 }
 
-// ------------------------------------------------------------------ pure drawing
-
-/// Composes the pill as premultiplied BGRA (`0xAARRGGBB` little-endian).
+/// Premultiplied BGRA (`0xAARRGGBB` little-endian), as `UpdateLayeredWindow` requires.
 pub(crate) fn compose(
     state: &OverlayState,
     w: usize,
@@ -511,7 +486,7 @@ pub(crate) fn compose(
     let r = hf / 2.0;
     let bg = [24u8, 24, 28];
     let bg_alpha = 0.90;
-    let accent = state.accent();
+    let dot_rgb = state.dot_rgb();
     let dot_cx = 20.0 * scale;
     let dot_r = 5.0 * scale;
     let level = match state {
@@ -524,7 +499,6 @@ pub(crate) fn compose(
     for y in 0..h {
         for x in 0..w {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            // Stadium distance: segment between the two cap centres.
             let cx = fx.clamp(r, wf - r);
             let d = ((fx - cx).powi(2) + (fy - r).powi(2)).sqrt() - (r - 0.5);
             let cover = (0.5 - d).clamp(0.0, 1.0);
@@ -540,7 +514,7 @@ pub(crate) fn compose(
             let dd = ((fx - dot_cx).powi(2) + (fy - r).powi(2)).sqrt() - dot_r;
             let dot_cover = (0.5 - dd).clamp(0.0, 1.0);
             if dot_cover > 0.0 {
-                blend(accent, dot_cover);
+                blend(dot_rgb, dot_cover);
             }
             if let Some(level) = level
                 && fx >= bar_x0

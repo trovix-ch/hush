@@ -1,5 +1,3 @@
-//! Paths, the config file and logging.
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -11,7 +9,6 @@ use tracing_subscriber::{EnvFilter, Layer};
 use wl_core::config::{Config, DEFAULT_CONFIG};
 use wl_platform_windows::ui_thread::AppPaths;
 
-/// Log files kept; one per day.
 const LOG_FILES_KEPT: usize = 7;
 
 #[derive(Debug, Clone)]
@@ -21,7 +18,6 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// The standard locations, with the config file optionally replaced.
     pub fn resolve(config_override: Option<PathBuf>) -> Result<Self> {
         let app = AppPaths::resolve().context("cannot resolve %APPDATA% / %LOCALAPPDATA%")?;
         Ok(Self {
@@ -31,8 +27,7 @@ impl Paths {
     }
 }
 
-/// Reads the config, writing the commented default first if there is none. Returns
-/// whether it was created.
+/// The bool is true when the default config was just written.
 pub fn load_config(path: &Path) -> Result<(Config, bool)> {
     let created = !path.exists();
     if created {
@@ -48,12 +43,8 @@ pub fn load_config(path: &Path) -> Result<(Config, bool)> {
     Ok((config, created))
 }
 
-/// Logs to stderr and to a daily file. `console_default` is the stderr level when
-/// `RUST_LOG` is unset: the subcommands print their own report and keep stderr quiet,
-/// while the file always gets `info`.
-///
-/// The returned guard flushes the file writer on drop; the process must not exit
-/// before it is dropped or the last lines are lost.
+/// `console_default` applies to stderr only when `RUST_LOG` is unset. The process must
+/// not exit before the guard is dropped, or the last lines are lost.
 pub fn init_logging(logs_dir: &Path, console_default: &str) -> Result<WorkerGuard> {
     std::fs::create_dir_all(logs_dir)
         .with_context(|| format!("creating {}", logs_dir.display()))?;

@@ -1,12 +1,5 @@
-//! Start, stop and error cues through `PlaySoundW` (§2).
-//!
-//! Why not an audio crate: three ~80 ms blips do not justify a second audio stack next to
-//! the capture path, and `PlaySoundW(SND_MEMORY | SND_ASYNC)` returns immediately. Why
-//! the WAVs are synthesised once into statics instead of shipped as files: `SND_ASYNC`
-//! keeps reading the buffer after the call returns, so it must live for the whole
-//! process, and generating them avoids binary assets in the tree. Why the start cue is
-//! played by the caller *before* the microphone opens: otherwise it lands in the
-//! transcription.
+//! `SND_ASYNC` keeps reading the WAV buffer after `PlaySoundW` returns, so every cue is a
+//! process-lifetime static.
 
 use std::sync::LazyLock;
 
@@ -17,7 +10,6 @@ use windows::core::PCWSTR;
 pub enum Cue {
     Start,
     Stop,
-    /// Recording discarded (Escape): one soft falling tone.
     Cancel,
     Error,
 }
@@ -43,7 +35,7 @@ static CANCEL: LazyLock<Vec<u8>> =
     LazyLock::new(|| wav(&tones(&[(523.0, 35), (392.0, 45)], 0.12, false)));
 static ERROR: LazyLock<Vec<u8>> = LazyLock::new(|| wav(&tones(&[(196.0, 90)], 0.12, true)));
 
-/// Plays `cue` asynchronously; a new cue cuts off the previous one.
+/// Returns immediately; a new cue cuts off the previous one.
 pub fn play(cue: Cue) {
     let data: &'static [u8] = match cue {
         Cue::Start => &START,
@@ -51,8 +43,7 @@ pub fn play(cue: Cue) {
         Cue::Cancel => &CANCEL,
         Cue::Error => &ERROR,
     };
-    // SAFETY: with SND_MEMORY the "name" is a pointer to a complete WAV image; it is a
-    // 'static buffer, so it outlives the asynchronous playback.
+    // SAFETY: SND_MEMORY takes a complete WAV image, and this 'static one outlives playback.
     let ok = unsafe {
         PlaySoundW(
             PCWSTR(data.as_ptr() as *const u16),
@@ -65,7 +56,7 @@ pub fn play(cue: Cue) {
     }
 }
 
-/// Mono 16-bit samples for a sequence of (frequency, milliseconds) tones.
+/// `parts` are (frequency, milliseconds).
 fn tones(parts: &[(f32, u32)], amplitude: f32, buzz: bool) -> Vec<i16> {
     let mut out = Vec::new();
     for &(freq, ms) in parts {
@@ -76,7 +67,6 @@ fn tones(parts: &[(f32, u32)], amplitude: f32, buzz: bool) -> Vec<i16> {
             let phase = 2.0 * std::f32::consts::PI * freq * t;
             let mut s = phase.sin();
             if buzz {
-                // Odd harmonics give a soft buzz without a harsh square wave.
                 s = s + (3.0 * phase).sin() / 3.0 + (5.0 * phase).sin() / 5.0;
                 s *= 0.8;
             }

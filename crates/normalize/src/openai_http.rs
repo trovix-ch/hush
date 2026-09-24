@@ -1,11 +1,4 @@
 //! LLM cleanup through a local HTTP inference server.
-//!
-//! Two wire dialects: the OpenAI `/v1/chat/completions` shape that llama-server, LM
-//! Studio and vLLM all speak, and Ollama's native `/api/chat`. Ollama gets its own
-//! dialect because its OpenAI endpoint ignores `think` and ignores `keep_alive` on a
-//! cold load (measured on Ollama 0.34, 2026-09-24), so a thinking model would reason
-//! for seconds and the model would unload after every utterance on machines that set
-//! `OLLAMA_KEEP_ALIVE=0`.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +21,8 @@ const OLLAMA_PORT: &str = ":11434";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     OpenAi,
+    /// Ollama's OpenAI endpoint ignores `think`, and `keep_alive` on a cold load
+    /// (measured on Ollama 0.34, 2026-09-24), so it gets its native `/api/chat`.
     Ollama,
 }
 
@@ -43,11 +38,8 @@ pub struct HttpConfig {
 }
 
 impl HttpConfig {
-    /// Picks the Ollama dialect for Ollama's default port.
-    ///
-    /// `localhost` becomes `127.0.0.1`: Windows resolves it to `::1` first, Ollama
-    /// listens on IPv4 only, and every new connection then waited ~2 s for the IPv6
-    /// attempt to fail (measured 2026-09-24: first request after warm-up 2.1 s vs 0.1 s).
+    /// `localhost` becomes `127.0.0.1`: Windows tries `::1` first, Ollama listens on IPv4
+    /// only, and each new connection waited ~2 s for that to fail (measured 2026-09-24).
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
         let base_url = base_url
             .into()
@@ -80,16 +72,12 @@ impl HttpConfig {
     }
 }
 
-/// Everything one LLM attempt produced, for callers (the bench) that need more than the
-/// final text.
 #[derive(Debug, Clone)]
 pub struct Attempt {
     /// What the LLM was given, and what is inserted if it is rejected.
     pub rule_text: String,
-    /// The model's raw answer, after stripping an empty thinking block.
     pub candidate: String,
     pub verdict: Result<Scores, Rejection>,
-    /// Round trip of the HTTP call alone.
     pub llm_elapsed: Duration,
 }
 
@@ -118,12 +106,8 @@ impl OpenAiHttpNormalizer {
         &self.cfg
     }
 
-    /// Rule pass, then the LLM, then validation. `Err` only when the server could not
-    /// produce an answer at all, or the request was cancelled or out of time.
-    ///
-    /// A blocking HTTP call cannot be interrupted, so cancellation is checked before the
-    /// request and after the reply; the request's own timeout is the configured one cut
-    /// down to the caller's deadline, which bounds how long a cancel can go unnoticed.
+    /// A rejected answer is `Ok` with the verdict in it. The blocking call cannot be
+    /// interrupted, so its deadline-capped timeout bounds how long a cancel goes unnoticed.
     pub fn attempt(&self, req: &NormalizeRequest<'_>) -> Result<Attempt, NormalizeError> {
         let timeout = req.cancel.timeout_within(self.cfg.timeout)?;
         let rule_text = self.rules.clean_request(req);
@@ -213,7 +197,7 @@ impl Normalizer for OpenAiHttpNormalizer {
         &self.id
     }
 
-    /// Loads the model and primes the server's prompt cache with the system prompt.
+    /// Also primes the server's prompt cache with the system prompt.
     fn warm(&mut self) -> Result<(), NormalizeError> {
         let app = wl_core::normalize::AppContext::default();
         let req = NormalizeRequest {
@@ -255,8 +239,8 @@ impl Normalizer for OpenAiHttpNormalizer {
     }
 }
 
-/// Output budget: 1.5 × the input's estimated tokens plus slack. A faithful cleanup is
-/// never longer than its input; the cap exists to stop a runaway repetition loop.
+/// A faithful cleanup is never longer than its input; the cap exists to stop a runaway
+/// repetition loop.
 pub fn max_tokens(text: &str) -> u32 {
     let est = (text.split_whitespace().count() as f64 * 1.3).ceil();
     (est * 1.5).ceil() as u32 + 20
@@ -403,8 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn token_budget() {
-        // 10 words → 13 tokens → 19.5 → 20, plus 20.
+    fn token_budget_is_one_and_a_half_times_the_estimate_plus_slack() {
         assert_eq!(max_tokens("a b c d e f g h i j"), 40);
         assert_eq!(max_tokens(""), 20);
     }
@@ -512,7 +495,7 @@ mod tests {
 
     #[test]
     fn unreachable_server_is_unavailable() {
-        // Port 9 (discard) is closed on any sane dev machine; the connect fails fast.
+        // Port 9 (discard) is closed on any sane dev machine.
         let mut cfg = HttpConfig::new("http://127.0.0.1:9/v1", "m");
         cfg.timeout = Duration::from_secs(2);
         let mut n = OpenAiHttpNormalizer::new(cfg);
@@ -527,7 +510,6 @@ mod tests {
         );
     }
 
-    /// A server that accepts the connection and never answers.
     fn silent_server() -> (std::net::TcpListener, String) {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1", l.local_addr().unwrap());
@@ -567,8 +549,7 @@ mod tests {
         );
     }
 
-    /// Needs a running Ollama with the model pulled:
-    /// `WL_TEST_OLLAMA_MODEL=qwen3:4b-instruct-2507-q4_K_M cargo test -p wl-normalize`.
+    /// Needs a running Ollama with the model named in `WL_TEST_OLLAMA_MODEL` pulled.
     #[test]
     fn live_ollama_round_trip() {
         let Ok(model) = std::env::var("WL_TEST_OLLAMA_MODEL") else {

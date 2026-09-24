@@ -1,5 +1,3 @@
-//! Capture through cpal (WASAPI shared mode on Windows).
-
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -10,15 +8,12 @@ use wl_core::recorder::RecorderError;
 
 use crate::capture::{CallbackShared, OpenedStream, StreamOpener, downmix_into, note_dropped};
 
-/// An input device as the settings UI and the example list them.
 #[derive(Debug, Clone)]
 pub struct InputDeviceInfo {
     pub name: String,
-    /// Stable id (`host:device`), preferable to the name in config because two identical
-    /// USB mics share a name.
+    /// Preferable to the name in config because two identical USB mics share a name.
     pub id: String,
     pub is_default: bool,
-    /// Default shared-mode format, e.g. `48000 Hz, 2 ch, f32`.
     pub default_format: Option<String>,
 }
 
@@ -53,7 +48,6 @@ pub fn list_input_devices() -> Result<Vec<InputDeviceInfo>, RecorderError> {
     Ok(out)
 }
 
-/// Opens the configured or default input device with its default shared-mode format.
 #[derive(Debug, Default)]
 pub struct CpalOpener;
 
@@ -73,8 +67,8 @@ fn find_device(host: &cpal::Host, wanted: Option<&str>) -> Result<cpal::Device, 
     let name_of = |d: &cpal::Device| d.description().map(|x| x.name().to_owned()).ok();
     let id_of = |d: &cpal::Device| d.id().ok().map(|i| i.to_string());
     let lower = wanted.to_lowercase();
-    // Exact id, then exact name, then substring: the config stores whatever the user
-    // picked, and Windows decorates names ("Microphone (2- USB Audio)") when it re-enumerates.
+    // Substring as a last resort because Windows decorates names ("Microphone (2- USB
+    // Audio)") when it re-enumerates.
     devices
         .iter()
         .find(|d| id_of(d).as_deref() == Some(wanted))
@@ -124,10 +118,8 @@ where
                 note_dropped(&data_shared, n);
             },
             move |err: cpal::Error| {
-                // Xruns and real-time denial are survivable; anything else means no more
-                // callbacks. WASAPI reports a default-device change as StreamInvalidated
-                // (or DeviceNotAvailable with no replacement) because it never rebinds an
-                // open client, so treating those as recoverable would record silence.
+                // WASAPI never rebinds an open client, so a default-device change arrives
+                // as StreamInvalidated and treating it as recoverable would record silence.
                 if !matches!(err.kind(), ErrorKind::Xrun | ErrorKind::RealtimeDenied) {
                     err_shared.lost.store(true, Ordering::Release);
                 }
@@ -137,7 +129,7 @@ where
         .map_err(map_err)
 }
 
-/// cpal's `Stream` is `Send` on every backend; boxing keeps the worker generic over openers.
+/// Held only to keep the stream alive; cpal's `Stream` is `Send` on every backend.
 struct Holder(#[allow(dead_code)] cpal::Stream);
 
 impl StreamOpener for CpalOpener {
@@ -153,8 +145,8 @@ impl StreamOpener for CpalOpener {
             .description()
             .map(|d| d.name().to_owned())
             .unwrap_or_default();
-        // The device's own mix format: asking WASAPI shared mode for 16 kHz either fails
-        // or engages its resampler, which is worse than ours.
+        // Asking WASAPI shared mode for 16 kHz either fails or engages its resampler,
+        // which is worse than ours.
         let supported = device.default_input_config().map_err(map_err)?;
         let config: StreamConfig = supported.into();
         let fmt = supported.sample_format();

@@ -1,5 +1,3 @@
-//! NVIDIA Parakeet TDT 0.6B v3 through ONNX Runtime.
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +9,7 @@ use wl_core::stt::{
 
 pub const ENGINE_ID: &str = "parakeet-tdt-0.6b-v3";
 
-/// Languages Parakeet TDT v3 was trained on, per the model card.
+/// Per the model card.
 const LANGUAGES: [&str; 25] = [
     "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "lt", "lv", "mt",
     "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk",
@@ -23,14 +21,11 @@ const MIN_SAMPLES: usize = 400;
 #[derive(Debug, Clone)]
 pub struct ParakeetOptions {
     pub backend: Backend,
-    /// Run the decoder/joint graph on the CPU even when the encoder uses the GPU. The joint
-    /// runs once per decoding step on tiny tensors, so a GPU round-trip can cost more than
-    /// the arithmetic. Off by default: on an idle GPU it measured slightly slower, on a GPU
-    /// shared with another model slightly faster.
+    /// Off by default: measured slightly slower on an idle GPU, slightly faster on a GPU
+    /// shared with another model.
     pub joint_on_cpu: bool,
-    /// ONNX Runtime intra-op threads for CPU work. `None` picks half the logical cores.
     pub intra_threads: Option<usize>,
-    /// DXGI adapter index for DirectML. `None` lets DirectML pick the default GPU.
+    /// DXGI adapter index.
     pub gpu_device: Option<i32>,
 }
 
@@ -51,8 +46,7 @@ pub struct ParakeetEngine {
 }
 
 impl ParakeetEngine {
-    /// Load the model from `model_dir` on `backend`. Fails rather than falling back to the
-    /// CPU when a GPU backend was requested and does not load.
+    /// Fails rather than falling back to the CPU when a GPU backend does not load.
     pub fn new(model_dir: &Path, backend: Backend) -> Result<Self, SttError> {
         Self::with_options(model_dir, ParakeetOptions::new(backend))
     }
@@ -101,8 +95,8 @@ impl ParakeetEngine {
             model,
             info: EngineInfo {
                 id,
-                // Only reachable when every requested provider registered with
-                // `error_on_failure`, so the requested backend is the one that loaded.
+                // Providers register with `error_on_failure`, so the requested backend is
+                // the one that loaded.
                 backend: opts.backend,
                 // ONNX Runtime does not report which adapter DirectML bound.
                 device: match (opts.backend, opts.gpu_device) {
@@ -114,8 +108,8 @@ impl ParakeetEngine {
                     hotwords: false,
                     word_timestamps: true,
                     punctuation: true,
-                    // parakeet-rs exposes no run options, so ONNX Runtime's terminate
-                    // flag is out of reach.
+                    // parakeet-rs exposes no run options, so ORT's terminate flag is
+                    // out of reach.
                     cancel: false,
                 },
                 languages: LANGUAGES.iter().map(|l| l.to_string()).collect(),
@@ -131,8 +125,7 @@ fn directml_config(
     backend_error: Arc<Mutex<Option<String>>>,
 ) -> Result<ExecutionConfig, SttError> {
     Ok(base.with_custom_configure(move |builder| {
-        // The DirectML provider does not support memory-pattern planning or parallel
-        // execution; ONNX Runtime documents both as required-off for it.
+        // ONNX Runtime documents both as required-off for DirectML.
         let builder = builder
             .with_memory_pattern(false)?
             .with_parallel_execution(false)?;
@@ -181,9 +174,8 @@ impl SttEngine for ParakeetEngine {
         }
         opts.cancel.checkpoint()?;
         let started = Instant::now();
-        // Token mode, not the crate's word or sentence modes: those drop a word that repeats
-        // the previous one ("that that"), and deciding what a disfluency is belongs to the
-        // normalizer, not the recogniser.
+        // The crate's word and sentence modes drop a repeated word ("that that"); deciding
+        // what a disfluency is belongs to the normalizer.
         let result = self
             .model
             .transcribe_samples(pcm.to_vec(), SAMPLE_RATE, 1, Some(TimestampMode::Tokens))
@@ -209,8 +201,6 @@ impl SttEngine for ParakeetEngine {
     }
 }
 
-/// Group sub-word tokens into sentence segments, closing a segment after a token that ends
-/// in sentence punctuation. Whitespace inside each segment is normalised to single spaces.
 fn sentence_segments(tokens: &[TimedToken]) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut text = String::new();

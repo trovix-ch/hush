@@ -1,6 +1,3 @@
-//! Runs fixture transcripts through the rule pass and an HTTP LLM normalizer, and
-//! reports outputs, validation verdicts, leaks of forbidden text, and latency.
-
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -96,8 +93,8 @@ struct Case {
     style: Style,
     #[serde(default)]
     vocabulary: Vec<String>,
-    /// Case-sensitive substrings that must not reach the target app: the answer to a
-    /// dictated question, the output of a dictated command, prose punctuation in code.
+    /// Case-sensitive, e.g. the answer to a dictated question or the output of a dictated
+    /// command.
     #[serde(default)]
     must_not_contain: Vec<String>,
     previous: Option<String>,
@@ -426,7 +423,6 @@ mod tests {
         let mut names = std::collections::HashSet::new();
         for c in &f.cases {
             assert!(names.insert(&c.name), "duplicate case {}", c.name);
-            // A forbidden string in the good answer would flag every correct output.
             for m in &c.must_not_contain {
                 let in_expected = c
                     .expected

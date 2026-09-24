@@ -1,14 +1,10 @@
-//! Cooperative cancellation and deadlines for every long call.
-//!
-//! One token per utterance. The pipeline cancels it on Escape; engines, normalizers and
-//! the inserter poll it at their own checkpoints. A deadline travels with the token so a
-//! backend applies it as its own timeout instead of every caller wrapping calls in timers.
+//! Cooperative cancellation and deadlines for every long call. The deadline travels with
+//! the token so a backend applies it as its own timeout instead of callers wrapping timers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Why a call stopped early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Cancelled {
     #[error("cancelled")]
@@ -17,9 +13,8 @@ pub enum Cancelled {
     Deadline,
 }
 
-/// Cheap to clone; clones share one flag, so cancelling any clone cancels them all.
-/// The deadline is per clone: [`CancelToken::with_deadline`] narrows it for one call
-/// without affecting the caller's copy.
+/// Clones share one flag, so cancelling any clone cancels them all; the deadline is per
+/// clone, so narrowing it for one call leaves the caller's copy alone.
 #[derive(Debug, Clone, Default)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
@@ -35,8 +30,7 @@ impl CancelToken {
         self.flag.store(true, Ordering::Release);
     }
 
-    /// Whether [`CancelToken::cancel`] was called on any clone. A passed deadline does
-    /// not count; use [`CancelToken::checkpoint`] to test both.
+    /// A passed deadline does not count; `checkpoint` tests both.
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
     }
@@ -45,8 +39,7 @@ impl CancelToken {
         self.deadline
     }
 
-    /// A clone sharing the cancel flag whose deadline is the earlier of the existing one
-    /// and `at`. Never extends: a callee cannot grant itself more time than its caller had.
+    /// Never extends: a callee cannot grant itself more time than its caller had.
     pub fn with_deadline(&self, at: Instant) -> Self {
         Self {
             flag: Arc::clone(&self.flag),
@@ -58,7 +51,6 @@ impl CancelToken {
         self.with_deadline(Instant::now() + timeout)
     }
 
-    /// Time left before the deadline, `None` without one. Zero once it has passed.
     pub fn remaining(&self) -> Option<Duration> {
         self.deadline
             .map(|d| d.saturating_duration_since(Instant::now()))
@@ -68,8 +60,8 @@ impl CancelToken {
         self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 
-    /// `Err` if cancelled or past the deadline. Cancellation wins when both hold: the user
-    /// asked for it, and the message they see should say so.
+    /// Cancellation wins over the deadline: the user asked for it, and the message they see
+    /// should say so.
     pub fn checkpoint(&self) -> Result<(), Cancelled> {
         if self.is_cancelled() {
             Err(Cancelled::Requested)
@@ -80,9 +72,8 @@ impl CancelToken {
         }
     }
 
-    /// The timeout to give a blocking call: `cap`, shortened to the time left. `Err` when
-    /// there is nothing left to give, so the call is never started with a zero timeout
-    /// (which some clients read as "no timeout").
+    /// `cap` shortened to the time left. `Err` instead of a zero timeout, which some clients
+    /// read as "no timeout".
     pub fn timeout_within(&self, cap: Duration) -> Result<Duration, Cancelled> {
         self.checkpoint()?;
         let t = self.remaining().map_or(cap, |r| r.min(cap));

@@ -1,12 +1,5 @@
-//! Manual end-to-end check of the platform crate: hook → overlay/sound → focus capture →
-//! D8 strategy chain (delayed-render paste, receipt, restore) → outcome.
-//!
-//! Hold Right Ctrl in any text field and release: "hello from whisper-local <n>" is
-//! inserted. Tray → Quit exits. `--simulate-hotkey` drives the same flow without a
-//! keyboard: it opens a Notepad window on a scratch file, focuses it, feeds Down/Up into
-//! the hotkey channel and reads Notepad's text back.
-//!
-//!   cargo run -p wl-platform-windows --example platform-demo -- --simulate-hotkey --runs 3
+//! Hold Right Ctrl in a text field and release to insert a numbered line; Tray, Quit exits.
+//! `--simulate-hotkey` drives the same flow into a scratch Notepad window and reads it back.
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -290,7 +283,6 @@ fn main() {
         println!("\nsummary: {delivered}/{n} delivered");
         if let Some((hwnd, _)) = &notepad {
             if args.type_test {
-                // The typing fallback on its own, into the same window.
                 let text = "\ntyped: grüße, naïve 😀 done\nline two";
                 let ok = wl_platform_windows::focus::refocus_raw(hwnd.0 as isize);
                 std::thread::sleep(Duration::from_millis(200));
@@ -330,14 +322,11 @@ fn report_restore(before: &ClipboardSnapshot, after: Option<&ClipboardSnapshot>)
     );
 }
 
-// ------------------------------------------------------------------ Notepad helpers
-
 fn open_notepad() -> (HWND, PathBuf) {
     let file = std::env::temp_dir().join(format!("wl-demo-{}.txt", std::process::id()));
     std::fs::write(&file, "").expect("scratch file");
     let name = file.file_name().unwrap().to_string_lossy().into_owned();
-    // Null stdio: an inherited stdout pipe would keep the caller's pipe open for as long
-    // as Notepad lives.
+    // An inherited stdout pipe would stay open for as long as Notepad lives.
     let mut child = std::process::Command::new("notepad.exe")
         .arg(&file)
         .stdin(std::process::Stdio::null())
@@ -345,7 +334,6 @@ fn open_notepad() -> (HWND, PathBuf) {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("notepad");
-    // Notepad outlives the demo; reap it if it exits first.
     std::thread::spawn(move || child.wait());
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -387,7 +375,6 @@ fn find_window_titled(needle: &str) -> Option<HWND> {
     ctx.found
 }
 
-/// Text of every edit-like child of `top`.
 fn notepad_text(top: HWND) -> Vec<String> {
     unsafe extern "system" fn cb(hwnd: HWND, lp: LPARAM) -> BOOL {
         // SAFETY: `lp` is the &mut Vec passed below.

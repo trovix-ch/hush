@@ -1,12 +1,3 @@
-//! Record from the microphone and write 16 kHz mono WAV.
-//!
-//! ```text
-//! cargo run -p wl-audio --example record -- <out.wav> [--seconds N] [--device NAME] [--list]
-//! ```
-//!
-//! Stops after N seconds (default 5) or on Ctrl+C, prints a level meter while recording,
-//! then the VAD events over the take.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -86,7 +77,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         r.max_duration_reached
     );
 
-    // A warm restart must be instant: that is what the warm window buys.
     let t2 = Instant::now();
     rec.start()?;
     println!(

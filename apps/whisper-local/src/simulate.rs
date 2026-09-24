@@ -1,9 +1,5 @@
-//! `whisper-local simulate <wav>`: one dictation end to end without a keyboard.
-//!
-//! Runs the same driver, workers and pipeline as the app; only the microphone is
-//! replaced by the WAV and the hotkey by two synthetic events. Why not call the engines
-//! directly: the point is to time the path the user waits on, including the channel
-//! hops, the pipeline and the insertion strategy chain.
+//! Drives the real driver, workers and pipeline rather than the engines alone, so the
+//! timing covers the channel hops and the insertion chain the user waits on.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -180,7 +176,6 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
     let driver = std::thread::Builder::new()
         .name("wl-driver".into())
         .spawn(move || driver.run())?;
-    // The engine reports ready once more through the worker; nothing to wait for.
 
     let target = match args.target {
         Target::Notepad => {
@@ -208,10 +203,9 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         } else {
             r.foreground_ok = true;
         }
-        // Drain what earlier runs left behind (a late "ready", a restore).
         while obs_rx.try_recv().is_ok() {}
         let down = Instant::now();
-        // The hold covers the clip, so the pipeline sees a real press, not a tap.
+        // At least a second, so the pipeline sees a hold rather than a tap.
         let up = down + clip.max(Duration::from_secs(1));
         tx.send(Msg::Hotkey(HotkeyEvent::Down { at: down }))
             .context("driver is gone")?;

@@ -9,8 +9,7 @@ build = "build.rs"
 
 [features]
 default = []
-# Parakeet through ONNX Runtime (DirectML on Windows). Off by default so a default build
-# ships no ONNX Runtime; ggml/Vulkan measured about twice as fast on the target GPU.
+# Off by default: no ONNX Runtime in default builds; ggml/Vulkan measured about 2x faster.
 ort-engine = ["dep:parakeet-rs", "dep:ort"]
 
 [dependencies]
@@ -22,10 +21,9 @@ serde_json = "1"
 directories = "6"
 sha2 = "0.10"
 ureq = "3"
-# Pinned exactly: 0.x bindings over a native library, no semver promise between patches.
+# Pinned exactly: 0.x native bindings with no semver promise between patches.
 transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
-# Pinned exactly: both are pre-1.0 / release-candidate wrappers around ONNX Runtime and
-# change API between patch releases. They must agree on the `ort` version.
+# Pinned exactly: pre-1.0 ONNX wrappers that break API in patches and must agree on `ort`.
 parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["cpu", "ort-defaults", "api-28"] }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "api-28"] }
 

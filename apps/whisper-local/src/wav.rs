@@ -1,5 +1,3 @@
-//! A WAV file as the recording, for `simulate`.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -8,7 +6,6 @@ use wl_audio::resample::StreamResampler;
 use wl_core::recorder::{Recorder, RecorderError, Recording};
 use wl_core::stt::SAMPLE_RATE;
 
-/// Any PCM or float WAV as 16 kHz mono f32.
 pub fn read_16k_mono(path: &Path) -> Result<Vec<f32>> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -43,7 +40,7 @@ pub fn read_16k_mono(path: &Path) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Hands out the same clip on every `stop()`, as if the user had said it.
+/// Hands out the same clip on every `stop()`.
 pub struct WavRecorder {
     pcm: Vec<f32>,
     recording: bool,

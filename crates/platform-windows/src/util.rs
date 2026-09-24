@@ -1,8 +1,5 @@
-//! Small Win32 helpers shared by several modules.
-//!
-//! Why not the `windows` crate's `HWND` in shared state: it wraps a raw pointer and is
-//! neither `Send` nor `Sync`, while window handles are process-global values that any
-//! thread may post to. They cross threads as `isize` and are rebuilt at the call site.
+//! `HWND` is neither `Send` nor `Sync`, but window handles are process-global values any
+//! thread may post to, so they cross threads as `isize`.
 
 use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::System::Threading::{
@@ -19,8 +16,6 @@ pub(crate) fn hwnd_raw(h: HWND) -> isize {
     h.0 as isize
 }
 
-/// Lower-cased file name of a process image, or `None` when the process cannot be
-/// opened (it exited, or it is protected).
 pub(crate) fn exe_name_of_pid(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
@@ -52,7 +47,7 @@ pub(crate) fn basename_lower(path: &str) -> String {
         .to_lowercase()
 }
 
-/// (thread id, process id) of the thread that created `hwnd`; zeros for a dead window.
+/// (thread id, process id); zeros for a dead window.
 pub(crate) fn window_thread_pid(hwnd: HWND) -> (u32, u32) {
     let mut pid = 0u32;
     // SAFETY: plain FFI query; a stale handle yields 0 rather than UB.

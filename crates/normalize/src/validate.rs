@@ -1,9 +1,5 @@
-//! Gate between the LLM and the target app.
-//!
-//! The model is a cleaner; anything that looks like it answered, explained, translated or
-//! invented text is rejected here and the rule-pass output is inserted instead. Every
-//! check is cheap and one-directional: it can only turn an LLM output into a fallback,
-//! never alter it.
+//! Gate between the LLM and the target app. A check can only turn an LLM output into a
+//! fallback, never alter it.
 
 use std::collections::HashSet;
 
@@ -20,7 +16,6 @@ pub const DEFAULT_MAX_LENGTH_RATIO: f64 = 1.5;
 const MIN_WORDS_FOR_RATIOS: usize = 4;
 const LANGUAGE_PROBE_WORDS: usize = 5;
 
-/// Openings that mark a reply, not a cleaned transcript, unless the speaker said them.
 const PREAMBLES: &[&str] = &[
     "here is",
     "here's",
@@ -47,13 +42,12 @@ const PREAMBLES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct Config<'a> {
     pub language: Option<&'a str>,
-    /// Dictionary words may legitimately appear in the output without appearing in the
-    /// transcript: that is what fixing "cooper netties" to "Kubernetes" looks like.
+    /// May appear in the output without appearing in the transcript: that is what fixing
+    /// "cooper netties" to "Kubernetes" looks like.
     pub vocabulary: &'a [String],
     pub min_containment: f64,
     pub min_length_ratio: f64,
     pub max_length_ratio: f64,
-    /// Every whitespace token of the candidate must appear, byte for byte, in the source.
     pub verbatim: bool,
 }
 
@@ -129,13 +123,10 @@ fn is_number_word(w: &str) -> bool {
     w.chars().all(|c| c.is_ascii_digit()) || NUMBER_WORDS.contains(&w)
 }
 
-/// Validates with default thresholds and no vocabulary.
 pub fn validate(source: &str, candidate: &str, lang: Option<&str>) -> Result<Scores, Rejection> {
     validate_with(source, candidate, &Config::new(lang, &[]))
 }
 
-/// `Ok` carries the scores of the checks that measured something, so a pass can be
-/// logged with its margin.
 pub fn validate_with(source: &str, candidate: &str, cfg: &Config<'_>) -> Result<Scores, Rejection> {
     let mut scores = Scores::default();
     let cand = candidate.trim();
@@ -240,8 +231,7 @@ pub fn validate_with(source: &str, candidate: &str, cfg: &Config<'_>) -> Result<
     Ok(scores)
 }
 
-/// Lower-cased alphanumeric runs. Apostrophes split words on both sides alike, so
-/// "don't" compares as "don" + "t" in source and candidate.
+/// Apostrophes split words on both sides alike, so "don't" compares as "don" + "t".
 fn words(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
@@ -434,7 +424,6 @@ mod tests {
 
     #[test]
     fn language_check_fires_on_its_own() {
-        // Containment is disabled so the probe is the only thing that can reject.
         let mut cfg = Config::new(Some("de"), &[]);
         cfg.min_containment = 0.0;
         let r = validate_with(
@@ -475,7 +464,6 @@ mod tests {
             validate_with(src, "git commit dash m fix typo.", &cfg),
             Err(Rejection::NotVerbatim("typo.".into()))
         );
-        // Prose style tolerates the same change.
         assert_eq!(v(src, "Git commit dash m fix typo."), Ok(()));
     }
 

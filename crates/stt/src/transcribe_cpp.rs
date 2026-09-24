@@ -1,6 +1,3 @@
-//! transcribe.cpp (ggml) engine: Parakeet, Whisper and other GGUF speech models on Vulkan
-//! or CPU.
-
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -13,20 +10,18 @@ use wl_core::stt::{
 /// Below one 10 ms feature hop there is nothing to recognise.
 const MIN_SAMPLES: usize = 160;
 
-/// The native abort callback can only read the library's own flag, so a watcher copies
-/// ours across. Its poll interval bounds how late a cancel lands; 5 ms is invisible next
-/// to a decode and costs nothing measurable while parked.
+/// The native abort callback reads only the library's own flag, so a watcher copies ours
+/// across; this bounds how late a cancel lands.
 const CANCEL_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone)]
 pub struct TranscribeCppOptions {
     pub backend: Backend,
-    /// Index into the Vulkan devices only (see [`vulkan_devices`]). `None` lets ggml pick,
-    /// which may be an integrated GPU or the card the LLM is using.
+    /// Index among Vulkan devices only. `None` lets ggml pick, which may be an integrated
+    /// GPU or the card the LLM is using.
     pub gpu_device: Option<usize>,
-    /// Threads for work on the CPU. `None` picks half the logical cores, i.e. the
-    /// physical cores on SMT machines: ggml's spin-waiting threads lose throughput when
-    /// they share a core.
+    /// `None` picks half the logical cores: ggml's spin-waiting threads lose throughput
+    /// when they share a physical core.
     pub threads: Option<usize>,
 }
 
@@ -40,10 +35,9 @@ impl TranscribeCppOptions {
     }
 }
 
-/// A Vulkan device as enumerated by ggml.
 #[derive(Debug, Clone)]
 pub struct DeviceSummary {
-    /// Position among Vulkan devices; what [`TranscribeCppOptions::gpu_device`] takes.
+    /// Position among Vulkan devices only.
     pub index: usize,
     pub name: String,
     pub description: String,
@@ -66,7 +60,6 @@ pub fn vulkan_devices() -> Vec<DeviceSummary> {
         .collect()
 }
 
-/// transcribe.cpp library version and commit.
 pub fn library_version() -> String {
     format!("{} ({})", tc::version(), tc::version_commit())
 }
@@ -85,8 +78,8 @@ fn load_err(e: tc::Error) -> SttError {
 }
 
 impl TranscribeCppEngine {
-    /// Load a GGUF model. Fails rather than falling back to the CPU when Vulkan was
-    /// requested and no Vulkan device took the weights.
+    /// Fails rather than falling back to the CPU when Vulkan was requested and no Vulkan
+    /// device took the weights.
     pub fn new(
         model_path: &Path,
         backend: Backend,
@@ -143,7 +136,7 @@ impl TranscribeCppEngine {
         )
         .map_err(load_err)?;
 
-        // Reported as the ggml device name, e.g. `Vulkan1` or `CPU`.
+        // A ggml device name such as `Vulkan1` or `CPU`, not the backend enum.
         let loaded = model.backend();
         let lower = loaded.to_ascii_lowercase();
         let loaded_backend = if lower.starts_with("vulkan") {
@@ -261,9 +254,8 @@ impl TranscribeCppEngine {
                 .map_or_else(|| SttError::Inference(e.to_string()), SttError::from),
             other => SttError::Inference(other.to_string()),
         })?;
-        // The encoder cannot be interrupted, so a cancel during it only lands when the run
-        // ends. A late deadline still returns the finished work; a cancel never does,
-        // because the caller has said it will not use it.
+        // The encoder cannot be interrupted, so a cancel during it lands only when the run
+        // ends. A late deadline still returns the finished work; a cancel never does.
         if opts.cancel.is_cancelled() {
             return Err(SttError::Cancelled);
         }
@@ -277,8 +269,7 @@ impl SttEngine for TranscribeCppEngine {
     }
 
     /// ggml builds a GPU pipeline per graph shape and the driver compiles shaders on first
-    /// use (seconds on a fresh driver cache), so warm up with the longest expected clip
-    /// and then a short one rather than a single short clip.
+    /// use (seconds on a fresh cache), so one short clip does not warm the long path.
     fn warm_up(&mut self) -> Result<(), SttError> {
         let opts = DecodeOptions::default();
         for secs in [30, 1] {
@@ -328,7 +319,6 @@ fn ms(v: i64) -> Duration {
     Duration::from_millis(u64::try_from(v).unwrap_or(0))
 }
 
-/// Engine segments when it produced any, else one segment spanning the audio.
 fn to_segments(tr: &tc::Transcript, audio_len: Duration) -> Vec<Segment> {
     let segs: Vec<Segment> = tr
         .segments
@@ -426,8 +416,6 @@ mod tests {
         assert!(matches!(err, SttError::Backend(_)));
     }
 
-    /// Needs a GGUF model:
-    /// `WL_TEST_TC_MODEL=<path to .gguf> cargo test -p wl-stt cancel -- --nocapture`.
     #[test]
     fn live_cancellation() {
         let Some(path) = std::env::var_os("WL_TEST_TC_MODEL") else {
@@ -460,8 +448,6 @@ mod tests {
         let r = engine.transcribe(&audio, &opts);
         let cancelled_time = started.elapsed();
         canceller.join().unwrap();
-        // Silence has no decode steps and the encoder is not interruptible, so this run
-        // ends at its natural length; only the result is withheld.
         eprintln!(
             "cancel supported: {}; full run {full_time:?}, cancelled run {cancelled_time:?}",
             engine.info().caps.cancel

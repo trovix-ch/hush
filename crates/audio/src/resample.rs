@@ -1,21 +1,15 @@
-//! Streaming fixed-ratio resampling of mono audio to 16 kHz.
-
 use audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
 use wl_core::stt::SAMPLE_RATE;
 
-/// Feeds arbitrary-length blocks through a fixed-chunk FFT resampler and keeps the output
-/// length equal to `input_len * ratio` over a whole take, with the resampler's start-up
-/// delay removed. Getting the length exact matters more than it looks: pre-roll seeding
-/// and VAD timestamps are both sample offsets.
+/// Output length is exactly `input_len * ratio` over a take, with rubato's start-up delay
+/// removed, because pre-roll seeding and VAD timestamps are both sample offsets.
 pub struct StreamResampler {
-    /// `None` when the device already runs at 16 kHz.
     inner: Option<Fft<f32>>,
     rate_in: u32,
     chunk_in: usize,
     pending: Vec<f32>,
     out_buf: Vec<f32>,
-    /// Output frames still to discard: the FFT delay after construction or reset.
     skip: usize,
     delay: usize,
     frames_in: u64,
@@ -40,9 +34,8 @@ impl StreamResampler {
                 frames_out: 0,
             });
         }
-        // 20 ms chunks: small enough that the level meter and VAD see fresh audio, large
-        // enough that FFT overhead per sample stays negligible. `Both` makes every call
-        // consume and produce a constant count, so no per-call size bookkeeping.
+        // 20 ms: fresh enough for the level meter and VAD, large enough that FFT overhead
+        // stays negligible.
         let chunk = (rate_in as usize / 50).max(1);
         let fft = Fft::<f32>::new(
             rate_in as usize,
@@ -72,12 +65,10 @@ impl StreamResampler {
         self.rate_in
     }
 
-    /// Output frames the given number of input frames should become.
     fn expected_out(&self, frames_in: u64) -> u64 {
         (frames_in * SAMPLE_RATE as u64 + self.rate_in as u64 / 2) / self.rate_in as u64
     }
 
-    /// Resample `input` and append whatever complete output is ready to `out`.
     pub fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
         self.frames_in += input.len() as u64;
         let Some(fft) = self.inner.as_mut() else {
@@ -101,10 +92,8 @@ impl StreamResampler {
         self.pending.drain(..consumed);
     }
 
-    /// Emit everything still buffered so the take's output length is exact, then return to
-    /// a fresh state. Flushing pads with silence, so the next take must not continue the
-    /// old filter state; resetting costs one delay's worth of output, which lands in the
-    /// pre-roll where nothing depends on it.
+    /// Resets afterwards because flushing pads with silence the next take must not inherit;
+    /// the reset costs one delay of output, which lands in the pre-roll.
     pub fn flush(&mut self, out: &mut Vec<f32>) {
         let target = self.expected_out(self.frames_in);
         if let Some(fft) = self.inner.as_mut() {
@@ -144,8 +133,8 @@ fn run_chunk(fft: &mut Fft<f32>, block: &[f32], idx: Option<&Indexing>, out: &mu
     let mut output = InterleavedSlice::new_mut(out, 1, frames_out).expect("mono slice");
     match fft.process_into_buffer(&input, &mut output, idx) {
         Ok((_, produced)) => produced,
-        // Buffers are sized from the resampler's own reported maxima, so this cannot fire
-        // short of a rubato bug; dropping one chunk beats panicking the audio worker.
+        // Buffers are sized from rubato's own maxima; dropping a chunk beats panicking the
+        // audio worker.
         Err(_) => 0,
     }
 }
@@ -206,8 +195,6 @@ mod tests {
 
     #[test]
     fn preserves_tone_and_alignment() {
-        // A 440 Hz tone must come out as a 440 Hz tone at the same phase: a wrong delay
-        // compensation would shift every VAD timestamp.
         let input = sine(48_000, 440.0, 1.0);
         let out = run(48_000, &input, 1000);
         let reference = sine(16_000, 440.0, 1.0);

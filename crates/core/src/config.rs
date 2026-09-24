@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::insert::{AppPolicies, AppPolicy, Chord};
 use crate::normalize::Style;
 
-/// Written on first run, and what a missing key falls back to. A test holds it equal to
-/// `Config::default()`.
+/// Written on first run. Must parse to `Config::default()`.
 pub const DEFAULT_CONFIG: &str = r#"# whisper-local configuration. Every key is optional; a missing key takes the value shown.
 
 # Hold to talk. CapsLock is the alternative for keyboards without a Right Ctrl.
@@ -55,13 +54,11 @@ never_type = false
 style = "code"
 "#;
 
-/// D13: a GPU product never silently becomes a CPU product.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GpuPolicy {
-    /// Fail loudly when no GPU backend loads.
     RequireGpu,
-    /// Fall back to the CPU and say so in the overlay and logs.
+    /// Falls back to the CPU and says so; never silently.
     #[default]
     PreferGpu,
     CpuOnly,
@@ -70,10 +67,9 @@ pub enum GpuPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineChoice {
-    /// Model id from the download manifest.
     pub model: String,
     pub gpu: GpuPolicy,
-    /// Vulkan device index. With two GPUs, the one not running the LLM.
+    /// Vulkan device index.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_device: Option<usize>,
 }
@@ -93,7 +89,7 @@ impl Default for EngineChoice {
 pub enum NormalizerChoice {
     #[default]
     Rules,
-    /// A local OpenAI-compatible server. Development backend (D5).
+    /// A local OpenAI-compatible server.
     Http {
         base_url: String,
         model: String,
@@ -109,7 +105,6 @@ fn default_http_timeout_ms() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppRule {
-    /// Executable file name, matched case-insensitively.
     pub exe: String,
     #[serde(default)]
     pub chord: Chord,
@@ -193,7 +188,7 @@ impl Config {
     }
 }
 
-/// Whole seconds: a TOML reader should not have to know serde's `{secs, nanos}` shape.
+/// Whole seconds, so a TOML reader never sees serde's `{secs, nanos}` shape.
 mod secs {
     use std::time::Duration;
 

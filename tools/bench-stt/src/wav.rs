@@ -1,5 +1,3 @@
-//! WAV loading and conversion to the 16 kHz mono f32 every engine expects.
-
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -36,12 +34,10 @@ pub fn read_wav(path: &Path) -> Result<Pcm> {
     })
 }
 
-/// Scale a signed integer sample of `bits` width into [-1, 1).
 pub fn int_to_f32(v: i32, bits: u16) -> f32 {
     (f64::from(v) / f64::from(1u32 << (bits - 1))) as f32
 }
 
-/// Average interleaved channels into one.
 pub fn downmix(interleaved: &[f32], channels: u16) -> Vec<f32> {
     let ch = usize::from(channels.max(1));
     if ch == 1 {
@@ -66,7 +62,6 @@ pub fn resample(mono: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
     Ok(out.take_data())
 }
 
-/// Convert any supported WAV content to 16 kHz mono f32.
 pub fn to_engine_pcm(pcm: &Pcm, target_rate: u32) -> Result<Vec<f32>> {
     let mono = downmix(&pcm.samples, pcm.channels);
     resample(&mono, pcm.sample_rate, target_rate)

@@ -1,23 +1,18 @@
-//! The device side: opening a stream and the real-time callback.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rtrb::Producer;
 use wl_core::recorder::RecorderError;
 
-/// State the real-time callbacks may touch. Atomics only: the callback must not block,
-/// allocate or log, and the error callback runs on the same device thread.
+/// Atomics only: the real-time callback must not block, allocate or log.
 #[derive(Debug, Default)]
 pub struct CallbackShared {
-    /// Device-rate frames the ring had no room for.
+    /// In device-rate frames.
     pub dropped: AtomicUsize,
-    /// The stream is dead: device removed, or the default changed and WASAPI does not
-    /// rebind an open client.
     pub lost: AtomicBool,
 }
 
-/// An open capture stream. Dropping it closes the device.
+/// Dropping it closes the device.
 pub struct OpenedStream {
     pub sample_rate: u32,
     pub channels: u16,
@@ -25,8 +20,7 @@ pub struct OpenedStream {
     pub handle: Box<dyn Send>,
 }
 
-/// Opens capture streams that deliver mono f32 at the device rate into `producer`.
-/// A trait so the worker's warm-window and pre-roll logic runs in tests without hardware.
+/// Delivers mono f32 at the device rate into `producer`.
 pub trait StreamOpener: Send + 'static {
     fn open(
         &mut self,
@@ -36,10 +30,8 @@ pub trait StreamOpener: Send + 'static {
     ) -> Result<OpenedStream, RecorderError>;
 }
 
-/// Average interleaved frames to mono and push them. Returns frames that did not fit.
-///
-/// Mono by averaging, not by picking channel 0: array mics and some USB headsets put the
-/// signal on one channel only, and an average keeps it at worst 6 dB down instead of gone.
+/// Returns frames that did not fit. Averages rather than picking channel 0 because array
+/// mics and some USB headsets put the signal on one channel only.
 pub fn downmix_into<T, F>(
     data: &[T],
     channels: usize,

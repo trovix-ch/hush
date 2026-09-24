@@ -1,8 +1,5 @@
-//! Insertion contract and the D8 strategy chain as pure logic.
-//!
-//! The chain decides chord, reads the clipboard receipt, picks the fallback and the
-//! restore delay. The Win32 calls sit behind three small ports implemented in the
-//! platform crate, so every branch here runs in unit tests against fakes.
+//! Insertion contract and the paste-with-read-receipt strategy chain, as pure logic over
+//! small OS ports so every branch runs against fakes.
 
 use std::time::Duration;
 
@@ -12,8 +9,8 @@ use crate::cancel::CancelToken;
 use crate::context::FocusContext;
 use crate::normalize::Style;
 
-/// Paste chord sent to the target. Per app because conhost ignores Ctrl+Shift+V and some
-/// terminals bind Ctrl+V to something else.
+/// Per app because conhost ignores Ctrl+Shift+V and some terminals bind Ctrl+V to
+/// something else.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Chord {
@@ -25,44 +22,37 @@ pub enum Chord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefuseReason {
-    /// Target runs at a higher integrity level; injected input is dropped by the OS.
     Elevated,
     Password,
-    /// The window captured at hotkey-down is no longer the foreground.
     FocusChanged,
-    /// Remote desktop, Citrix or WSL client window: typing would land in the wrong
-    /// session and the paste receipt is meaningless there.
+    /// Typing would land in the wrong session and the paste receipt is meaningless there.
     UnsupportedRemote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaveReason {
-    /// Nothing read the clipboard after the chord and this app may not be typed into.
     NeverType,
     ChordFailed(String),
     TypingFailed(String),
 }
 
-/// The D8 receipt, and what the chain finally did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertOutcome {
-    /// The render came after the chord from the target's own process.
     TargetRead,
-    /// Something else read first (before the chord, or another process after it); the
-    /// target's own read is invisible. Most likely inserted, not confirmed.
+    /// Something else read first, which hides the target's own read: most likely
+    /// inserted, not confirmed.
     ThirdPartyRead {
         reader: Option<String>,
     },
     Typed,
-    /// Nothing read the clipboard within the bound. A classification the chain turns
-    /// into `Typed` or `LeftOnClipboard`; it never returns it.
+    /// An intermediate classification the chain turns into `Typed` or `LeftOnClipboard`;
+    /// it never returns it.
     NotRequested,
-    /// Someone else wrote the clipboard meanwhile. Not restored: that write is theirs.
+    /// Not restored: the foreign write is theirs.
     ClipboardChanged,
     LeftOnClipboard {
         reason: LeaveReason,
     },
-    /// Not attempted. `on_clipboard` says whether the text was left there instead.
     Refused {
         reason: RefuseReason,
         on_clipboard: bool,
@@ -70,7 +60,6 @@ pub enum InsertOutcome {
 }
 
 impl InsertOutcome {
-    /// The text reached the target, as far as anything here can tell.
     pub fn delivered(&self) -> bool {
         matches!(
             self,
@@ -78,7 +67,6 @@ impl InsertOutcome {
         )
     }
 
-    /// What to tell the user when the text did not arrive. `None` when it did.
     pub fn message(&self) -> Option<String> {
         let where_ = |on_clipboard: bool| {
             if on_clipboard {
@@ -127,8 +115,8 @@ pub enum InsertError {
 }
 
 pub trait Inserter: Send {
-    /// Insert `text` into `target`. Cancellation is honoured until the paste chord is
-    /// sent; after that the paste is in the target's hands and is only observed.
+    /// Cancellation is honoured until the paste chord is sent; after that the paste is in
+    /// the target's hands and is only observed.
     fn insert(
         &mut self,
         target: &FocusContext,
@@ -141,14 +129,12 @@ pub trait Inserter: Send {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reader {
     pub pid: Option<u32>,
-    /// Lower-case executable file name.
     pub exe: Option<String>,
 }
 
 impl Reader {
-    /// Matched on the executable: `FocusContext` carries no process id, so two instances
-    /// of one program are indistinguishable here. An unknown reader never matches, which
-    /// errs towards "third party": a later restore, and no typing.
+    /// Matched on the executable because the focus context carries no pid. An unknown
+    /// reader never matches, erring towards a later restore and no typing.
     fn is_target(&self, target: &FocusContext) -> bool {
         match (&self.exe, &target.exe) {
             (Some(r), Some(t)) => r.eq_ignore_ascii_case(t),
@@ -159,11 +145,11 @@ impl Reader {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderWait {
-    /// First render request since the last write. Windows asks the owner exactly once per
-    /// write, so there is never a second one to wait for.
+    /// Windows asks the owner to render exactly once per write, so there is never a
+    /// second read to wait for.
     Read(Reader),
     TimedOut,
-    /// The sequence number moved: a foreign write replaced ours.
+    /// A foreign write replaced ours.
     Changed,
 }
 
@@ -173,33 +159,31 @@ pub trait ClipboardPort: Send {
     /// Bounded, best-effort copy of the current contents.
     fn snapshot(&mut self) -> Result<Self::Snapshot, InsertError>;
 
-    /// Offer `text` as delayed-rendered `CF_UNICODETEXT`, marked for exclusion from
-    /// history and cloud sync. Returns the sequence number after the write.
+    /// Delayed-rendered, excluded from clipboard history and cloud sync. Returns the
+    /// sequence number after the write.
     fn write_delayed(&mut self, text: &str) -> Result<u64, InsertError>;
 
     fn sequence_number(&self) -> u64;
 
     fn wait_for_render(&mut self, timeout: Duration) -> RenderWait;
 
-    /// Put `snapshot` back after `after`, but only if the sequence number is still
-    /// `if_sequence` then. Must not block: the ≈1 s third-party delay would otherwise sit
-    /// on the release-to-text path of the next utterance.
+    /// Only if the sequence number is still `if_sequence` by then. Must not block: the
+    /// ≈1 s third-party delay would otherwise sit on the next utterance's latency path.
     fn restore(&mut self, snapshot: Self::Snapshot, after: Duration, if_sequence: u64);
 }
 
 pub trait InputPort: Send {
-    /// Release modifiers the user still holds, so the chord is not Ctrl+Alt+V.
+    /// So a still-held modifier does not turn the chord into Ctrl+Alt+V.
     fn release_modifiers(&mut self) -> Result<(), InsertError>;
     fn send_chord(&mut self, chord: Chord) -> Result<(), InsertError>;
-    /// One batch of Unicode key events.
     fn type_text(&mut self, text: &str) -> Result<(), InsertError>;
 }
 
 pub trait FocusPort: Send {
     fn foreground_window(&self) -> usize;
 
-    /// Whether `target` is (again) the foreground window. An implementation may try to
-    /// refocus it first; it must never steal focus from a window the user moved to.
+    /// An implementation may try to refocus `target` first; it must never steal focus
+    /// from a window the user moved to.
     fn is_still(&mut self, target: &FocusContext) -> bool {
         target.window != 0 && self.foreground_window() == target.window
     }
@@ -207,12 +191,11 @@ pub trait FocusPort: Send {
     fn is_remote_session(&self) -> bool;
 }
 
-/// Per-app insertion and style settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppPolicy {
     pub chord: Chord,
-    /// Never fall back to typing: apps where autocomplete or Enter-to-send would mangle
-    /// typed text, or that paste late and would get the text twice.
+    /// For apps where autocomplete or Enter-to-send would mangle typed text, or that paste
+    /// late and would get the text twice.
     pub never_type: bool,
     pub style: Style,
 }
@@ -220,7 +203,6 @@ pub struct AppPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppPolicies {
     pub default: AppPolicy,
-    /// Lower-case executable name and its policy; the first match wins.
     pub by_exe: Vec<(String, AppPolicy)>,
 }
 
@@ -238,17 +220,15 @@ impl AppPolicies {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertTiming {
-    /// Between the clipboard write and the chord; any read in it is a third party.
-    /// D8 measured the RDP clipboard reading within 1 ms of every write.
+    /// Between the write and the chord; any read in it is a third party. The RDP
+    /// clipboard was measured reading within 1 ms of every write.
     pub early_read_gap: Duration,
-    /// How long after the chord a missing read means the chord did not paste. Targets
-    /// were measured reading within 2.3 ms; the bound is for slow apps under load, and it
-    /// is only ever paid in full on the typing fallback path.
+    /// Targets were measured reading within 2.3 ms; the bound is for slow apps under load
+    /// and is only paid in full on the typing fallback path.
     pub render_timeout: Duration,
-    /// After a target read: the app already holds the data.
     pub restore_margin: Duration,
-    /// After a third-party read the target's own read cannot be seen, so wait long enough
-    /// for a late paste; history covers the rare miss.
+    /// After a third-party read the target's own read cannot be seen, so wait for a late
+    /// paste; history covers the rare miss.
     pub third_party_restore_delay: Duration,
 }
 
@@ -276,10 +256,8 @@ pub const DEFAULT_UNSUPPORTED_TARGETS: &[&str] = &[
 pub struct InsertPolicy {
     pub timing: InsertTiming,
     pub apps: AppPolicies,
-    /// Lower-case executable names refused as `UnsupportedRemote`.
     pub unsupported_targets: Vec<String>,
-    /// Inside a remote session, type instead of pasting so the text never reaches the
-    /// clipboard that RDP forwards to the client machine.
+    /// Keeps the text off the clipboard that RDP forwards to the client machine.
     pub type_only_in_remote: bool,
 }
 
@@ -297,8 +275,8 @@ impl Default for InsertPolicy {
     }
 }
 
-/// D8: delayed-render paste with a read receipt, typing as fallback, clipboard as the
-/// last resort.
+/// Delayed-render paste with a read receipt, typing as fallback, clipboard as the last
+/// resort.
 pub struct StrategyChain<C, I, F> {
     clipboard: C,
     input: I,
@@ -347,8 +325,7 @@ impl<C: ClipboardPort, I: InputPort, F: FocusPort> StrategyChain<C, I, F> {
         }
     }
 
-    /// Restores only while our write is still the latest; a foreign write is the user's
-    /// newer data and must survive.
+    /// A foreign write is the user's newer data and must survive.
     fn restore(&mut self, snapshot: Option<C::Snapshot>, after: Duration, ours: u64) {
         if let Some(s) = snapshot
             && self.clipboard.sequence_number() == ours
@@ -410,7 +387,6 @@ impl<C: ClipboardPort, I: InputPort, F: FocusPort> StrategyChain<C, I, F> {
             self.restore(snapshot, Duration::ZERO, ours);
             return Err(InsertError::Cancelled);
         }
-        // Text stays on the clipboard: the user moved on, and it must not be lost.
         if !self.focus.is_still(target) {
             return Ok(InsertOutcome::Refused {
                 reason: RefuseReason::FocusChanged,
@@ -427,7 +403,6 @@ impl<C: ClipboardPort, I: InputPort, F: FocusPort> StrategyChain<C, I, F> {
             });
         }
 
-        // After an early read Windows will not ask again, so there is nothing to wait for.
         let outcome = match early {
             Some(r) => InsertOutcome::ThirdPartyRead { reader: r.exe },
             None => match self.clipboard.wait_for_render(timing.render_timeout) {
@@ -503,8 +478,8 @@ impl<C: ClipboardPort, I: InputPort, F: FocusPort> Inserter for StrategyChain<C,
             return Err(InsertError::Cancelled);
         }
         let app = self.policy.apps.lookup(target.exe.as_deref()).clone();
-        // A dictated secret on the clipboard is readable by every process and forwarded
-        // by RDP; history keeps it recoverable instead.
+        // A secret on the clipboard is readable by every process and forwarded by RDP;
+        // history keeps it recoverable instead.
         if target.is_password {
             return Ok(InsertOutcome::Refused {
                 reason: RefuseReason::Password,

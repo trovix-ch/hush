@@ -1,17 +1,13 @@
-//! What the user sees and hears: overlay state, sounds, toasts.
-//!
-//! A port only. The overlay, tray and sound player live in the platform crate; the
-//! pipeline talks to them through this trait so it can be tested with a recorder of calls.
+//! The port for what the user sees and hears: overlay state, sounds, toasts.
 
 use crate::normalize::Provenance;
 
-/// Where the final text came from, reduced to what the overlay shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceHint {
     Rules,
     Llm,
-    /// The LLM was wanted but its output was rejected or it failed; rule-pass text was
-    /// inserted. D4 asks for a subtle indicator, never an error.
+    /// Rule-pass text was inserted because the LLM failed or was rejected. Shown as a
+    /// subtle indicator, never an error.
     LlmFallback,
 }
 
@@ -28,9 +24,8 @@ impl From<&Provenance> for ProvenanceHint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayState {
     Idle,
-    /// `level` in `0.0..=1.0`. The pipeline only ever sends `0.0`; the live meter is fed
-    /// by the driver straight from the recorder, because routing 30 updates a second
-    /// through the state machine would buy nothing.
+    /// `level` in `0.0..=1.0`. The pipeline only ever sends `0.0`; routing the live meter's
+    /// 30 updates a second through the state machine would buy nothing.
     Listening {
         level: f32,
     },
@@ -58,7 +53,7 @@ pub enum Sound {
 pub trait Notifier: Send {
     fn set_state(&mut self, state: OverlayState);
     fn play(&mut self, sound: Sound);
-    /// A message that outlives the overlay, e.g. "text is on the clipboard".
+    /// A message that outlives the overlay.
     fn toast(&mut self, message: &str);
 }
 

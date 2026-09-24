@@ -1,19 +1,8 @@
-//! Push-to-talk hotkey through our own `WH_KEYBOARD_LL` hook (design D7).
-//!
-//! Why not `RegisterHotKey`, polling or a hotkey crate: none of them deliver key-up for a
-//! modifier-only key *and* let us swallow it. Why the callback is so bare: Windows
-//! silently unhooks a low-level hook whose callback exceeds `LowLevelHooksTimeout` and
-//! never says so, so the callback compares, `try_send`s and returns; no locks,
-//! allocation, logging or `GetAsyncKeyState`. Everything else (reinstalling, the Alt/Win
-//! menu mask, shutdown) happens on the same thread *after* the callback returned, driven
-//! by thread messages, because a hook may only be removed by the thread that owns it.
-//!
-//! Why the watchdog does not simply compare `GetAsyncKeyState` of the hotkey with the
-//! hook's view, as first sketched in D7: a key the hook swallows never reaches the async
-//! key state (verified by `swallowed_key_never_reaches_async_state` below), so while the
-//! hook works the physical-state query *always* disagrees with "held". The watchdog
-//! therefore inverts the check (the hotkey showing up in the async state means nobody
-//! swallowed it) and adds an active probe while a recording is running.
+//! Windows silently removes a low-level hook whose callback overruns
+//! `LowLevelHooksTimeout`, so the callback only compares, `try_send`s and returns; all
+//! other work is posted back to the hook thread, the only thread allowed to unhook.
+//! A key the hook swallows never reaches `GetAsyncKeyState`, so the watchdog reads the
+//! hotkey showing up there as proof that nothing swallowed it.
 
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -37,9 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::INJECTED_TAG;
 
-// ------------------------------------------------------------------ public types
-
-/// What the hook reports. Timestamps are taken inside the callback, before any queueing.
+/// Timestamps are taken inside the callback, before any queueing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyEvent {
     Down {
@@ -48,13 +35,11 @@ pub enum HotkeyEvent {
     Up {
         at: Instant,
     },
-    /// Escape pressed while the hotkey is held, or while [`HookHandle::set_escape_armed`]
-    /// is on; the Escape itself is swallowed.
+    /// Escape while the hotkey is held or Escape is armed; the Escape itself is swallowed.
     Cancel {
         at: Instant,
     },
-    /// The watchdog found the hook dead and reinstalled it. If the hotkey was held, a
-    /// synthetic `Up` is sent right before this.
+    /// If the hotkey was held, a synthetic `Up` precedes this.
     HookReinstalled {
         at: Instant,
         reason: ReinstallReason,
@@ -63,13 +48,9 @@ pub enum HotkeyEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReinstallReason {
-    /// A probe injected while the hotkey was held never reached the callback.
     ProbeUnanswered,
-    /// The hotkey showed up in the async key state, so nothing swallowed it.
     KeyNotSwallowed,
-    /// Other keys changed state but the callback heartbeat did not move.
     HeartbeatStopped,
-    /// Requested through [`HookHandle::reinstall`].
     Requested,
 }
 
@@ -110,15 +91,14 @@ const VK_LCONTROL: u8 = 0xA2;
 const VK_RCONTROL: u8 = 0xA3;
 const VK_LMENU: u8 = 0xA4;
 const VK_RMENU: u8 = 0xA5;
-/// Unassigned virtual key: used as the Alt/Win menu mask and as the watchdog probe.
+/// Unassigned, so injecting it has no effect of its own.
 const VK_MASK: u16 = 0xE8;
 
-/// A hotkey: one key, optionally with modifiers that must be held when it goes down.
-/// For a chord of modifiers only (`Ctrl+Win`), the last one named is the key.
+/// Modifiers must be held when the key goes down. In a modifier-only chord (`Ctrl+Win`)
+/// the last one named is the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySpec {
-    /// Virtual key. For `any_side` keys this is the side-neutral code (VK_CONTROL,
-    /// VK_SHIFT, VK_MENU, or VK_LWIN standing for both Win keys).
+    /// Side-neutral for `any_side` keys, with VK_LWIN standing for both Win keys.
     pub vk: u8,
     pub any_side: bool,
     /// Bit set of MOD_* flags.
@@ -148,7 +128,6 @@ impl KeySpec {
         }
     }
 
-    /// Every concrete virtual key this spec can be pressed as.
     fn concrete_vks(self) -> &'static [u8] {
         match (self.any_side, self.vk) {
             (true, VK_CONTROL) => &[VK_LCONTROL, VK_RCONTROL],
@@ -193,17 +172,15 @@ fn modifier_bit(vk: u8) -> u8 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeyConfig {
     pub key: KeySpec,
-    /// How often the watchdog thread wakes.
     pub watchdog_period: Duration,
-    /// While the hotkey is held, how often the watchdog proves the hook alive by
-    /// injecting an unassigned key. Zero disables the probe.
+    /// Liveness probe while the hotkey is held; zero disables it.
     pub probe_interval: Duration,
     accept_injected: bool,
 }
 
 impl HotkeyConfig {
-    /// Parses `RightCtrl`, `CapsLock`, `F13`, `Ctrl+Win`, `Ctrl+Shift+Space` and the like.
-    /// Case-insensitive; `+` separated; modifiers first.
+    /// `RightCtrl`, `F13`, `Ctrl+Shift+Space`: case-insensitive, `+` separated, modifiers
+    /// first.
     pub fn parse(s: &str) -> Result<Self, HotkeyParseError> {
         Ok(Self::new(parse_key_spec(s)?))
     }
@@ -217,9 +194,8 @@ impl HotkeyConfig {
         }
     }
 
-    /// Lets injected (synthetic) events trigger the hotkey. Only for automated tests,
-    /// which cannot press physical keys; in normal use another program's injected
-    /// input must never start a recording.
+    /// Tests cannot press physical keys; in normal use another program's injected input
+    /// must never start a recording.
     #[doc(hidden)]
     pub fn accept_injected_for_tests(mut self) -> Self {
         self.accept_injected = true;
@@ -308,18 +284,13 @@ fn key_by_name(name: &str) -> Option<(u8, bool)> {
     Some(fixed)
 }
 
-// ------------------------------------------------------------------ shared state
-
 struct Shared {
     spec: AtomicU32,
     accept_injected: AtomicBool,
     heartbeat: AtomicU64,
-    /// The hook's own view: hotkey down was swallowed and its up not yet seen.
     held: AtomicBool,
-    /// Escape cancels even without the hotkey held: set by the app while something is in
-    /// flight. Off when idle, so an idle app never steals Escape from the user.
+    /// Off when idle, so an idle app never steals Escape from the user.
     escape_armed: AtomicBool,
-    /// Test-only fault injection: the next callback sleeps this long.
     stall_ms: AtomicU32,
     stop: AtomicBool,
 }
@@ -333,15 +304,13 @@ struct CallbackState {
 }
 
 thread_local! {
-    // Const-initialised: first access from the callback allocates nothing.
+    // Const-initialised so first access from the callback allocates nothing.
     static CB: RefCell<CallbackState> = const {
         RefCell::new(CallbackState { shared: None, tx: None })
     };
-    /// Concrete vk whose down we swallowed; 0 when not held.
+    /// 0 when not held.
     static SWALLOWED: Cell<u8> = const { Cell::new(0) };
-    /// Escape was swallowed on the way down, so its up is ours too.
     static ESC_SWALLOWED: Cell<bool> = const { Cell::new(false) };
-    /// Modifiers currently down as seen by the hook, one bit per side.
     static MODS_DOWN: Cell<u16> = const { Cell::new(0) };
     static THREAD_ID: Cell<u32> = const { Cell::new(0) };
 }
@@ -405,7 +374,7 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
     if swallow { LRESULT(1) } else { pass() }
 }
 
-/// The whole per-event decision. Returns true to swallow.
+/// Returns true to swallow.
 fn decide(shared: &Shared, tx: &SyncSender<HotkeyEvent>, kb: &KBDLLHOOKSTRUCT, msg: u32) -> bool {
     let vk = (kb.vkCode & 0xFF) as u8;
     let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
@@ -470,8 +439,8 @@ fn decide(shared: &Shared, tx: &SyncSender<HotkeyEvent>, kb: &KBDLLHOOKSTRUCT, m
     SWALLOWED.with(|s| s.set(vk));
     shared.held.store(true, Ordering::Release);
     send(tx, HotkeyEvent::Down { at });
-    // Alt or Win logically down with nothing else pressed opens a menu or Start when it
-    // is released; an unassigned key in between prevents that. Injected after return.
+    // Releasing Alt or Win with nothing pressed in between opens a menu or Start; an
+    // unassigned key in between prevents it.
     if held_mods & (MOD_ALT | MOD_WIN) != 0 || matches!(side_neutral(vk), VK_MENU | VK_LWIN) {
         let tid = THREAD_ID.with(Cell::get);
         // SAFETY: posting to our own thread's queue; no pointers travel with it.
@@ -481,8 +450,8 @@ fn decide(shared: &Shared, tx: &SyncSender<HotkeyEvent>, kb: &KBDLLHOOKSTRUCT, m
 }
 
 fn send(tx: &SyncSender<HotkeyEvent>, ev: HotkeyEvent) {
-    // A full channel means the consumer is stuck; dropping is better than blocking the
-    // hook into removal.
+    // A full channel means the consumer is stuck; dropping beats blocking the hook into
+    // removal.
     match tx.try_send(ev) {
         Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
     }
@@ -513,11 +482,8 @@ fn send_inputs(inputs: &[INPUT]) -> u32 {
     unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) }
 }
 
-// ------------------------------------------------------------------ hook thread
-
 fn install_hook() -> windows::core::Result<HHOOK> {
-    // SAFETY: GetModuleHandleW(None) returns this executable's module, valid for the
-    // process lifetime; the callback is a 'static function.
+    // SAFETY: our own module handle lives for the process and the callback is 'static.
     unsafe {
         let module = GetModuleHandleW(None)?;
         SetWindowsHookExW(
@@ -621,15 +587,12 @@ fn reason_from(c: usize) -> ReinstallReason {
     }
 }
 
-// ------------------------------------------------------------------ watchdog
-
 fn key_down_async(vk: u8) -> bool {
     // SAFETY: plain FFI query. Only ever called off the hook thread.
     (unsafe { GetAsyncKeyState(vk as i32) } as u16) & 0x8000 != 0
 }
 
-/// Keyboard keys whose async state the heartbeat check samples. Mouse buttons are left
-/// out because they never pass through a keyboard hook.
+/// Skips the mouse buttons, which never pass through a keyboard hook.
 fn sample_keys(buf: &mut [bool; 256]) {
     for (vk, slot) in buf.iter_mut().enumerate() {
         *slot = vk > 7 && vk < 0xFF && key_down_async(vk as u8);
@@ -646,12 +609,11 @@ fn watchdog_thread(
     let mut prev_keys = [false; 256];
     let mut cur_keys = [false; 256];
     sample_keys(&mut prev_keys);
-    // Heartbeats of the last two ticks, oldest first.
     let mut hb_hist = [shared.heartbeat.load(Ordering::Relaxed); 2];
     let mut last_probe = Instant::now();
     let mut unswallowed_ticks = 0u32;
-    // After a reinstall the hotkey may still be physically down; do not count it again
-    // until it has been seen released.
+    // After a reinstall the hotkey may still be physically down; it counts again only
+    // once it has been seen released.
     let mut key_check_armed = true;
     let mut last_reinstall: Option<Instant> = None;
 
@@ -685,7 +647,6 @@ fn watchdog_thread(
         let held = shared.held.load(Ordering::Acquire);
         let spec = KeySpec::unpack(shared.spec.load(Ordering::Relaxed));
 
-        // 1. Active probe while a recording runs: the one time a dead hook costs the most.
         if held && !blind && !probe_interval.is_zero() && last_probe.elapsed() >= probe_interval {
             last_probe = Instant::now();
             let start = shared.heartbeat.load(Ordering::Relaxed);
@@ -704,8 +665,7 @@ fn watchdog_thread(
             }
         }
 
-        // 2. The hotkey visible in the async state means it was not swallowed. Only for
-        //    plain keys: with required modifiers, a bare press legitimately passes.
+        // With required modifiers a bare press legitimately passes through unswallowed.
         if let Some(spec) = spec
             && spec.modifiers == 0
         {
@@ -723,9 +683,8 @@ fn watchdog_thread(
             }
         }
 
-        // 3. Keys changed but the callback never ran. Compared against the heartbeat of
-        //    two ticks ago so an event caught between hook and state update is not
-        //    misread as a dead hook.
+        // Compared with the heartbeat of two ticks ago, so an event caught between the
+        // hook and the key-state update is not misread as a dead hook.
         let changed = cur_keys
             .iter()
             .zip(prev_keys.iter())
@@ -739,14 +698,10 @@ fn watchdog_thread(
     }
 }
 
-// ------------------------------------------------------------------ handle
-
-/// Installs the hook and its watchdog.
 pub struct HotkeyHook;
 
 impl HotkeyHook {
-    /// Spawns the hook thread (hook + message loop) and the watchdog timer thread.
-    /// Events arrive on `tx`; the callback never blocks on it.
+    /// The callback never blocks on `tx`; events are dropped while it is full.
     pub fn install(
         config: HotkeyConfig,
         tx: SyncSender<HotkeyEvent>,
@@ -792,8 +747,7 @@ impl HotkeyHook {
     }
 }
 
-/// Owns the hook thread. Dropping it stops the watchdog, unhooks on the hook thread
-/// and joins both threads.
+/// Dropping it unhooks and joins both threads.
 pub struct HookHandle {
     shared: Arc<Shared>,
     hook_tid: u32,
@@ -803,7 +757,7 @@ pub struct HookHandle {
 }
 
 impl HookHandle {
-    /// Swaps the hotkey. A key already held keeps being tracked until its release.
+    /// A key already held keeps being tracked until its release.
     pub fn update(&self, config: &HotkeyConfig) {
         self.shared.spec.store(config.key.pack(), Ordering::Relaxed);
         self.shared
@@ -816,18 +770,15 @@ impl HookHandle {
         self.shared.heartbeat.load(Ordering::Relaxed)
     }
 
-    /// Swallow Escape and report it as [`HotkeyEvent::Cancel`] even while the hotkey is
-    /// up: while a recording runs hands-free or an utterance is still being processed.
+    /// Swallow Escape and report it as [`HotkeyEvent::Cancel`] even while the hotkey is up.
     pub fn set_escape_armed(&self, armed: bool) {
         self.shared.escape_armed.store(armed, Ordering::Relaxed);
     }
 
-    /// Whether the hook believes the hotkey is currently held.
     pub fn is_held(&self) -> bool {
         self.shared.held.load(Ordering::Acquire)
     }
 
-    /// Forces an unhook/reinstall cycle on the hook thread.
     pub fn reinstall(&self) {
         // SAFETY: posting a plain integer message to the hook thread.
         let _ = unsafe {
@@ -840,8 +791,7 @@ impl HookHandle {
         };
     }
 
-    /// Fault injection for the manual test matrix: the next callback sleeps `ms`, which
-    /// past `LowLevelHooksTimeout` makes Windows silently remove the hook.
+    /// Past `LowLevelHooksTimeout`, Windows silently removes the hook.
     #[doc(hidden)]
     pub fn debug_stall_next_callback(&self, ms: u32) {
         self.shared.stall_ms.store(ms, Ordering::Relaxed);
@@ -862,8 +812,6 @@ impl Drop for HookHandle {
         }
     }
 }
-
-// ------------------------------------------------------------------ tests
 
 #[cfg(test)]
 mod tests {
@@ -972,8 +920,6 @@ mod tests {
         );
     }
 
-    // ---- live hook tests: inject keys through SendInput and watch the channel.
-
     static LIVE: Mutex<()> = Mutex::new(());
 
     fn key_event(vk: u8, up: bool) -> INPUT {
@@ -995,9 +941,8 @@ mod tests {
         }
     }
 
-    /// `SendInput` needs an interactive input desktop. A disconnected or locked session
-    /// refuses every injection with access denied, and no hook test can run there; that
-    /// is reported, not failed, so `cargo test` stays deterministic for a remote user.
+    /// A locked or disconnected session refuses every injection, so live tests report
+    /// SKIPPED there instead of failing.
     pub(crate) fn input_desktop_available() -> bool {
         let n = super::send_inputs(&mask_inputs(true));
         if n == 0 {
@@ -1021,10 +966,8 @@ mod tests {
         rx.recv_timeout(Duration::from_millis(1000)).ok()
     }
 
-    /// Shadows the module's `send_inputs` so a refused injection fails loudly instead of
-    /// looking like a hook that saw nothing. `SendInput` is refused when the session has
-    /// no interactive input desktop (a minimised or disconnected RDP client, the lock
-    /// screen) or an elevated window is in front.
+    /// Asserts, so a refused injection fails loudly instead of looking like a hook that
+    /// saw nothing.
     fn send_inputs(inputs: &[INPUT]) -> u32 {
         let n = super::send_inputs(inputs);
         assert_eq!(
@@ -1052,7 +995,6 @@ mod tests {
         send_inputs(&[key_event(0x7C, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
         assert!(!h.is_held());
-        // Our own tag passes through untouched even with injected input accepted.
         let mut own = key_event(0x7C, false);
         own.Anonymous.ki.dwExtraInfo = INJECTED_TAG;
         let mut own_up = key_event(0x7C, true);
@@ -1075,7 +1017,6 @@ mod tests {
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
         send_inputs(&[key_event(VK_LSHIFT, true), key_event(0x7D, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
-        // Swap to a different key at runtime.
         h.update(
             &HotkeyConfig::parse("F15")
                 .unwrap()
@@ -1086,8 +1027,6 @@ mod tests {
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
     }
 
-    /// The fact the watchdog design rests on: a key the hook swallows never shows up in
-    /// `GetAsyncKeyState`, while one it passes does.
     #[test]
     fn swallowed_key_never_reaches_async_state() {
         let _g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1101,7 +1040,6 @@ mod tests {
         let swallowed_visible = key_down_async(0x7F);
         send_inputs(&[key_event(0x7F, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
-        // F17 is not the hotkey, so it passes and lands in the async state.
         send_inputs(&[key_event(0x80, false)]);
         std::thread::sleep(Duration::from_millis(50));
         let passed_visible = key_down_async(0x80);
@@ -1110,8 +1048,6 @@ mod tests {
         assert!(passed_visible, "passed F17 not visible in async state");
     }
 
-    /// A callback that overruns `LowLevelHooksTimeout` gets the hook silently removed;
-    /// the watchdog's probe notices while the key is held and reinstalls.
     #[test]
     fn watchdog_recovers_from_stalled_callback() {
         let _g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1122,7 +1058,6 @@ mod tests {
         send_inputs(&[key_event(0x81, false)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
         h.debug_stall_next_callback(1500);
-        // Nothing we inject from here reaches a live hook, so the probe goes unanswered.
         let t0 = Instant::now();
         send_inputs(&[key_event(0x82, false), key_event(0x82, true)]);
         let mut got_up = false;
@@ -1134,12 +1069,10 @@ mod tests {
                 _ => {}
             }
         }
-        // Release F18 physically-equivalent so the async state is clean.
         send_inputs(&[key_event(0x81, true)]);
         eprintln!("watchdog: {reinstalled:?} after {:?}", t0.elapsed());
         assert!(reinstalled.is_some(), "watchdog never reinstalled");
         assert!(got_up, "no synthetic Up for the held key");
-        // The new hook works.
         while rx.try_recv().is_ok() {}
         send_inputs(&[key_event(0x81, false), key_event(0x81, true)]);
         let after = next(&rx);

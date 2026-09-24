@@ -1,10 +1,7 @@
-//! Identity of one dictation, carried on every request and result so a reply for an
-//! utterance the pipeline has already moved past is recognised and dropped.
-
 use serde::{Deserialize, Serialize};
 
-/// Monotonic within one pipeline. Zero is never issued, so a default-constructed id in a
-/// request that forgot to set it cannot match a live utterance.
+/// Zero is never issued, so a default-constructed id in a request that forgot to set it
+/// cannot match a live utterance.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]

@@ -1,9 +1,3 @@
-//! whisper-local: hold a key, speak, release; cleaned-up text appears at the cursor.
-//!
-//! The binary is wiring only. Every decision about what happens next lives in
-//! `wl_core::pipeline`; this crate owns the threads, devices and engines that the state
-//! machine's effects are executed on.
-
 #[cfg(windows)]
 mod doctor;
 #[cfg(windows)]

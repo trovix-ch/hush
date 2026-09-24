@@ -1,7 +1,3 @@
-//! Capture worker: drains the ring, resamples, routes audio to the recording or the
-//! pre-roll, and owns the warm window. Single-threaded and clock-injected so every state
-//! transition is unit-testable; the thread around it only forwards commands.
-
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -29,8 +25,8 @@ impl Clock for SystemClock {
     }
 }
 
-/// Read by the handle without a round trip to the worker: the overlay polls the level at
-/// frame rate and must never wait behind a stream open.
+/// Atomics rather than a worker round trip: the overlay polls the level at frame rate and
+/// must never wait behind a stream open.
 #[derive(Debug, Default)]
 pub struct Shared {
     level_bits: AtomicU32,
@@ -49,10 +45,8 @@ impl Shared {
     }
 }
 
-/// 50 ms at 16 kHz.
 const LEVEL_WINDOW: usize = SAMPLE_RATE as usize / 20;
-/// Seconds of device-rate audio the ring holds. The worker drains every 10 ms, so this only
-/// matters when it is starved, e.g. while a stop flushes; overruns are counted, not hidden.
+/// Only matters when the worker is starved, e.g. while a stop flushes.
 const RING_SECONDS: usize = 2;
 
 struct LevelMeter {
@@ -95,7 +89,6 @@ struct Take {
     overruns: usize,
     lost_at: Option<Instant>,
     capped: bool,
-    /// Delivery-rate audit, see [`Take::shortfall`].
     first_data_at: Option<Instant>,
     last_data_at: Option<Instant>,
     frames_after_first: u64,
@@ -119,8 +112,8 @@ impl Take {
             return;
         }
         if self.first_data_at.is_none() {
-            // The first batch covers time before it was drained, so it is the reference
-            // point rather than counted: that keeps cold-start latency out of the audit.
+            // The first batch covers time before it was drained; counting it would put
+            // cold-start latency into the audit.
             self.first_data_at = Some(now);
         } else {
             self.frames_after_first += frames as u64;
@@ -128,17 +121,16 @@ impl Take {
         self.last_data_at = Some(now);
     }
 
-    /// Device-rate frames the device should have delivered but did not. Some virtual
-    /// devices (measured: RDP "Remote Audio", 2026-09-24) deliver about three quarters of
-    /// their nominal rate, flagging only discontinuities and keeping their own timestamps
-    /// consistent with the short count, so wall-clock time is the only witness.
+    /// RDP "Remote Audio" delivers about three quarters of its nominal rate (measured
+    /// 2026-09-24) with timestamps consistent with the short count, so wall-clock time is
+    /// the only witness.
     fn shortfall(&self, rate: u32) -> u64 {
         let (Some(a), Some(b)) = (self.first_data_at, self.last_data_at) else {
             return 0;
         };
         let expected = b.saturating_duration_since(a).as_secs_f64() * rate as f64;
         let missing = expected - self.frames_after_first as f64;
-        // Drain timing jitters by a callback period or two; below this it is noise.
+        // Drain timing jitters by a callback period or two.
         let tolerance = rate as f64 * 0.05 + expected * 0.02;
         if missing > tolerance {
             missing as u64
@@ -201,8 +193,7 @@ impl<O: StreamOpener> Engine<O> {
     fn open(&mut self) -> Result<(), RecorderError> {
         let t0 = Instant::now();
         let cb = Arc::new(CallbackShared::default());
-        // Capacity is fixed before the rate is known; 192 kHz covers every shared-mode
-        // format Windows offers.
+        // Sized before the rate is known; 192 kHz covers every shared-mode format.
         let (producer, consumer) = RingBuffer::new(192_000 * RING_SECONDS);
         let stream = self
             .opener
@@ -385,9 +376,8 @@ enum Cmd {
     Cancel,
 }
 
-/// A [`Recorder`] that runs an [`Engine`] on its own thread. The stream is owned by that
-/// thread for its whole life, so the COM apartment cpal sets up there is never shared with
-/// the UI or hook threads.
+/// The stream lives on this worker thread for its whole life so the COM apartment cpal
+/// sets up is never shared with the UI or hook threads.
 pub struct WorkerRecorder {
     tx: Option<mpsc::Sender<Cmd>>,
     shared: Arc<Shared>,
@@ -416,7 +406,6 @@ impl WorkerRecorder {
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         }
                     } else {
-                        // Cold: nothing to drain, so sleep until asked instead of polling.
                         match rx.recv() {
                             Ok(c) => Some(c),
                             Err(_) => break,
@@ -568,7 +557,7 @@ mod tests {
         (e, probe, t0)
     }
 
-    /// Feed `secs` of constant `v` at 48 kHz in 10 ms blocks, pumping like the worker.
+    /// Only correct for a 48 kHz stream.
     fn feed_secs(e: &mut Engine<FakeOpener>, p: &Probe, v: f32, secs: f64, t: &mut Instant) {
         let blocks = (secs * 100.0).round() as usize;
         for _ in 0..blocks {
@@ -608,18 +597,16 @@ mod tests {
         e.start(t).unwrap();
         feed_secs(&mut e, &p, 0.0, 0.2, &mut t);
         e.stop(t).unwrap();
-        // Idle but warm: the speaker starts just before the key press.
         feed_secs(&mut e, &p, 0.0, 1.0, &mut t);
         feed_secs(&mut e, &p, 0.5, 0.2, &mut t);
         e.start(t).unwrap();
         feed_secs(&mut e, &p, 0.5, 0.5, &mut t);
         let r = e.stop(t).unwrap();
-        // The pre-roll ends where the resampler's output did at `start()`, which trails the
-        // ring by at most one 20 ms chunk plus the FFT delay; that audio is not lost, it
-        // lands in the recording instead.
+        // Resampler output trails the ring by up to one chunk plus its delay at `start()`;
+        // that audio lands in the recording instead of the pre-roll.
         let extra = r.pcm.len() - (4800 + 8000);
         assert!(extra <= 400, "{}", r.pcm.len());
-        // Pre-roll holds the last 300 ms: 100 ms of silence then 200 ms of signal.
+        // Default 300 ms pre-roll: 100 ms of silence, then 200 ms of signal.
         let head: f32 = r.pcm[..1000].iter().map(|x| x.abs()).sum::<f32>() / 1000.0;
         let tail: f32 = r.pcm[2400..4800].iter().sum::<f32>() / 2400.0;
         assert!(head < 0.05, "head {head}");
@@ -739,7 +726,6 @@ mod tests {
     fn slow_device_is_reported_as_dropped() {
         let (mut e, p, mut t) = engine(RecorderConfig::default(), 48_000);
         e.start(t).unwrap();
-        // 75 % of the nominal rate, as the RDP redirected microphone delivers.
         for _ in 0..200 {
             p.feed(0.1, 360);
             t += ms(10);
@@ -755,10 +741,9 @@ mod tests {
     }
 
     #[test]
-    fn on_time_device_reports_nothing_dropped() {
+    fn bursty_but_complete_device_reports_nothing_dropped() {
         let (mut e, p, mut t) = engine(RecorderConfig::default(), 44_100);
         e.start(t).unwrap();
-        // Bursty but complete delivery: 20 ms every other tick.
         for i in 0..300 {
             if i % 2 == 0 {
                 p.feed(0.1, 882);

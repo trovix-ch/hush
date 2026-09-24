@@ -1,5 +1,3 @@
-//! Building the speech engine and the normalizer from the config.
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12,10 +10,9 @@ use wl_normalize::{HttpConfig, NormalizerChain, OpenAiHttpNormalizer};
 use wl_stt::models::{self, ModelManifest};
 use wl_stt::{TranscribeCppEngine, transcribe_cpp};
 
-/// The only engine family a default build contains (D17).
+/// The only engine family this binary contains.
 const ENGINE_FAMILY: &str = "transcribe-cpp";
 
-/// Where the configured model lives, and whether this build can load it.
 pub fn resolve_model(choice: &EngineChoice) -> Result<(&'static ModelManifest, PathBuf)> {
     let model = models::find(&choice.model)?;
     if model.engine != ENGINE_FAMILY {
@@ -31,20 +28,18 @@ pub fn resolve_model(choice: &EngineChoice) -> Result<(&'static ModelManifest, P
     Ok((model, dir))
 }
 
-/// What loaded, where, and how long it took. Reported, never assumed (D13).
 #[derive(Debug, Clone)]
 pub struct EngineSummary {
     pub model: String,
     pub backend: Backend,
     pub device: Option<String>,
-    /// Set when `prefer-gpu` fell back to the CPU: why the GPU did not load.
+    /// Why the GPU did not load when `prefer-gpu` fell back to the CPU.
     pub fallback: Option<String>,
     pub load: Duration,
     pub warm_up: Duration,
 }
 
 impl EngineSummary {
-    /// One line for the tray tooltip and logs.
     pub fn short(&self) -> String {
         let device = self.device.as_deref().unwrap_or("default device");
         match self.backend {
@@ -54,7 +49,7 @@ impl EngineSummary {
     }
 }
 
-/// Loads and warms the engine under the configured GPU policy. Blocking; seconds.
+/// Blocks for seconds.
 pub fn load_engine(
     choice: &EngineChoice,
     model_path: &Path,
@@ -98,7 +93,6 @@ pub fn load_engine(
     Ok((Box::new(engine), summary))
 }
 
-/// Vulkan devices with a note on which one the config selects.
 pub fn describe_vulkan_devices(selected: Option<usize>) -> Vec<String> {
     transcribe_cpp::vulkan_devices()
         .into_iter()
@@ -119,8 +113,6 @@ pub fn describe_vulkan_devices(selected: Option<usize>) -> Vec<String> {
         .collect()
 }
 
-// ------------------------------------------------------------------ normalizer
-
 pub fn http_config(choice: &NormalizerChoice) -> Option<HttpConfig> {
     match choice {
         NormalizerChoice::Rules => None,
@@ -136,7 +128,6 @@ pub fn http_config(choice: &NormalizerChoice) -> Option<HttpConfig> {
     }
 }
 
-/// Result of asking the server what it serves.
 #[derive(Debug, Clone)]
 pub struct Probe {
     pub elapsed: Duration,
@@ -146,8 +137,8 @@ pub struct Probe {
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Lists the server's models. Cheap and loads nothing, so it answers even when the model
-/// itself is cold; `Err` means the server is not there.
+/// Loads nothing, so it answers even when the model is cold; `Err` means the server is
+/// not there.
 pub fn probe_http(cfg: &HttpConfig) -> Result<Probe> {
     let (url, key) = match cfg.dialect {
         Dialect::Ollama => {
@@ -193,7 +184,7 @@ pub fn probe_http(cfg: &HttpConfig) -> Result<Probe> {
     })
 }
 
-/// Probes, builds and warms the HTTP stage. `Err` explains why the app stays rules-only.
+/// `Err` explains why the app stays rules-only.
 pub fn build_http_normalizer(cfg: HttpConfig) -> Result<(Box<dyn Normalizer>, Duration)> {
     let probe = probe_http(&cfg).context("normalizer server did not answer")?;
     if !probe.has_model {
