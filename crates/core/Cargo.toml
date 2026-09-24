@@ -1,6 +1,6 @@
 [package]
-name = "wl-core"
-description = "Platform-neutral types, traits and state machine for whisper-local"
+name = "hush-core"
+description = "Platform-neutral types, traits and state machine for hush"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

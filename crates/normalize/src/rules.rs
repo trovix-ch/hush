@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use wl_core::normalize::{
+use hush_core::normalize::{
     NormalizeError, NormalizeOutput, NormalizeRequest, Normalizer, Provenance, Style,
 };
 
@@ -615,7 +615,7 @@ fn apply_style(toks: &mut [Tok], style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wl_core::normalize::AppContext;
+    use hush_core::normalize::AppContext;
 
     fn formal(s: &str) -> String {
         clean(s, Some("en"), Style::Formal, &[])
@@ -1044,11 +1044,11 @@ mod tests {
             vocabulary: &[],
             app: &app,
             previous: None,
-            utterance: wl_core::UtteranceId(3),
-            cancel: wl_core::CancelToken::new(),
+            utterance: hush_core::UtteranceId(3),
+            cancel: hush_core::CancelToken::new(),
         };
         let out = RuleNormalizer::new().normalize(&req).unwrap();
-        assert_eq!(out.utterance, wl_core::UtteranceId(3));
+        assert_eq!(out.utterance, hush_core::UtteranceId(3));
         assert_eq!(out.text, "Hello.");
         assert_eq!(out.provenance, Provenance::Rules);
         assert_eq!(RuleNormalizer.id(), "rules");

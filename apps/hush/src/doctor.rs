@@ -2,13 +2,13 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
+use hush_core::stt::{DecodeOptions, SAMPLE_RATE};
+use hush_platform_windows::focus;
+use hush_platform_windows::hook::HotkeyConfig;
+use hush_platform_windows::ui_thread::{self, INSTANCE_MUTEX, UiError};
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_SWITCHDESKTOP, OpenInputDesktop, SwitchDesktop,
 };
-use wl_core::stt::{DecodeOptions, SAMPLE_RATE};
-use wl_platform_windows::focus;
-use wl_platform_windows::hook::HotkeyConfig;
-use wl_platform_windows::ui_thread::{self, INSTANCE_MUTEX, UiError};
 
 use crate::engines;
 use crate::setup::{self, Paths};
@@ -35,8 +35,8 @@ pub fn input_desktop_unlocked() -> bool {
 
 pub fn run(paths: &Paths) -> Result<ExitCode> {
     let (config, created) = setup::load_config(&paths.config_file)?;
-    let _log = setup::init_logging(&paths.logs_dir, "warn,wl_stt::models=info")?;
-    println!("whisper-local doctor\n");
+    let _log = setup::init_logging(&paths.logs_dir, "warn,hush_stt::models=info")?;
+    println!("hush doctor\n");
     row(
         "config",
         format!(
@@ -70,13 +70,13 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
         "instance",
         match ui_thread::acquire_single_instance(INSTANCE_MUTEX) {
             Ok(_guard) => "no other instance running".to_string(),
-            Err(UiError::AlreadyRunning) => "whisper-local is running in this session".into(),
+            Err(UiError::AlreadyRunning) => "hush is running in this session".into(),
             Err(e) => format!("check failed: {e}"),
         },
     );
 
     println!("\ninput devices");
-    match wl_audio::list_input_devices() {
+    match hush_audio::list_input_devices() {
         Ok(devs) if devs.is_empty() => println!("  none (dictation needs a microphone)"),
         Ok(devs) => {
             for d in devs {
@@ -134,7 +134,7 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
                 dir.display()
             ),
         );
-        if let Err(e) = wl_stt::models::ensure_downloaded(model, &dir) {
+        if let Err(e) = hush_stt::models::ensure_downloaded(model, &dir) {
             row("", format!("DOWNLOAD FAILED: {e}"));
             return Ok(ExitCode::FAILURE);
         }

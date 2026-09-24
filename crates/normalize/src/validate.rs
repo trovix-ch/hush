@@ -3,8 +3,8 @@
 
 use std::collections::HashSet;
 
-pub use wl_core::normalize::Rejection;
-use wl_core::normalize::{Measured, Scores};
+pub use hush_core::normalize::Rejection;
+use hush_core::normalize::{Measured, Scores};
 
 use crate::lang;
 
@@ -276,7 +276,7 @@ mod tests {
             Some("en"),
         )
         .unwrap_err();
-        assert_eq!(r.check(), wl_core::normalize::Check::Containment);
+        assert_eq!(r.check(), hush_core::normalize::Check::Containment);
         assert!(r.score().unwrap() < DEFAULT_MIN_CONTAINMENT);
         assert_eq!(r.threshold(), Some(DEFAULT_MIN_CONTAINMENT));
     }

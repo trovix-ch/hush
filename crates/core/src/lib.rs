@@ -1,4 +1,4 @@
-//! Platform-neutral contracts and pipeline logic for whisper-local. Nothing here may
+//! Platform-neutral contracts and pipeline logic for hush. Nothing here may
 //! depend on Win32 or an inference library.
 
 pub mod cancel;

@@ -45,8 +45,8 @@ pub struct FocusSnapshot {
 }
 
 impl FocusSnapshot {
-    pub fn to_core(&self) -> wl_core::context::FocusContext {
-        wl_core::context::FocusContext {
+    pub fn to_core(&self) -> hush_core::context::FocusContext {
+        hush_core::context::FocusContext {
             window: self.hwnd as usize,
             exe: self.exe.clone(),
             title: self.title.clone(),
@@ -242,7 +242,7 @@ pub(crate) fn refocus_hwnd(raw: isize) -> bool {
     }
 }
 
-impl wl_core::insert::FocusPort for WinFocus {
+impl hush_core::insert::FocusPort for WinFocus {
     fn foreground_window(&self) -> usize {
         // SAFETY: plain FFI query.
         hwnd_raw(unsafe { GetForegroundWindow() }) as usize
@@ -250,7 +250,7 @@ impl wl_core::insert::FocusPort for WinFocus {
 
     /// Refocuses only when nothing or one of our own windows took the foreground; a
     /// window the user moved to is never taken away from them.
-    fn is_still(&mut self, target: &wl_core::context::FocusContext) -> bool {
+    fn is_still(&mut self, target: &hush_core::context::FocusContext) -> bool {
         if target.window == 0 {
             return false;
         }
@@ -285,7 +285,7 @@ impl UiaWorker {
         let busy = Arc::new(AtomicBool::new(false));
         let busy_w = busy.clone();
         let join = std::thread::Builder::new()
-            .name("wl-uia".into())
+            .name("hush-uia".into())
             .spawn(move || uia_thread(rx, busy_w))
             .ok();
         Self {

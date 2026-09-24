@@ -28,12 +28,12 @@ use crate::util::{hwnd_from, hwnd_raw, wide};
 
 /// Per session: a second hook in one session would double every hotkey, but another
 /// user's session may run its own instance.
-pub const INSTANCE_MUTEX: &str = r"Local\whisper-local";
-const APP_DIR: &str = "whisper-local";
+pub const INSTANCE_MUTEX: &str = r"Local\hush";
+const APP_DIR: &str = "hush";
 
 #[derive(Debug, thiserror::Error)]
 pub enum UiError {
-    #[error("another whisper-local is already running in this session")]
+    #[error("another hush is already running in this session")]
     AlreadyRunning,
     #[error("UI thread failed to start: {0}")]
     Start(String),
@@ -156,7 +156,7 @@ impl UiHandle {
         let (tray_tx, tray_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = std::thread::Builder::new()
-            .name("wl-ui".into())
+            .name("hush-ui".into())
             .spawn(move || ui_thread(options, rx, tray_tx, ready_tx))
             .map_err(|e| UiError::Start(e.to_string()))?;
         let hwnd = ready_rx
@@ -237,12 +237,12 @@ impl WinNotifier {
     }
 }
 
-impl wl_core::notify::Notifier for WinNotifier {
-    fn set_state(&mut self, state: wl_core::notify::OverlayState) {
+impl hush_core::notify::Notifier for WinNotifier {
+    fn set_state(&mut self, state: hush_core::notify::OverlayState) {
         self.ui.set_overlay(state.into());
     }
 
-    fn play(&mut self, sound: wl_core::notify::Sound) {
+    fn play(&mut self, sound: hush_core::notify::Sound) {
         crate::sound::play(sound.into());
     }
 
@@ -407,7 +407,7 @@ fn ui_thread(
         hwnd,
         overlay,
         tray,
-        tooltip: "whisper-local".into(),
+        tooltip: "hush".into(),
         paused: false,
         requested: OverlayState::Hidden,
         admin: AdminWatch::default(),
@@ -435,7 +435,7 @@ fn create_control_window() -> windows::core::Result<HWND> {
     // SAFETY: a 'static window procedure and a message-only window owned by this thread.
     unsafe {
         let inst = GetModuleHandleW(PCWSTR::null())?;
-        let class = w!("wl-ui-control");
+        let class = w!("hush-ui-control");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(control_wndproc),
             hInstance: inst.into(),
@@ -446,7 +446,7 @@ fn create_control_window() -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
-            w!("whisper-local ui"),
+            w!("hush ui"),
             WINDOW_STYLE(0),
             0,
             0,
@@ -532,8 +532,8 @@ mod tests {
     #[test]
     fn paths_follow_the_layout() {
         let p = AppPaths::under(Path::new(r"C:\R"), Path::new(r"C:\L"));
-        assert_eq!(p.config_file, Path::new(r"C:\R\whisper-local\config.toml"));
-        assert_eq!(p.models_dir, Path::new(r"C:\L\whisper-local\models"));
+        assert_eq!(p.config_file, Path::new(r"C:\R\hush\config.toml"));
+        assert_eq!(p.models_dir, Path::new(r"C:\L\hush\models"));
         let real = AppPaths::resolve().expect("known folders");
         let appdata = std::env::var("APPDATA").unwrap();
         assert!(real.config_file.starts_with(appdata));
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn second_instance_is_refused() {
-        let name = format!(r"Local\whisper-local-test-{}", std::process::id());
+        let name = format!(r"Local\hush-test-{}", std::process::id());
         let first = acquire_single_instance(&name).expect("first");
         assert!(matches!(
             acquire_single_instance(&name),
@@ -595,7 +595,7 @@ mod tests {
         ui.set_overlay(OverlayState::Status {
             message: "Loading".into(),
         });
-        ui.set_tooltip("whisper-local · test");
+        ui.set_tooltip("hush · test");
         ui.set_paused(true);
         let seq = ui.clipboard().sequence_number();
         assert!(seq > 0);

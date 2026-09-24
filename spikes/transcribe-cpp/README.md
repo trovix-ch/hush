@@ -17,7 +17,7 @@ Prerequisites: Rust 1.97 MSVC, VS 2022 (MSVC 14.44), CMake 4.4, Vulkan SDK 1.4.3
 export VULKAN_SDK='C:\VulkanSDK\1.4.357.0'
 export PATH="/c/VulkanSDK/1.4.357.0/Bin:/c/Program Files/CMake/bin:$PATH"
 cargo build --release          # cold: 166 s including the native CMake + shader build
-M="$LOCALAPPDATA/whisper-local/models/spike"
+M="$LOCALAPPDATA/hush/models/spike"
 F=../../tools/bench-stt/fixtures
 ./target/release/spike-transcribe-cpp.exe "$M/parakeet-tdt-0.6b-v3-F16.gguf" \
   $F/tts-03s-question.wav $F/tts-10s-fillers.wav $F/tts-30s-dictation.wav \

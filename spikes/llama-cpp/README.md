@@ -30,7 +30,7 @@ export PATH="/c/VulkanSDK/1.4.357.0/Bin:/c/Program Files/CMake/bin:$PATH"
 export CMAKE_GENERATOR=Ninja        # required, see "Build" below
 export CARGO_TARGET_DIR='C:\lct'    # required: a short path, see "Build" below
 cargo build --release               # cold: 85 s, including the llama.cpp + shader build
-M="$LOCALAPPDATA/whisper-local/models/spike"
+M="$LOCALAPPDATA/hush/models/spike"
 /c/lct/release/spike-llama-cpp.exe "$M/Qwen3-4B-Instruct-2507-Q4_K_M.gguf" 2> llama.log
 /c/lct/release/spike-llama-cpp.exe "$M/granite-4.0-micro-Q4_K_M.gguf" 2> llama.log
 # flags: --pci 05:00 (default) | --device N, --runs 3, --case SUBSTRING, --kv-unified
@@ -68,9 +68,9 @@ short target directory, or a junction.
 ## Method
 
 - The rule pass, the user-message format and validation come from the real crate:
-  `wl-normalize` is a path dependency, called as `bench-normalize` calls it. The system
+  `hush-normalize` is a path dependency, called as `bench-normalize` calls it. The system
   prompt is **copied verbatim** into `src/prompt.rs`, as the gate required, and at startup
-  the binary asserts that it is byte-identical to `wl_normalize::prompt::system_prompt`.
+  the binary asserts that it is byte-identical to `hush_normalize::prompt::system_prompt`.
   Keep the two in sync until the embedded backend lives in the crate and reuses the
   constant.
 - The chat is rendered with the model's own template through

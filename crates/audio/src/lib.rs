@@ -12,7 +12,7 @@ pub mod vad;
 
 pub use cpal_backend::{CpalOpener, InputDeviceInfo, list_input_devices};
 pub use engine::{Clock, SystemClock, WorkerRecorder};
-pub use wl_core::recorder::{Recorder, RecorderConfig, RecorderError, Recording};
+pub use hush_core::recorder::{Recorder, RecorderConfig, RecorderError, Recording};
 
 pub struct CpalRecorder(WorkerRecorder);
 

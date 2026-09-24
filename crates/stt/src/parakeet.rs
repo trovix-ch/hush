@@ -2,10 +2,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimedToken, TimestampMode, Transcriber};
-use wl_core::stt::{
+use hush_core::stt::{
     Backend, Caps, DecodeOptions, EngineInfo, SAMPLE_RATE, Segment, SttEngine, SttError, Transcript,
 };
+use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimedToken, TimestampMode, Transcriber};
 
 pub const ENGINE_ID: &str = "parakeet-tdt-0.6b-v3";
 

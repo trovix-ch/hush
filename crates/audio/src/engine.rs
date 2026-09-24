@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use hush_core::recorder::{Recorder, RecorderConfig, RecorderError, Recording};
+use hush_core::stt::SAMPLE_RATE;
 use rtrb::{Consumer, RingBuffer};
-use wl_core::recorder::{Recorder, RecorderConfig, RecorderError, Recording};
-use wl_core::stt::SAMPLE_RATE;
 
 use crate::capture::{CallbackShared, OpenedStream, StreamOpener};
 use crate::resample::StreamResampler;
@@ -420,7 +420,7 @@ impl WorkerRecorder {
         let mut engine = Engine::new(cfg, opener, clock.now());
         let shared = engine.shared();
         let join = std::thread::Builder::new()
-            .name("wl-audio".into())
+            .name("hush-audio".into())
             .spawn(move || {
                 loop {
                     let cmd = if engine.is_live() {

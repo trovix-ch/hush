@@ -1,5 +1,5 @@
 [package]
-name = "wl-normalize"
+name = "hush-normalize"
 description = "Transcript normalization: rule pass, LLM backends, validation"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-wl-core = { path = "../core" }
+hush-core ={ path = "../core" }
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

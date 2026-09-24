@@ -6,7 +6,7 @@ members = [
     "crates/stt",
     "crates/normalize",
     "crates/platform-windows",
-    "apps/whisper-local",
+    "apps/hush",
     "tools/bench-stt",
     "tools/bench-normalize",
 ]
@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.90"
-repository = "https://github.com/trovix/whisper-local"
+repository = "https://github.com/trovix-ch/hush"
 
 [workspace.lints.clippy]
 all = "warn"

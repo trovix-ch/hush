@@ -2,9 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use wl_audio::resample::StreamResampler;
-use wl_core::recorder::{Recorder, RecorderError, Recording};
-use wl_core::stt::SAMPLE_RATE;
+use hush_audio::resample::StreamResampler;
+use hush_core::recorder::{Recorder, RecorderError, Recording};
+use hush_core::stt::SAMPLE_RATE;
 
 pub fn read_16k_mono(path: &Path) -> Result<Vec<f32>> {
     let mut reader =
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn stereo_48k_becomes_16k_mono_of_the_same_length() {
-        let path = std::env::temp_dir().join(format!("wl-wav-test-{}.wav", std::process::id()));
+        let path = std::env::temp_dir().join(format!("hush-wav-test-{}.wav", std::process::id()));
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: 48_000,

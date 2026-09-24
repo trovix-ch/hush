@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use hush_core::recorder::RecorderError;
 use rtrb::Producer;
-use wl_core::recorder::RecorderError;
 
 /// Atomics only: the real-time callback must not block, allocate or log.
 #[derive(Debug, Default)]

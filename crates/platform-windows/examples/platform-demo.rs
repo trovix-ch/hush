@@ -5,16 +5,16 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use wl_core::cancel::CancelToken;
-use wl_core::insert::{InsertPolicy, Inserter, StrategyChain};
-use wl_platform_windows::clipboard::{ClipboardSnapshot, DEFAULT_SNAPSHOT_CAP};
-use wl_platform_windows::focus::WinFocus;
-use wl_platform_windows::hook::{HotkeyConfig, HotkeyEvent, HotkeyHook};
-use wl_platform_windows::input::WinInput;
-use wl_platform_windows::overlay::OverlayState;
-use wl_platform_windows::sound::{self, Cue};
-use wl_platform_windows::tray::TrayEvent;
-use wl_platform_windows::ui_thread::{self, UiHandle, UiOptions};
+use hush_core::cancel::CancelToken;
+use hush_core::insert::{InsertPolicy, Inserter, StrategyChain};
+use hush_platform_windows::clipboard::{ClipboardSnapshot, DEFAULT_SNAPSHOT_CAP};
+use hush_platform_windows::focus::WinFocus;
+use hush_platform_windows::hook::{HotkeyConfig, HotkeyEvent, HotkeyHook};
+use hush_platform_windows::input::WinInput;
+use hush_platform_windows::overlay::OverlayState;
+use hush_platform_windows::sound::{self, Cue};
+use hush_platform_windows::tray::TrayEvent;
+use hush_platform_windows::ui_thread::{self, UiHandle, UiOptions};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -70,7 +70,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,wl_platform_windows=debug".into()),
+                .unwrap_or_else(|_| "info,hush_platform_windows=debug".into()),
         )
         .init();
     let args = args();
@@ -140,7 +140,7 @@ fn main() {
         let target = hwnd.0 as isize;
         std::thread::spawn(move || {
             for _ in 0..runs {
-                let ok = wl_platform_windows::focus::refocus_raw(target);
+                let ok = hush_platform_windows::focus::refocus_raw(target);
                 println!("[sim] notepad foreground: {ok}");
                 std::thread::sleep(Duration::from_millis(250));
                 let _ = hk.send(HotkeyEvent::Down { at: Instant::now() });
@@ -193,7 +193,7 @@ fn main() {
                 sound::play(Cue::Stop);
                 ui.set_overlay(OverlayState::Inserting);
                 n += 1;
-                let text = format!("hello from whisper-local {n}");
+                let text = format!("hello from hush {n}");
                 let before = clipboard.snapshot(DEFAULT_SNAPSHOT_CAP).ok();
                 let t0 = Instant::now();
                 let outcome = chain.insert(&snap.to_core(), &text, &CancelToken::new());
@@ -284,7 +284,7 @@ fn main() {
         if let Some((hwnd, _)) = &notepad {
             if args.type_test {
                 let text = "\ntyped: grüße, naïve 😀 done\nline two";
-                let ok = wl_platform_windows::focus::refocus_raw(hwnd.0 as isize);
+                let ok = hush_platform_windows::focus::refocus_raw(hwnd.0 as isize);
                 std::thread::sleep(Duration::from_millis(200));
                 let r = input.type_text(text);
                 std::thread::sleep(Duration::from_millis(600));
@@ -323,7 +323,7 @@ fn report_restore(before: &ClipboardSnapshot, after: Option<&ClipboardSnapshot>)
 }
 
 fn open_notepad() -> (HWND, PathBuf) {
-    let file = std::env::temp_dir().join(format!("wl-demo-{}.txt", std::process::id()));
+    let file = std::env::temp_dir().join(format!("hush-demo-{}.txt", std::process::id()));
     std::fs::write(&file, "").expect("scratch file");
     let name = file.file_name().unwrap().to_string_lossy().into_owned();
     // An inherited stdout pipe would stay open for as long as Notepad lives.

@@ -1,4 +1,4 @@
-# whisper-local: design and decisions
+# hush: design and decisions
 
 Last revised 2026-09-24. Sections marked *(perishable)* name crates, models or machine
 state and must be re-verified before being trusted after 2026-12. Sections without that
@@ -455,7 +455,7 @@ crates/
   normalize/               rules, prompt building, validation, OpenAI-HTTP backend; llama.cpp later
   platform-windows/        hook, focus context, clipboard/insert, overlay, tray, sound, paths
 apps/
-  whisper-local/           the binary: wiring, config loading, tray menu
+  hush/                    the binary: wiring, config loading, tray menu
 tools/
   bench/                   CLI: wav → engine → text with timings; transcript → normalizer with timings
 docs/
@@ -557,7 +557,7 @@ byte-identical, plus the three history-exclusion markers. Paced typing of a 37-u
 string with umlauts, an emoji and a newline landed intact in 918 ms.
 
 ### Whole pipeline, 2026-09-24
-Method: `whisper-local simulate tools/bench-stt/fixtures/tts-10s-fillers.wav`, release
+Method: `hush simulate tools/bench-stt/fixtures/tts-10s-fillers.wav`, release
 build, Parakeet F16 on Vulkan device 1 (the card without the LLM), three runs per
 configuration, times in ms from key release; RDP session, so every insert is
 `ThirdPartyRead`, and Notepad's text was read back after each run.

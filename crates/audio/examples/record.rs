@@ -2,14 +2,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use wl_audio::vad::{EnergyVad, Vad, has_speech, trim_silence};
-use wl_audio::{CpalRecorder, Recorder, RecorderConfig, list_input_devices};
+use hush_audio::vad::{EnergyVad, Vad, has_speech, trim_silence};
+use hush_audio::{CpalRecorder, Recorder, RecorderConfig, list_input_devices};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "wl_audio=debug".into()),
+                .unwrap_or_else(|_| "hush_audio=debug".into()),
         )
         .init();
 

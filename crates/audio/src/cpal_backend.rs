@@ -3,8 +3,8 @@ use std::sync::atomic::Ordering;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample, StreamConfig};
+use hush_core::recorder::RecorderError;
 use rtrb::Producer;
-use wl_core::recorder::RecorderError;
 
 use crate::capture::{CallbackShared, OpenedStream, StreamOpener, downmix_into, note_dropped};
 

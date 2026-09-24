@@ -1,6 +1,6 @@
 use audioadapter_buffers::direct::InterleavedSlice;
+use hush_core::stt::SAMPLE_RATE;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
-use wl_core::stt::SAMPLE_RATE;
 
 /// Output length is exactly `input_len * ratio` over a take, with rubato's start-up delay
 /// removed, because pre-roll seeding and VAD timestamps are both sample offsets.

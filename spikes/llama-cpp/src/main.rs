@@ -11,6 +11,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use hush_core::normalize::{AppContext, NormalizeRequest, Rejection, Style};
+use hush_normalize::{rules::RuleNormalizer, validate};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -22,8 +24,6 @@ use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use serde::Deserialize;
-use wl_core::normalize::{AppContext, NormalizeRequest, Rejection, Style};
-use wl_normalize::{rules::RuleNormalizer, validate};
 
 const USAGE: &str = "usage: spike-llama-cpp <model.gguf> [--pci BUS] [--device N] [--runs N] \
 [--fixtures PATH] [--case SUBSTRING]
@@ -121,16 +121,16 @@ fn prepare<'a>(c: &'a Case, model: &LlamaModel) -> Result<Prepared<'a>> {
         vocabulary: &c.vocabulary,
         app: &app,
         previous: c.previous.as_deref(),
-        utterance: wl_core::UtteranceId::FIRST,
-        cancel: wl_core::CancelToken::new(),
+        utterance: hush_core::UtteranceId::FIRST,
+        cancel: hush_core::CancelToken::new(),
     };
     let rule_text = RuleNormalizer.clean_request(&req);
     let system = prompt::system_prompt(req.language);
     // The copied constant must be the crate's, byte for byte.
-    if system != wl_normalize::prompt::system_prompt(req.language) {
+    if system != hush_normalize::prompt::system_prompt(req.language) {
         bail!("system prompt drifted from crates/normalize/src/prompt.rs");
     }
-    let user = wl_normalize::prompt::user_message(&req, &rule_text);
+    let user = hush_normalize::prompt::user_message(&req, &rule_text);
     let n_in = model.str_to_token(&rule_text, AddBos::Never)?.len();
     Ok(Prepared {
         case: c,

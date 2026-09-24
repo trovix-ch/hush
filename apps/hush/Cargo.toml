@@ -1,5 +1,5 @@
 [package]
-name = "whisper-local"
+name = "hush"
 description = "Local-only voice dictation for Windows"
 version.workspace = true
 edition.workspace = true
@@ -7,11 +7,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-wl-core = { path = "../../crates/core" }
-wl-audio = { path = "../../crates/audio" }
-wl-stt = { path = "../../crates/stt" }
-wl-normalize = { path = "../../crates/normalize" }
-wl-platform-windows = { path = "../../crates/platform-windows" }
+hush-core = { path = "../../crates/core" }
+hush-audio = { path = "../../crates/audio" }
+hush-stt = { path = "../../crates/stt" }
+hush-normalize = { path = "../../crates/normalize" }
+hush-platform-windows ={ path = "../../crates/platform-windows" }
 anyhow = "1"
 ctrlc = "3"
 hound = "3.5"

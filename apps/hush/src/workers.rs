@@ -7,18 +7,18 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use wl_audio::vad::{EnergyVad, Vad, has_speech, trim_silence};
-use wl_core::UtteranceId;
-use wl_core::cancel::CancelToken;
-use wl_core::context::FocusContext;
-use wl_core::insert::{InsertError, InsertOutcome, InsertPolicy, Inserter, StrategyChain};
-use wl_core::normalize::{NormalizeError, NormalizeRequest, Normalizer};
-use wl_core::pipeline::{Event, Failure, NormalizeContext, Timer};
-use wl_core::stt::{DecodeOptions, SttEngine, SttError};
-use wl_normalize::RuleNormalizer;
-use wl_platform_windows::clipboard::WinClipboard;
-use wl_platform_windows::focus::WinFocus;
-use wl_platform_windows::input::WinInput;
+use hush_audio::vad::{EnergyVad, Vad, has_speech, trim_silence};
+use hush_core::UtteranceId;
+use hush_core::cancel::CancelToken;
+use hush_core::context::FocusContext;
+use hush_core::insert::{InsertError, InsertOutcome, InsertPolicy, Inserter, StrategyChain};
+use hush_core::normalize::{NormalizeError, NormalizeRequest, Normalizer};
+use hush_core::pipeline::{Event, Failure, NormalizeContext, Timer};
+use hush_core::stt::{DecodeOptions, SttEngine, SttError};
+use hush_normalize::RuleNormalizer;
+use hush_platform_windows::clipboard::WinClipboard;
+use hush_platform_windows::focus::WinFocus;
+use hush_platform_windows::input::WinInput;
 
 use crate::driver::Msg;
 use crate::engines::EngineSummary;
@@ -52,7 +52,7 @@ pub fn spawn_stt(
     out: Sender<Msg>,
 ) -> std::io::Result<(Sender<SttJob>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<SttJob>();
-    let join = spawn("wl-stt", move || {
+    let join = spawn("hush-stt", move || {
         let loaded = match catch_unwind(AssertUnwindSafe(load)) {
             Ok(Ok(loaded)) => Ok(loaded),
             Ok(Err(e)) => Err(format!("{e:#}")),
@@ -133,7 +133,7 @@ pub fn spawn_normalizer(
     out: Sender<Msg>,
 ) -> std::io::Result<(Sender<NormCmd>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<NormCmd>();
-    let join = spawn("wl-normalize", move || {
+    let join = spawn("hush-normalize", move || {
         let mut rules = RuleNormalizer::new();
         let mut full: Option<Box<dyn Normalizer>> = None;
         for cmd in rx {
@@ -206,7 +206,7 @@ pub fn spawn_inserter(
     out: Sender<Msg>,
 ) -> std::io::Result<(Sender<InsertCmd>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<InsertCmd>();
-    let join = spawn("wl-insert", move || {
+    let join = spawn("hush-insert", move || {
         let mut chain = StrategyChain::new(clipboard, WinInput::new(), focus.clone(), policy);
         let mut insert = |target: &FocusContext, text: &str, cancel: &CancelToken| {
             catch_unwind(AssertUnwindSafe(|| chain.insert(target, text, cancel))).unwrap_or_else(
@@ -276,7 +276,7 @@ impl Timers {
 
 pub fn spawn_timers(out: Sender<Msg>) -> std::io::Result<(Timers, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<Armed>();
-    let join = spawn("wl-timers", move || timer_loop(&rx, &out))?;
+    let join = spawn("hush-timers", move || timer_loop(&rx, &out))?;
     Ok((Timers { tx }, join))
 }
 

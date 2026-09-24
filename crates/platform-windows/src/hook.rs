@@ -725,7 +725,7 @@ impl HotkeyHook {
         let (ready_tx, ready_rx) = mpsc::channel();
         let hook_shared = shared.clone();
         let hook_join = std::thread::Builder::new()
-            .name("wl-hotkey-hook".into())
+            .name("hush-hotkey-hook".into())
             .spawn(move || hook_thread(hook_shared, tx, ready_tx))
             .map_err(|e| HookError::Thread(e.to_string()))?;
         let tid = match ready_rx.recv() {
@@ -741,7 +741,7 @@ impl HotkeyHook {
         let period = config.watchdog_period;
         let probe = config.probe_interval;
         let watchdog_join = std::thread::Builder::new()
-            .name("wl-hotkey-watchdog".into())
+            .name("hush-hotkey-watchdog".into())
             .spawn(move || watchdog_thread(wd_shared, tid, period, probe, stop_rx))
             .map_err(|e| HookError::Thread(e.to_string()))?;
         Ok(HookHandle {

@@ -1,5 +1,5 @@
 [package]
-name = "wl-platform-windows"
+name = "hush-platform-windows"
 description = "Win32 integration: keyboard hook, focus context, clipboard insertion, overlay, tray"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-wl-core = { path = "../core" }
+hush-core ={ path = "../core" }
 thiserror = "2"
 tracing = "0.1"
 

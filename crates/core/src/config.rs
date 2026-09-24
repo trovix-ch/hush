@@ -8,7 +8,7 @@ use crate::insert::{AppPolicies, AppPolicy, Chord};
 use crate::normalize::Style;
 
 /// Written on first run. Must parse to `Config::default()`.
-pub const DEFAULT_CONFIG: &str = r#"# whisper-local configuration. Every key is optional; a missing key takes the value shown.
+pub const DEFAULT_CONFIG: &str = r#"# hush configuration. Every key is optional; a missing key takes the value shown.
 
 # Hold to talk. CapsLock is the alternative for keyboards without a Right Ctrl.
 hotkey = "RightCtrl"
@@ -26,7 +26,7 @@ vocabulary = []
 model = "parakeet-tdt-0.6b-v3-f16-gguf"
 # require-gpu | prefer-gpu | cpu-only
 gpu = "prefer-gpu"
-# Vulkan device index, as `whisper-local doctor` lists them. Unset lets the runtime pick,
+# Vulkan device index, as `hush doctor` lists them. Unset lets the runtime pick,
 # which may be an integrated GPU or the card running your LLM.
 # gpu_device = 1
 

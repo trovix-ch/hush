@@ -22,7 +22,7 @@ pub enum TrayEvent {
     Quit,
 }
 
-pub const ABOUT_TEXT: &str = "whisper-local: local-only voice dictation.\n\n\
+pub const ABOUT_TEXT: &str = "hush: local-only voice dictation.\n\n\
 Nothing you dictate leaves this machine.\n\n\
 Speech recognition uses NVIDIA Parakeet TDT 0.6B v3 by NVIDIA Corporation, \
 licensed under the Creative Commons Attribution 4.0 International licence \
@@ -30,12 +30,12 @@ licensed under the Creative Commons Attribution 4.0 International licence \
 Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3. \
 The model is used in a converted file format; no other changes were made.";
 
-const ID_PAUSE: &str = "wl.pause";
-const ID_PASTE_LAST: &str = "wl.paste_last";
-const ID_COPY_LAST: &str = "wl.copy_last";
-const ID_OPEN_CONFIG: &str = "wl.open_config";
-const ID_ABOUT: &str = "wl.about";
-const ID_QUIT: &str = "wl.quit";
+const ID_PAUSE: &str = "hush.pause";
+const ID_PASTE_LAST: &str = "hush.paste_last";
+const ID_COPY_LAST: &str = "hush.copy_last";
+const ID_OPEN_CONFIG: &str = "hush.open_config";
+const ID_ABOUT: &str = "hush.about";
+const ID_QUIT: &str = "hush.quit";
 
 fn event_for(id: &str) -> Option<TrayEvent> {
     Some(match id {
@@ -110,7 +110,7 @@ impl Tray {
             }
         }));
         let icon = TrayIconBuilder::new()
-            .with_tooltip("whisper-local")
+            .with_tooltip("hush")
             .with_icon(icon_image(TrayIndicator::Idle)?)
             .with_menu(Box::new(menu))
             .build()
@@ -170,7 +170,7 @@ impl Drop for Tray {
 pub fn show_about() {
     std::thread::spawn(|| {
         let text = wide(ABOUT_TEXT);
-        let title = wide("About whisper-local");
+        let title = wide("About hush");
         // SAFETY: both buffers are NUL-terminated and outlive the modal call.
         unsafe {
             MessageBoxW(

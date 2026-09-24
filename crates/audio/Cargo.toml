@@ -1,5 +1,5 @@
 [package]
-name = "wl-audio"
+name = "hush-audio"
 description = "Microphone capture, resampling and voice activity detection"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-wl-core = { path = "../core" }
+hush-core ={ path = "../core" }
 cpal = "0.18.2"
 # rubato broke its API twice in 2026 (v4, v5); pinned exactly.
 rubato = "=5.0.0"

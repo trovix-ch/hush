@@ -2,10 +2,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use transcribe_cpp as tc;
-use wl_core::stt::{
+use hush_core::stt::{
     Backend, Caps, DecodeOptions, EngineInfo, SAMPLE_RATE, Segment, SttEngine, SttError, Transcript,
 };
+use transcribe_cpp as tc;
 
 /// Below one 10 ms feature hop there is nothing to recognise.
 const MIN_SAMPLES: usize = 160;
@@ -418,14 +418,14 @@ mod tests {
 
     #[test]
     fn live_cancellation() {
-        let Some(path) = std::env::var_os("WL_TEST_TC_MODEL") else {
+        let Some(path) = std::env::var_os("HUSH_TEST_TC_MODEL") else {
             return;
         };
         let mut engine = TranscribeCppEngine::new(Path::new(&path), Backend::Cpu, None).unwrap();
         let audio = vec![0.0f32; SAMPLE_RATE as usize * 30];
 
         let expired = DecodeOptions {
-            cancel: wl_core::CancelToken::new().with_deadline(Instant::now()),
+            cancel: hush_core::CancelToken::new().with_deadline(Instant::now()),
             ..Default::default()
         };
         assert!(matches!(

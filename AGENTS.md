@@ -1,6 +1,6 @@
-# whisper-local
+# hush
 
-whisper-local is a Windows dictation tool: hold a key anywhere in the OS, speak, let go,
+hush is a Windows dictation tool: hold a key anywhere in the OS, speak, let go,
 and cleaned-up text appears where the cursor is. Speech recognition, the language-model
 cleanup and the insertion all run on the user's machine. It is the local answer to
 Wispr Flow, written in Rust, with no web view and no cloud.
@@ -9,7 +9,7 @@ The product decisions, numbered and dated, live in `docs/design.md`. Read the se
 that touch what you are changing before you change it. The code is the ground truth for
 how things work; the design doc is the ground truth for why.
 
-## What makes whisper-local special
+## What makes hush special
 
 1. **Nothing leaves the machine.** No cloud, no accounts, no telemetry. The only network
    traffic is a one-time model download from a pinned manifest and the user's own local
@@ -119,18 +119,18 @@ maintainer's shell is PowerShell; a shell opened before the SDK install needs:
 ```powershell
 $env:VULKAN_SDK = 'C:\VulkanSDK\1.4.357.0'
 $env:PATH = "C:\VulkanSDK\1.4.357.0\Bin;C:\Program Files\CMake\bin;$env:PATH"
-cargo build --release -p whisper-local
+cargo build --release -p hush
 ```
 
 In Git Bash the same two are `export VULKAN_SDK='C:\VulkanSDK\1.4.357.0'` and
 `export PATH="/c/VulkanSDK/1.4.357.0/Bin:/c/Program Files/CMake/bin:$PATH"`.
 
-- `whisper-local doctor` reports devices, model, engine backend and the normalizer.
-- `whisper-local simulate <wav> [--runs N]` runs one dictation from a WAV into Notepad
+- `hush doctor` reports devices, model, engine backend and the normalizer.
+- `hush simulate <wav> [--runs N]` runs one dictation from a WAV into Notepad
   and prints per-stage timings. Fixtures are under `tools/bench-stt/fixtures/`.
 - `bench-stt` and `bench-normalize` measure engines and normalizers in isolation.
-- Config: `%APPDATA%\whisper-local\config.toml`. Models: `%LOCALAPPDATA%\whisper-local\models`.
-  Logs: `%LOCALAPPDATA%\whisper-local\logs`.
+- Config: `%APPDATA%\hush\config.toml`. Models: `%LOCALAPPDATA%\hush\models`.
+  Logs: `%LOCALAPPDATA%\hush\logs`.
 - With two GPUs, pin `engine.gpu_device` to the card not running the LLM; sharing one
   card tripled speech latency in measurement.
 
@@ -207,7 +207,7 @@ pipeline state machine runs on the driver thread and touches none of them direct
 - `crates/normalize`: rule pass, prompt, validation, LLM backends, the chain.
 - `crates/platform-windows`: everything Win32. Hook, focus, clipboard, input, overlay,
   tray, sound, UI thread.
-- `apps/whisper-local`: wiring, the driver, `doctor`, `simulate`.
+- `apps/hush`: wiring, the driver, `doctor`, `simulate`.
 - `tools/bench-*`: measurement harnesses and their fixtures.
 - `spikes/`: standalone experiments with their own workspaces and READMEs.
 - `docs/`: decisions and research.

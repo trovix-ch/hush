@@ -16,13 +16,13 @@ mod wav;
 mod workers;
 
 const USAGE: &str = "\
-usage: whisper-local [--config <path>]                 run the dictation app (tray + hotkey)
-       whisper-local [--config <path>] doctor          check devices, model, engine, normalizer
-       whisper-local [--config <path>] simulate <wav> [--target notepad|foreground] [--runs N]
+usage: hush [--config <path>]                 run the dictation app (tray + hotkey)
+       hush [--config <path>] doctor          check devices, model, engine, normalizer
+       hush [--config <path>] simulate <wav> [--target notepad|foreground] [--runs N]
                                                        run one dictation from a WAV, end to end
 
-The default config is %APPDATA%\\whisper-local\\config.toml, created on first run.
-Logs go to stderr and %LOCALAPPDATA%\\whisper-local\\logs\\. RUST_LOG overrides the level.";
+The default config is %APPDATA%\\hush\\config.toml, created on first run.
+Logs go to stderr and %LOCALAPPDATA%\\hush\\logs\\. RUST_LOG overrides the level.";
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
@@ -31,7 +31,7 @@ fn main() -> std::process::ExitCode {
     match run_cli() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("whisper-local: {e:#}");
+            eprintln!("hush: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -74,6 +74,6 @@ fn run_cli() -> anyhow::Result<std::process::ExitCode> {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("whisper-local runs on Windows only.\n{USAGE}");
+    eprintln!("hush runs on Windows only.\n{USAGE}");
     std::process::exit(1);
 }

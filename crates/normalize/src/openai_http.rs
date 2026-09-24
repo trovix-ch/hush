@@ -2,11 +2,11 @@
 
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-use wl_core::normalize::{
+use hush_core::normalize::{
     NormalizeError, NormalizeOutput, NormalizeRequest, Normalizer, Provenance, Rejection, Scores,
     Style,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::prompt::{self, ChatMessage};
 use crate::rules::RuleNormalizer;
@@ -199,15 +199,15 @@ impl Normalizer for OpenAiHttpNormalizer {
 
     /// Also primes the server's prompt cache with the system prompt.
     fn warm(&mut self) -> Result<(), NormalizeError> {
-        let app = wl_core::normalize::AppContext::default();
+        let app = hush_core::normalize::AppContext::default();
         let req = NormalizeRequest {
             transcript: "ok",
             language: None,
             vocabulary: &[],
             app: &app,
             previous: None,
-            utterance: wl_core::UtteranceId::default(),
-            cancel: wl_core::CancelToken::new(),
+            utterance: hush_core::UtteranceId::default(),
+            cancel: hush_core::CancelToken::new(),
         };
         let messages = prompt::build_messages(&req, "ok");
         self.chat(&messages, 1, self.cfg.warm_timeout).map(|_| ())
@@ -370,8 +370,8 @@ fn parse_reply(dialect: Dialect, text: &str) -> Result<Reply, NormalizeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wl_core::normalize::{AppContext, Style};
-    use wl_core::{CancelToken, UtteranceId};
+    use hush_core::normalize::{AppContext, Style};
+    use hush_core::{CancelToken, UtteranceId};
 
     #[test]
     fn dialect_and_endpoint_follow_the_base_url() {
@@ -549,10 +549,10 @@ mod tests {
         );
     }
 
-    /// Needs a running Ollama with the model named in `WL_TEST_OLLAMA_MODEL` pulled.
+    /// Needs a running Ollama with the model named in `HUSH_TEST_OLLAMA_MODEL` pulled.
     #[test]
     fn live_ollama_round_trip() {
-        let Ok(model) = std::env::var("WL_TEST_OLLAMA_MODEL") else {
+        let Ok(model) = std::env::var("HUSH_TEST_OLLAMA_MODEL") else {
             return;
         };
         let mut n = OpenAiHttpNormalizer::new(HttpConfig::new("http://localhost:11434/v1", model));

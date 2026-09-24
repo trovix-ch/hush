@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use wl_core::normalize::{
+use hush_core::normalize::{
     NormalizeError, NormalizeOutput, NormalizeRequest, Normalizer, Provenance, Style,
 };
 
@@ -97,11 +97,11 @@ fn well_formed(t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hush_core::normalize::{AppContext, Scores};
+    use hush_core::{CancelToken, UtteranceId};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use wl_core::normalize::{AppContext, Scores};
-    use wl_core::{CancelToken, UtteranceId};
 
     #[derive(Clone, Copy)]
     enum Behaviour {

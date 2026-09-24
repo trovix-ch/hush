@@ -1,5 +1,5 @@
 [package]
-name = "wl-stt"
+name = "hush-stt"
 description = "Speech-to-text engine implementations"
 version.workspace = true
 edition.workspace = true
@@ -13,7 +13,7 @@ default = []
 ort-engine = ["dep:parakeet-rs", "dep:ort"]
 
 [dependencies]
-wl-core = { path = "../core" }
+hush-core ={ path = "../core" }
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

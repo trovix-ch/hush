@@ -5,13 +5,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hush_core::insert::InsertError;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyW,
     SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-use wl_core::insert::InsertError;
 
 use crate::INJECTED_TAG;
 
@@ -137,24 +137,24 @@ impl WinInput {
     }
 }
 
-impl From<wl_core::insert::Chord> for Chord {
-    fn from(c: wl_core::insert::Chord) -> Self {
+impl From<hush_core::insert::Chord> for Chord {
+    fn from(c: hush_core::insert::Chord) -> Self {
         match c {
-            wl_core::insert::Chord::CtrlV => Chord::CtrlV,
-            wl_core::insert::Chord::CtrlShiftV => Chord::CtrlShiftV,
-            wl_core::insert::Chord::ShiftInsert => Chord::ShiftInsert,
+            hush_core::insert::Chord::CtrlV => Chord::CtrlV,
+            hush_core::insert::Chord::CtrlShiftV => Chord::CtrlShiftV,
+            hush_core::insert::Chord::ShiftInsert => Chord::ShiftInsert,
         }
     }
 }
 
-impl wl_core::insert::InputPort for WinInput {
+impl hush_core::insert::InputPort for WinInput {
     fn release_modifiers(&mut self) -> Result<(), InsertError> {
         WinInput::release_modifiers(self)
             .map(|_| ())
             .map_err(input_err)
     }
 
-    fn send_chord(&mut self, chord: wl_core::insert::Chord) -> Result<(), InsertError> {
+    fn send_chord(&mut self, chord: hush_core::insert::Chord) -> Result<(), InsertError> {
         WinInput::send_chord(self, chord.into()).map_err(input_err)
     }
 

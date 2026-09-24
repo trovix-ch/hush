@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-pub use wl_core::segment::VadEvent;
-use wl_core::stt::SAMPLE_RATE;
+pub use hush_core::segment::VadEvent;
+use hush_core::stt::SAMPLE_RATE;
 
 pub trait Vad: Send {
     /// Returns boundaries that became certain during this call: events lag the audio by

@@ -9,7 +9,7 @@ fn main() {
             println!("cargo:rustc-link-search=native={}", lib.display());
         }
         None if windows => panic!(
-            "wl-stt: VULKAN_SDK is not set. Install the Vulkan SDK (e.g. \
+            "hush-stt: VULKAN_SDK is not set. Install the Vulkan SDK (e.g. \
              `winget install KhronosGroup.VulkanSDK`) and open a fresh shell, or set \
              VULKAN_SDK to its install directory, e.g. C:\\VulkanSDK\\1.4.357.0."
         ),

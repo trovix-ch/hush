@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-use wl_core::insert::{InsertError, Reader, RenderWait};
+use hush_core::insert::{InsertError, Reader, RenderWait};
 
 use crate::util::{exe_name_of_pid, hwnd_from, hwnd_raw, window_thread_pid};
 
@@ -234,7 +234,7 @@ impl WinClipboard {
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_shared = shared.clone();
         let join = std::thread::Builder::new()
-            .name("wl-clipboard".into())
+            .name("hush-clipboard".into())
             .spawn(move || owner_thread(rx, thread_shared, ready_tx))
             .map_err(|_| ClipboardError::Gone)?;
         let hwnd = ready_rx.recv().map_err(|_| ClipboardError::Gone)??;
@@ -387,7 +387,7 @@ impl WinClipboard {
     }
 }
 
-impl wl_core::insert::ClipboardPort for WinClipboard {
+impl hush_core::insert::ClipboardPort for WinClipboard {
     type Snapshot = ClipboardSnapshot;
 
     fn snapshot(&mut self) -> Result<ClipboardSnapshot, InsertError> {
@@ -547,7 +547,7 @@ fn create_owner_window() -> windows::core::Result<HWND> {
     // SAFETY: a 'static window procedure and a message-only window owned by this thread.
     unsafe {
         let inst = GetModuleHandleW(PCWSTR::null())?;
-        let class = w!("wl-clipboard-owner");
+        let class = w!("hush-clipboard-owner");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(owner_wndproc),
             hInstance: inst.into(),
@@ -559,7 +559,7 @@ fn create_owner_window() -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
-            w!("whisper-local clipboard"),
+            w!("hush clipboard"),
             WINDOW_STYLE(0),
             0,
             0,
@@ -1015,7 +1015,7 @@ mod tests {
 
     #[test]
     fn scheduled_restore_fires_later_and_a_new_snapshot_takes_it_over() {
-        use wl_core::insert::ClipboardPort;
+        use hush_core::insert::ClipboardPort;
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut cb = WinClipboard::start().expect("owner");
         let original = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");

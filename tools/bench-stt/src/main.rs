@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use wl_core::stt::{Backend, DecodeOptions, SAMPLE_RATE, SttEngine};
-use wl_stt::{TranscribeCppEngine, TranscribeCppOptions, models, transcribe_cpp};
+use hush_core::stt::{Backend, DecodeOptions, SAMPLE_RATE, SttEngine};
+use hush_stt::{TranscribeCppEngine, TranscribeCppOptions, models, transcribe_cpp};
 
 const USAGE: &str = "\
 usage: bench-stt <wav-path> [--engine transcribe-cpp|ort] [--backend vulkan|cpu|directml]
@@ -165,9 +165,9 @@ fn build_ort(
     backend: Backend,
     load_path: &std::path::Path,
 ) -> Result<(Box<dyn SttEngine>, Vec<String>)> {
-    let engine = wl_stt::ParakeetEngine::with_options(
+    let engine = hush_stt::ParakeetEngine::with_options(
         load_path,
-        wl_stt::ParakeetOptions {
+        hush_stt::ParakeetOptions {
             backend,
             joint_on_cpu: args.joint_on_cpu,
             intra_threads: args.threads,
@@ -178,7 +178,7 @@ fn build_ort(
         },
     )?;
     let notes = vec![
-        format!("onnxruntime:    {}", wl_stt::onnxruntime_build_info()),
+        format!("onnxruntime:    {}", hush_stt::onnxruntime_build_info()),
         format!("joint on cpu:   {}", args.joint_on_cpu),
     ];
     Ok((Box::new(engine), notes))

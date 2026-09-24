@@ -22,8 +22,8 @@ llama-cpp-sys-2 = "=0.1.157"
 encoding_rs = "0.8"
 # Rule pass, validation and user-message format come from the real crate so the numbers
 # are comparable with bench-normalize; the system prompt is copied (see src/prompt.rs).
-wl-core = { path = "../../crates/core" }
-wl-normalize = { path = "../../crates/normalize" }
+hush-core = { path = "../../crates/core" }
+hush-normalize ={ path = "../../crates/normalize" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 anyhow = "1"

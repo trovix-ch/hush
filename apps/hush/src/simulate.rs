@@ -7,12 +7,12 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use wl_core::normalize::Provenance;
-use wl_core::pipeline::Stage;
-use wl_core::stt::SAMPLE_RATE;
-use wl_platform_windows::focus::{self, WinFocus};
-use wl_platform_windows::hook::HotkeyEvent;
-use wl_platform_windows::ui_thread::{UiHandle, UiOptions};
+use hush_core::normalize::Provenance;
+use hush_core::pipeline::Stage;
+use hush_core::stt::SAMPLE_RATE;
+use hush_platform_windows::focus::{self, WinFocus};
+use hush_platform_windows::hook::HotkeyEvent;
+use hush_platform_windows::ui_thread::{UiHandle, UiOptions};
 
 use crate::driver::{Driver, DriverParts, Msg, Observed, Workers};
 use crate::engines;
@@ -95,7 +95,7 @@ fn ms_between(a: Option<Instant>, b: Option<Instant>) -> String {
 
 pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
     let (config, _) = setup::load_config(&paths.config_file)?;
-    let _log = setup::init_logging(&paths.logs_dir, "warn,wl_stt::models=info")?;
+    let _log = setup::init_logging(&paths.logs_dir, "warn,hush_stt::models=info")?;
     let pcm = wav::read_16k_mono(&args.wav)?;
     let clip = Duration::from_secs_f64(pcm.len() as f64 / f64::from(SAMPLE_RATE));
     println!(
@@ -114,7 +114,7 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
     let (model, dir) = engines::resolve_model(&config.engine)?;
     if !model.is_present(&dir) {
         println!("model       downloading {} ...", model.id);
-        wl_stt::models::ensure_downloaded(model, &dir)?;
+        hush_stt::models::ensure_downloaded(model, &dir)?;
     }
     let (engine, summary) = engines::load_engine(&config.engine, &model.load_path(&dir))?;
     println!(
@@ -174,7 +174,7 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         observer: Some(obs_tx),
     });
     let driver = std::thread::Builder::new()
-        .name("wl-driver".into())
+        .name("hush-driver".into())
         .spawn(move || driver.run())?;
 
     let target = match args.target {

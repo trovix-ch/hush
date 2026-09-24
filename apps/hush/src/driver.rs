@@ -8,21 +8,21 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use wl_audio::CpalRecorder;
-use wl_audio::display::LevelBallistics;
-use wl_core::UtteranceId;
-use wl_core::cancel::CancelToken;
-use wl_core::config::{Config, GpuPolicy};
-use wl_core::insert::{InsertError, InsertOutcome, InsertPolicy};
-use wl_core::normalize::Provenance;
-use wl_core::notify::{Notifier, OverlayState as CoreOverlay, Sound};
-use wl_core::pipeline::{Effect, Event, Failure, Pipeline, PipelineConfig, Stage};
-use wl_core::recorder::{Recorder, RecorderConfig};
-use wl_platform_windows::focus::WinFocus;
-use wl_platform_windows::hook::{HookHandle, HotkeyConfig, HotkeyEvent, HotkeyHook};
-use wl_platform_windows::overlay::OverlayState;
-use wl_platform_windows::tray::TrayEvent;
-use wl_platform_windows::ui_thread::{
+use hush_audio::CpalRecorder;
+use hush_audio::display::LevelBallistics;
+use hush_core::UtteranceId;
+use hush_core::cancel::CancelToken;
+use hush_core::config::{Config, GpuPolicy};
+use hush_core::insert::{InsertError, InsertOutcome, InsertPolicy};
+use hush_core::normalize::Provenance;
+use hush_core::notify::{Notifier, OverlayState as CoreOverlay, Sound};
+use hush_core::pipeline::{Effect, Event, Failure, Pipeline, PipelineConfig, Stage};
+use hush_core::recorder::{Recorder, RecorderConfig};
+use hush_platform_windows::focus::WinFocus;
+use hush_platform_windows::hook::{HookHandle, HotkeyConfig, HotkeyEvent, HotkeyHook};
+use hush_platform_windows::overlay::OverlayState;
+use hush_platform_windows::tray::TrayEvent;
+use hush_platform_windows::ui_thread::{
     self, INSTANCE_MUTEX, UiError, UiHandle, UiOptions, WinNotifier,
 };
 
@@ -119,7 +119,7 @@ pub fn spawn_normalizer_upgrade(config: &Config, norm: Sender<NormCmd>, tx: Send
         return;
     };
     let spawned = std::thread::Builder::new()
-        .name("wl-normalizer-warm".into())
+        .name("hush-normalizer-warm".into())
         .spawn(move || {
             let label = format!("{} via {}", http.model, http.base_url);
             let msg = match engines::build_http_normalizer(http) {
@@ -247,7 +247,7 @@ impl Driver {
                 let live = self.tokens.contains_key(&id);
                 self.feed(Event::TranscriptReady(
                     id,
-                    wl_core::stt::Transcript {
+                    hush_core::stt::Transcript {
                         utterance: id,
                         ..Default::default()
                     },
@@ -448,7 +448,7 @@ impl Driver {
     fn update_tooltip(&self) {
         let engine = self.engine.as_deref().unwrap_or("loading model…");
         self.ui
-            .set_tooltip(format!("whisper-local · {engine} · {}", self.normalizer));
+            .set_tooltip(format!("hush · {engine} · {}", self.normalizer));
     }
 
     fn feed(&mut self, ev: Event) {
@@ -507,7 +507,7 @@ impl Driver {
                     .map(|_| {
                         Event::Failed(
                             id,
-                            Failure::Stt(wl_core::stt::SttError::BackendDied(
+                            Failure::Stt(hush_core::stt::SttError::BackendDied(
                                 "speech worker is gone".into(),
                             )),
                         )
@@ -531,7 +531,7 @@ impl Driver {
                     .map(|_| {
                         Event::Failed(
                             id,
-                            Failure::Normalize(wl_core::normalize::NormalizeError::BackendDied(
+                            Failure::Normalize(hush_core::normalize::NormalizeError::BackendDied(
                                 "normalize worker is gone".into(),
                             )),
                         )
@@ -623,7 +623,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
     let _instance = match ui_thread::acquire_single_instance(INSTANCE_MUTEX) {
         Ok(g) => g,
         Err(UiError::AlreadyRunning) => {
-            eprintln!("whisper-local is already running in this session (see the tray).");
+            eprintln!("hush is already running in this session (see the tray).");
             return Ok(std::process::ExitCode::FAILURE);
         }
         Err(e) => return Err(e).context("single-instance check"),
@@ -642,8 +642,8 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         model = %model.id,
         gpu = ?config.engine.gpu,
         gpu_device = ?config.engine.gpu_device,
-        remote_session = wl_platform_windows::focus::is_remote_session(),
-        elevated = wl_platform_windows::focus::self_elevated(),
+        remote_session = hush_platform_windows::focus::is_remote_session(),
+        elevated = hush_platform_windows::focus::self_elevated(),
         "starting"
     );
 
@@ -651,7 +651,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         tray: true,
         ..Default::default()
     })?;
-    ui.set_tooltip("whisper-local · loading model…");
+    ui.set_tooltip("hush · loading model…");
     ui.set_overlay(OverlayState::Status {
         message: "Loading speech model…".into(),
     });
@@ -666,10 +666,10 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
             tracing::warn!(error = %e, "no Ctrl+C handler; use tray -> Quit");
         }
     }
-    forward(tray_rx, tx.clone(), Msg::Tray, "wl-tray-fwd")?;
+    forward(tray_rx, tx.clone(), Msg::Tray, "hush-tray-fwd")?;
     // Bounded because the hook callback must never block: it drops on a full channel.
     let (hk_tx, hk_rx) = mpsc::sync_channel::<HotkeyEvent>(64);
-    forward(hk_rx, tx.clone(), Msg::Hotkey, "wl-hotkey-fwd")?;
+    forward(hk_rx, tx.clone(), Msg::Hotkey, "hush-hotkey-fwd")?;
 
     let focus = WinFocus::new();
     let recorder = CpalRecorder::new(RecorderConfig {
@@ -683,7 +683,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
     let load: EngineLoader = Box::new(move || {
         if !model.is_present(&model_dir) {
             let _ = status.send(Msg::Status("Downloading speech model…".into()));
-            wl_stt::models::ensure_downloaded(model, &model_dir)?;
+            hush_stt::models::ensure_downloaded(model, &model_dir)?;
         }
         engines::load_engine(&engine_choice, &model.load_path(&model_dir))
     });
@@ -712,7 +712,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
     });
     drop(tx);
     std::thread::Builder::new()
-        .name("wl-driver".into())
+        .name("hush-driver".into())
         .spawn(move || driver.run())
         .context("starting the driver thread")?
         .join()

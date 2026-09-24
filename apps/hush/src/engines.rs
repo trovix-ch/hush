@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use wl_core::config::{EngineChoice, GpuPolicy, NormalizerChoice};
-use wl_core::normalize::Normalizer;
-use wl_core::stt::{Backend, SttEngine};
-use wl_normalize::openai_http::Dialect;
-use wl_normalize::{HttpConfig, NormalizerChain, OpenAiHttpNormalizer};
-use wl_stt::models::{self, ModelManifest};
-use wl_stt::{TranscribeCppEngine, transcribe_cpp};
+use hush_core::config::{EngineChoice, GpuPolicy, NormalizerChoice};
+use hush_core::normalize::Normalizer;
+use hush_core::stt::{Backend, SttEngine};
+use hush_normalize::openai_http::Dialect;
+use hush_normalize::{HttpConfig, NormalizerChain, OpenAiHttpNormalizer};
+use hush_stt::models::{self, ModelManifest};
+use hush_stt::{TranscribeCppEngine, transcribe_cpp};
 
 /// The only engine family this binary contains.
 const ENGINE_FAMILY: &str = "transcribe-cpp";
@@ -204,7 +204,7 @@ pub fn build_http_normalizer(cfg: HttpConfig) -> Result<(Box<dyn Normalizer>, Du
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wl_core::config::Config;
+    use hush_core::config::Config;
 
     #[test]
     fn default_config_names_a_model_this_build_can_load() {

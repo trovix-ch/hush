@@ -17,4 +17,4 @@ mod util;
 
 /// Marker in `dwExtraInfo` of every event this process injects. The hook passes these
 /// through untouched so our own paste chord can never look like the hotkey.
-pub const INJECTED_TAG: usize = 0x574C_4F43; // "WLOC"
+pub const INJECTED_TAG: usize = 0x4855_5348; // "HUSH"

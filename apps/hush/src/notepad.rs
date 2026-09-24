@@ -16,7 +16,7 @@ pub struct Notepad {
 }
 
 pub fn open() -> Result<Notepad> {
-    let file = std::env::temp_dir().join(format!("wl-simulate-{}.txt", std::process::id()));
+    let file = std::env::temp_dir().join(format!("hush-simulate-{}.txt", std::process::id()));
     std::fs::write(&file, "")?;
     let name = file
         .file_name()

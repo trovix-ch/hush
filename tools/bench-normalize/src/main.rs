@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use hush_core::normalize::{AppContext, NormalizeRequest, Normalizer, Style};
+use hush_normalize::openai_http::{Attempt, HttpConfig, OpenAiHttpNormalizer};
+use hush_normalize::{rules, should_use_llm};
 use serde::Deserialize;
-use wl_core::normalize::{AppContext, NormalizeRequest, Normalizer, Style};
-use wl_normalize::openai_http::{Attempt, HttpConfig, OpenAiHttpNormalizer};
-use wl_normalize::{rules, should_use_llm};
 
 const USAGE: &str = "usage: bench-normalize [--base-url URL] [--model NAME]... [--runs N] \
 [--fixtures PATH] [--timeout-ms MS] [--case SUBSTRING] [--rules-only]
@@ -114,8 +114,8 @@ impl Case {
             vocabulary: &self.vocabulary,
             app: &app,
             previous: self.previous.as_deref(),
-            utterance: wl_core::UtteranceId::FIRST,
-            cancel: wl_core::CancelToken::new(),
+            utterance: hush_core::UtteranceId::FIRST,
+            cancel: hush_core::CancelToken::new(),
         })
     }
 
@@ -303,7 +303,7 @@ fn run_model(args: &Args, model: &str, cases: &[&Case]) -> Summary {
         match &first.verdict {
             Ok(scores) => {
                 s.validated += 1;
-                let margin = |m: Option<wl_core::normalize::Measured>| {
+                let margin = |m: Option<hush_core::normalize::Measured>| {
                     m.map_or("-".to_string(), |m| format!("{:.2}", m.margin()))
                 };
                 println!(

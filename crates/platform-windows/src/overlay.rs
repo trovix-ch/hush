@@ -108,9 +108,9 @@ impl OverlayState {
     }
 }
 
-impl From<wl_core::notify::OverlayState> for OverlayState {
-    fn from(s: wl_core::notify::OverlayState) -> Self {
-        use wl_core::notify::{OverlayState as C, ProvenanceHint};
+impl From<hush_core::notify::OverlayState> for OverlayState {
+    fn from(s: hush_core::notify::OverlayState) -> Self {
+        use hush_core::notify::{OverlayState as C, ProvenanceHint};
         match s {
             C::Idle => OverlayState::Hidden,
             C::Listening { level } => OverlayState::Listening { level },
@@ -176,7 +176,7 @@ impl Overlay {
         // SAFETY: a 'static window procedure and a hidden popup owned by this thread.
         let hwnd = unsafe {
             let inst = GetModuleHandleW(PCWSTR::null())?;
-            let class = w!("wl-overlay-pill");
+            let class = w!("hush-overlay-pill");
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(overlay_wndproc),
                 hInstance: inst.into(),
@@ -191,7 +191,7 @@ impl Overlay {
                     | WS_EX_TOPMOST
                     | WS_EX_TRANSPARENT,
                 class,
-                w!("whisper-local"),
+                w!("hush"),
                 WS_POPUP,
                 0,
                 0,

@@ -150,12 +150,12 @@ name = "bench-normalize"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hush-core",
+ "hush-normalize",
  "serde",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "wl-core",
- "wl-normalize",
 ]
 
 [[package]]
@@ -164,11 +164,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hound",
+ "hush-core",
+ "hush-stt",
  "rubato",
  "tracing",
  "tracing-subscriber",
- "wl-core",
- "wl-stt",
 ]
 
 [[package]]
@@ -1271,6 +1271,97 @@ name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "hush"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "hound",
+ "hush-audio",
+ "hush-core",
+ "hush-normalize",
+ "hush-platform-windows",
+ "hush-stt",
+ "serde_json",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "ureq",
+ "windows",
+]
+
+[[package]]
+name = "hush-audio"
+version = "0.1.0"
+dependencies = [
+ "audioadapter-buffers",
+ "cpal",
+ "ctrlc",
+ "hound",
+ "hush-core",
+ "rtrb",
+ "rubato",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "tract-onnx",
+]
+
+[[package]]
+name = "hush-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
+name = "hush-normalize"
+version = "0.1.0"
+dependencies = [
+ "hush-core",
+ "serde",
+ "serde_json",
+ "strsim",
+ "thiserror 2.0.21",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
+name = "hush-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "hush-core",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "tray-icon",
+ "windows",
+]
+
+[[package]]
+name = "hush-stt"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "hush-core",
+ "ort",
+ "parakeet-rs",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "transcribe-cpp",
+ "ureq",
+]
 
 [[package]]
 name = "icu_collections"
@@ -3824,26 +3915,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "whisper-local"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ctrlc",
- "hound",
- "serde_json",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "ureq",
- "windows",
- "wl-audio",
- "wl-core",
- "wl-normalize",
- "wl-platform-windows",
- "wl-stt",
-]
-
-[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4104,77 +4175,6 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "wl-audio"
-version = "0.1.0"
-dependencies = [
- "audioadapter-buffers",
- "cpal",
- "ctrlc",
- "hound",
- "rtrb",
- "rubato",
- "thiserror 2.0.21",
- "tracing",
- "tracing-subscriber",
- "tract-onnx",
- "wl-core",
-]
-
-[[package]]
-name = "wl-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror 2.0.21",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
-]
-
-[[package]]
-name = "wl-normalize"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "strsim",
- "thiserror 2.0.21",
- "tracing",
- "ureq",
- "wl-core",
-]
-
-[[package]]
-name = "wl-platform-windows"
-version = "0.1.0"
-dependencies = [
- "directories",
- "thiserror 2.0.21",
- "tracing",
- "tracing-subscriber",
- "tray-icon",
- "windows",
- "wl-core",
-]
-
-[[package]]
-name = "wl-stt"
-version = "0.1.0"
-dependencies = [
- "directories",
- "ort",
- "parakeet-rs",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.21",
- "tracing",
- "transcribe-cpp",
- "ureq",
- "wl-core",
-]
 
 [[package]]
 name = "writeable"

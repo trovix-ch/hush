@@ -173,8 +173,7 @@ pub fn find(id: &str) -> Result<&'static ModelManifest, ModelError> {
 
 /// Local, not Roaming: these are gigabytes and must never sync with a roaming profile.
 pub fn default_models_root() -> Result<PathBuf, ModelError> {
-    let dirs =
-        directories::ProjectDirs::from("", "", "whisper-local").ok_or(ModelError::NoDataDir)?;
+    let dirs = directories::ProjectDirs::from("", "", "hush").ok_or(ModelError::NoDataDir)?;
     Ok(models_root_from_data_local(dirs.data_local_dir()))
 }
 
@@ -423,21 +422,21 @@ mod tests {
 
     #[test]
     fn models_root_strips_windows_data_component() {
-        let root = models_root_from_data_local(Path::new("base/whisper-local/data"));
+        let root = models_root_from_data_local(Path::new("base/hush/data"));
         if cfg!(windows) {
-            assert_eq!(root, Path::new("base/whisper-local/models"));
+            assert_eq!(root, Path::new("base/hush/models"));
         } else {
-            assert_eq!(root, Path::new("base/whisper-local/data/models"));
+            assert_eq!(root, Path::new("base/hush/data/models"));
         }
-        let root = models_root_from_data_local(Path::new("base/whisper-local"));
-        assert_eq!(root, Path::new("base/whisper-local/models"));
+        let root = models_root_from_data_local(Path::new("base/hush"));
+        assert_eq!(root, Path::new("base/hush/models"));
     }
 
     #[cfg(windows)]
     #[test]
     fn default_model_dir_is_under_local_app_data() {
         let dir = default_model_dir("parakeet-tdt-0.6b-v3").unwrap();
-        assert!(dir.ends_with(r"whisper-local\models\parakeet-tdt-0.6b-v3"));
+        assert!(dir.ends_with(r"hush\models\parakeet-tdt-0.6b-v3"));
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             assert!(dir.starts_with(local));
         }

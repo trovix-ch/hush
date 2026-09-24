@@ -5,8 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hush_core::stt::SAMPLE_RATE;
 use tract_onnx::prelude::*;
-use wl_core::stt::SAMPLE_RATE;
 
 use crate::vad::{Vad, VadEvent};
 
@@ -250,9 +250,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    /// Set `WL_SILERO_MODEL` to the downloaded `silero_vad.onnx` to run these.
+    /// Set `HUSH_SILERO_MODEL` to the downloaded `silero_vad.onnx` to run these.
     fn model() -> Option<PathBuf> {
-        std::env::var_os("WL_SILERO_MODEL").map(PathBuf::from)
+        std::env::var_os("HUSH_SILERO_MODEL").map(PathBuf::from)
     }
 
     fn fixture(name: &str) -> Vec<f32> {
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn speech_clips_have_speech_and_silence_has_none() {
         let Some(path) = model() else {
-            eprintln!("skipped: WL_SILERO_MODEL is not set");
+            eprintln!("skipped: HUSH_SILERO_MODEL is not set");
             return;
         };
         let mut vad = SileroVad::load(&path, SileroConfig::default()).unwrap();
@@ -316,9 +316,9 @@ mod tests {
 
     #[test]
     fn dictation_closes_segments_before_release() {
-        use wl_core::segment::{Segmenter, SegmenterConfig};
+        use hush_core::segment::{Segmenter, SegmenterConfig};
         let Some(path) = model() else {
-            eprintln!("skipped: WL_SILERO_MODEL is not set");
+            eprintln!("skipped: HUSH_SILERO_MODEL is not set");
             return;
         };
         let mut vad = SileroVad::load(&path, SileroConfig::default()).unwrap();
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn chunk_cost() {
         let Some(path) = model() else {
-            eprintln!("skipped: WL_SILERO_MODEL is not set");
+            eprintln!("skipped: HUSH_SILERO_MODEL is not set");
             return;
         };
         let t = Instant::now();

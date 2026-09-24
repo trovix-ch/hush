@@ -274,6 +274,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "hush-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "hush-normalize"
+version = "0.1.0"
+dependencies = [
+ "hush-core",
+ "serde",
+ "serde_json",
+ "strsim",
+ "thiserror",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -734,12 +757,12 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "encoding_rs",
+ "hush-core",
+ "hush-normalize",
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "serde",
  "toml",
- "wl-core",
- "wl-normalize",
 ]
 
 [[package]]
@@ -1033,29 +1056,6 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-
-[[package]]
-name = "wl-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "wl-normalize"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "strsim",
- "thiserror",
- "tracing",
- "ureq",
- "wl-core",
-]
 
 [[package]]
 name = "writeable"

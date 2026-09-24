@@ -1,9 +1,9 @@
-# whisper-local
+# hush
 
 Hold a key, talk, let go. Clean text appears wherever your cursor is. Nothing leaves your
 computer.
 
-whisper-local is a Windows dictation tool in the spirit of Wispr Flow, built in Rust and
+hush is a Windows dictation tool in the spirit of Wispr Flow, built in Rust and
 running every step locally: speech recognition, the language-model cleanup that removes
 "um"s and applies your mid-sentence corrections, and the insertion into the app you are
 using.
@@ -26,18 +26,18 @@ shell opened before the install, set them for the session (PowerShell):
 ```powershell
 $env:VULKAN_SDK = 'C:\VulkanSDK\1.4.357.0'
 $env:PATH = "C:\VulkanSDK\1.4.357.0\Bin;C:\Program Files\CMake\bin;$env:PATH"
-cargo build --release -p whisper-local
+cargo build --release -p hush
 ```
 
-- `whisper-local` runs the app. Hold **Right Ctrl**, speak, release. Tray → Quit (or
+- `hush` runs the app. Hold **Right Ctrl**, speak, release. Tray → Quit (or
   Ctrl+C in its console) exits.
-- `whisper-local doctor` checks microphone, GPUs, model (downloads it if missing),
+- `hush doctor` checks microphone, GPUs, model (downloads it if missing),
   engine load and the normalizer server.
-- `whisper-local simulate <wav> [--target notepad|foreground] [--runs N]` runs one
+- `hush simulate <wav> [--target notepad|foreground] [--runs N]` runs one
   dictation from a WAV through the whole pipeline and prints per-stage timings.
-- Config: `%APPDATA%\whisper-local\config.toml`, written on first run with every key
+- Config: `%APPDATA%\hush\config.toml`, written on first run with every key
   commented. With two GPUs set `engine.gpu_device` to the one not running your LLM
-  (`doctor` lists them). Logs: `%LOCALAPPDATA%\whisper-local\logs\`.
+  (`doctor` lists them). Logs: `%LOCALAPPDATA%\hush\logs\`.
 
 ## Principles
 

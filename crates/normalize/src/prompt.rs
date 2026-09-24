@@ -3,8 +3,8 @@
 
 use std::borrow::Cow;
 
+use hush_core::normalize::{NormalizeRequest, Style};
 use serde::Serialize;
-use wl_core::normalize::{NormalizeRequest, Style};
 
 use crate::lang;
 
@@ -154,7 +154,7 @@ fn neutralize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wl_core::normalize::AppContext;
+    use hush_core::normalize::AppContext;
 
     fn req<'a>(
         transcript: &'a str,
@@ -169,8 +169,8 @@ mod tests {
             vocabulary,
             app,
             previous,
-            utterance: wl_core::UtteranceId::FIRST,
-            cancel: wl_core::CancelToken::new(),
+            utterance: hush_core::UtteranceId::FIRST,
+            cancel: hush_core::CancelToken::new(),
         }
     }
 

@@ -14,13 +14,13 @@ pub enum Cue {
     Error,
 }
 
-impl From<wl_core::notify::Sound> for Cue {
-    fn from(s: wl_core::notify::Sound) -> Self {
+impl From<hush_core::notify::Sound> for Cue {
+    fn from(s: hush_core::notify::Sound) -> Self {
         match s {
-            wl_core::notify::Sound::Start => Cue::Start,
-            wl_core::notify::Sound::Stop => Cue::Stop,
-            wl_core::notify::Sound::Cancel => Cue::Cancel,
-            wl_core::notify::Sound::Error => Cue::Error,
+            hush_core::notify::Sound::Start => Cue::Start,
+            hush_core::notify::Sound::Stop => Cue::Stop,
+            hush_core::notify::Sound::Cancel => Cue::Cancel,
+            hush_core::notify::Sound::Error => Cue::Error,
         }
     }
 }

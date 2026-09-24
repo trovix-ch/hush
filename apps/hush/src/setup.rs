@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use hush_core::config::{Config, DEFAULT_CONFIG};
+use hush_platform_windows::ui_thread::AppPaths;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
-use wl_core::config::{Config, DEFAULT_CONFIG};
-use wl_platform_windows::ui_thread::AppPaths;
 
 const LOG_FILES_KEPT: usize = 7;
 
@@ -50,7 +50,7 @@ pub fn init_logging(logs_dir: &Path, console_default: &str) -> Result<WorkerGuar
         .with_context(|| format!("creating {}", logs_dir.display()))?;
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
-        .filename_prefix("whisper-local")
+        .filename_prefix("hush")
         .filename_suffix("log")
         .max_log_files(LOG_FILES_KEPT)
         .build(logs_dir)
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn first_run_writes_the_default_config_and_reads_it_back() {
-        let dir = std::env::temp_dir().join(format!("wl-setup-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hush-setup-test-{}", std::process::id()));
         let path = dir.join("sub").join("config.toml");
         let _ = std::fs::remove_dir_all(&dir);
         let (c, created) = load_config(&path).unwrap();
