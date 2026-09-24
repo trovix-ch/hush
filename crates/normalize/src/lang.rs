@@ -228,7 +228,7 @@ pub(crate) static DE: Table = Table {
     ],
     stutter_keep: &[
         "die", "der", "das", "den", "dem", "ja", "nein", "so", "sehr", "null", "eins", "zwei",
-        "drei", "vier", "fünf", "sechs", "acht", "neun", "zehn",
+        "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun", "zehn",
     ],
     not_before_command: &[
         "der",
@@ -355,6 +355,19 @@ mod tests {
             let mut sorted = lens.clone();
             sorted.sort_by(|a, b| b.cmp(a));
             assert_eq!(lens, sorted);
+        }
+    }
+
+    #[test]
+    fn german_number_words_are_in_every_number_list() {
+        let numbers = [
+            "null", "eins", "zwei", "drei", "vier", "fünf", "sechs", "sieben", "acht", "neun",
+            "zehn",
+        ];
+        for list in [DE.stutter_keep, DE.not_before_command, DE.not_after_command] {
+            for n in numbers {
+                assert!(list.contains(&n), "{n}");
+            }
         }
     }
 

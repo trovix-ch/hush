@@ -53,24 +53,21 @@ pub fn spawn_stt(
 ) -> std::io::Result<(Sender<SttJob>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<SttJob>();
     let join = spawn("wl-stt", move || {
-        let mut engine = match catch_unwind(AssertUnwindSafe(load)) {
-            Ok(Ok((engine, summary))) => {
+        let loaded = match catch_unwind(AssertUnwindSafe(load)) {
+            Ok(Ok(loaded)) => Ok(loaded),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(p) => Err(format!("engine load panicked: {}", panic_text(p.as_ref()))),
+        };
+        let mut engine: Result<Box<dyn SttEngine>, String> = match loaded {
+            Ok((engine, summary)) => {
                 let _ = out.send(Msg::EngineReady(Ok(summary)));
-                Some(engine)
+                Ok(engine)
             }
-            Ok(Err(e)) => {
-                let _ = out.send(Msg::EngineReady(Err(format!("{e:#}"))));
-                None
-            }
-            Err(p) => {
-                let _ = out.send(Msg::EngineReady(Err(format!(
-                    "engine load panicked: {}",
-                    panic_text(p.as_ref())
-                ))));
-                None
+            Err(reason) => {
+                let _ = out.send(Msg::EngineReady(Err(reason.clone())));
+                Err(reason)
             }
         };
-        let mut load_error = None::<String>;
         for job in rx {
             // Escape already moved the pipeline on; nobody is waiting for this answer.
             if job.cancel.is_cancelled() {
@@ -88,12 +85,8 @@ pub fn spawn_stt(
             let pcm = trim_silence(&job.pcm, &events, VAD_PAD);
             tracing::debug!(%id, samples = job.pcm.len(), trimmed = pcm.len(), vad_ms = vad_started.elapsed().as_secs_f64() * 1e3, "vad");
             let result = match engine.as_mut() {
-                None => Err(SttError::Load(
-                    load_error
-                        .get_or_insert_with(|| "the speech engine did not load".into())
-                        .clone(),
-                )),
-                Some(e) => {
+                Err(reason) => Err(SttError::Load(reason.clone())),
+                Ok(e) => {
                     let opts = DecodeOptions {
                         utterance: id,
                         cancel: job.cancel.clone(),
@@ -104,8 +97,7 @@ pub fn spawn_stt(
                         Err(p) => {
                             // The native session may be half torn down; never reuse it.
                             let msg = format!("engine panicked: {}", panic_text(p.as_ref()));
-                            engine = None;
-                            load_error = Some(msg.clone());
+                            engine = Err(msg.clone());
                             Err(SttError::BackendDied(msg))
                         }
                     }
@@ -367,19 +359,21 @@ mod tests {
             Msg::NoSpeech(UtteranceId(1))
         ));
         let tone: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
-        tx.send(SttJob {
-            id: UtteranceId(2),
-            pcm: tone,
-            cancel: CancelToken::new(),
-        })
-        .unwrap();
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Msg::Event(Event::Failed(
-                UtteranceId(2),
-                Failure::Stt(SttError::Load(_))
-            ))
-        ));
+        for id in [UtteranceId(2), UtteranceId(3)] {
+            tx.send(SttJob {
+                id,
+                pcm: tone.clone(),
+                cancel: CancelToken::new(),
+            })
+            .unwrap();
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Msg::Event(Event::Failed(got, Failure::Stt(SttError::Load(reason)))) => {
+                    assert_eq!(got, id);
+                    assert!(reason.contains("no model here"), "{reason}");
+                }
+                _ => panic!("unexpected message"),
+            }
+        }
         drop(tx);
         join.join().unwrap();
     }

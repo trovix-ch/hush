@@ -969,8 +969,9 @@ mod tests {
         assert_eq!(ev.generation, receipt.generation);
         assert_eq!(ev.format, CF_UNICODETEXT);
         assert_eq!(cb.sequence_number(), receipt.sequence);
+        assert_eq!(cb.render_count(), 1);
         assert_eq!(read_text_as_other_reader().as_deref(), Some("hello ✓ 😀"));
-        assert!(cb.render_count() >= 1);
+        assert_eq!(cb.render_count(), 1);
 
         let outcome = cb
             .restore(&before, Some(receipt.sequence))
@@ -1058,12 +1059,14 @@ mod tests {
         let cb = WinClipboard::start().expect("owner");
         let before = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
         cb.write_delayed("x").unwrap();
-        // Under RDP, rdpclip has usually rendered already.
+        let other = WinClipboard::start().expect("second owner");
+        other.write_text("foreign").unwrap();
+        // Once the foreign write has landed nothing can render ours any more, so this check
+        // is final. Under RDP, rdpclip has usually rendered before it, and a render
+        // legitimately outranks the change.
         if cb.first_render().is_none() {
-            let other = WinClipboard::start().expect("second owner");
-            other.write_text("foreign").unwrap();
             let r = cb.wait_for_render_or_change(Duration::from_millis(500));
-            assert!(matches!(r, Err(Waited::Changed) | Ok(_)), "{r:?}");
+            assert!(matches!(r, Err(Waited::Changed)), "{r:?}");
         }
         cb.restore(&before, None).unwrap();
     }

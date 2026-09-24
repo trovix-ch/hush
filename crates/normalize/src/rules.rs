@@ -77,13 +77,11 @@ pub(crate) fn has_disfluency(text: &str) -> bool {
     let tables = [&lang::EN, &lang::DE];
     (0..toks.len()).any(|i| {
         let k = toks[i].key().unwrap_or_default();
-        let stutter = toks.get(i + 1).and_then(Tok::key).is_some_and(|n| {
-            n == k
-                && !k.is_empty()
-                && k.chars().count() <= STUTTER_MAX_CHARS
-                && k.chars().all(char::is_alphabetic)
-                && !tables.iter().any(|t| t.stutter_keep.contains(&k.as_str()))
-        });
+        let stutter = match (&toks[i], toks.get(i + 1)) {
+            (Tok::Word(a), Some(Tok::Word(b))) => stutter_key(a, b)
+                .is_some_and(|s| !tables.iter().any(|t| t.stutter_keep.contains(&s.as_str()))),
+            _ => false,
+        };
         stutter
             || tables.iter().any(|t| {
                 t.fillers.contains(&k.as_str())
@@ -318,24 +316,29 @@ fn phrase_filler_at(toks: &[Tok], i: usize, table: &Table) -> Option<usize> {
     })
 }
 
+/// The shared key when `a b` is a candidate stutter. Punctuation between the two means the
+/// speaker restarted on purpose ("The, the thing"), so it is not one.
+fn stutter_key(a: &str, b: &str) -> Option<String> {
+    let ka = key(a);
+    let candidate = !ka.is_empty()
+        && ka.chars().count() <= STUTTER_MAX_CHARS
+        && ka.chars().all(char::is_alphabetic)
+        && trail(a).is_empty()
+        && parts(b).0.is_empty()
+        && ka == key(b);
+    candidate.then_some(ka)
+}
+
 fn collapse_stutters(toks: &mut Vec<Tok>, table: &Table) {
     let mut i = 0;
     while i + 1 < toks.len() {
-        if let (Tok::Word(a), Tok::Word(b)) = (&toks[i], &toks[i + 1]) {
-            let ka = key(a);
-            let collapses = !ka.is_empty()
-                && ka.chars().count() <= STUTTER_MAX_CHARS
-                && ka.chars().all(char::is_alphabetic)
-                && trail(a).is_empty()
-                && parts(b).0.is_empty()
-                && ka == key(b)
-                && !table.stutter_keep.contains(&ka.as_str());
-            if collapses {
-                let merged = format!("{a}{}", trail(b));
-                toks[i] = Tok::Word(merged);
-                toks.remove(i + 1);
-                continue;
-            }
+        if let (Tok::Word(a), Tok::Word(b)) = (&toks[i], &toks[i + 1])
+            && stutter_key(a, b).is_some_and(|k| !table.stutter_keep.contains(&k.as_str()))
+        {
+            let merged = format!("{a}{}", trail(b));
+            toks[i] = Tok::Word(merged);
+            toks.remove(i + 1);
+            continue;
         }
         i += 1;
     }
@@ -668,6 +671,10 @@ mod tests {
         assert_eq!(
             de("Die Frau, die die Zeitung liest."),
             "Die Frau, die die Zeitung liest."
+        );
+        assert_eq!(
+            de("Die Nummer ist sieben sieben drei."),
+            "Die Nummer ist sieben sieben drei."
         );
     }
 
@@ -1021,6 +1028,7 @@ mod tests {
         assert!(has_disfluency("ich glaube äh ja"));
         assert!(has_disfluency("hello comma world"));
         assert!(!has_disfluency("I know that that is true."));
+        assert!(!has_disfluency("The, the thing is."));
         assert!(!has_disfluency("A perfectly clean sentence."));
     }
 

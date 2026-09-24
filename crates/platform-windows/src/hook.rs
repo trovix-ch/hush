@@ -593,9 +593,16 @@ fn key_down_async(vk: u8) -> bool {
 }
 
 /// Skips the mouse buttons, which never pass through a keyboard hook.
+/// Left, right, middle, X1, X2. Not a range: 3 between them is Ctrl+Break.
+const MOUSE_BUTTON_VKS: [usize; 5] = [0x01, 0x02, 0x04, 0x05, 0x06];
+
+fn is_sampled_key(vk: usize) -> bool {
+    vk != 0 && vk < 0xFF && !MOUSE_BUTTON_VKS.contains(&vk)
+}
+
 fn sample_keys(buf: &mut [bool; 256]) {
     for (vk, slot) in buf.iter_mut().enumerate() {
-        *slot = vk > 7 && vk < 0xFF && key_down_async(vk as u8);
+        *slot = is_sampled_key(vk) && key_down_async(vk as u8);
     }
 }
 
@@ -817,6 +824,17 @@ impl Drop for HookHandle {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn watchdog_samples_ctrl_break_but_not_mouse_buttons() {
+        assert!(is_sampled_key(0x03));
+        for vk in [0x01, 0x02, 0x04, 0x05, 0x06] {
+            assert!(!is_sampled_key(vk), "{vk:#x}");
+        }
+        assert!(!is_sampled_key(0x00));
+        assert!(!is_sampled_key(0xFF));
+        assert!(is_sampled_key(0x08));
+    }
 
     #[test]
     fn parse_right_ctrl() {

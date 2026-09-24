@@ -61,7 +61,6 @@ pub enum TrayError {
 pub struct Tray {
     icon: TrayIcon,
     pause: MenuItem,
-    _menu: Menu,
 }
 
 impl Tray {
@@ -93,14 +92,10 @@ impl Tray {
         let icon = TrayIconBuilder::new()
             .with_tooltip("whisper-local")
             .with_icon(icon_image(false)?)
-            .with_menu(Box::new(menu.clone()))
+            .with_menu(Box::new(menu))
             .build()
             .map_err(|e| TrayError::Icon(e.to_string()))?;
-        Ok(Self {
-            icon,
-            pause,
-            _menu: menu,
-        })
+        Ok(Self { icon, pause })
     }
 
     pub fn set_paused(&self, paused: bool) {

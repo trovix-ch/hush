@@ -27,6 +27,8 @@ pub enum RefuseReason {
     FocusChanged,
     /// Typing would land in the wrong session and the paste receipt is meaningless there.
     UnsupportedRemote,
+    /// The app may not be typed into and pasting is turned off in remote sessions.
+    NeverTypeInRemote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +99,9 @@ impl InsertOutcome {
                     RefuseReason::Password => "Not inserted into a password field",
                     RefuseReason::FocusChanged => "The focused window changed",
                     RefuseReason::UnsupportedRemote => "Remote windows are not supported",
+                    RefuseReason::NeverTypeInRemote => {
+                        "This app is not typed into, and pasting is off in remote sessions"
+                    }
                 };
                 Some(format!("{why}; {}", where_(*on_clipboard)))
             }
@@ -343,7 +348,7 @@ impl<C: ClipboardPort, I: InputPort, F: FocusPort> StrategyChain<C, I, F> {
     ) -> Result<InsertOutcome, InsertError> {
         if app.never_type {
             return Ok(InsertOutcome::Refused {
-                reason: RefuseReason::UnsupportedRemote,
+                reason: RefuseReason::NeverTypeInRemote,
                 on_clipboard: false,
             });
         }
@@ -875,6 +880,37 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Call::Write(_) | Call::Snapshot))
         );
+    }
+
+    #[test]
+    fn never_type_app_in_type_only_remote_session_is_refused_without_touching_the_clipboard() {
+        let mut rig = Rig::new(vec![]);
+        rig.remote = true;
+        rig.policy.type_only_in_remote = true;
+        rig.policy.apps.by_exe.push((
+            "notepad.exe".into(),
+            AppPolicy {
+                never_type: true,
+                ..Default::default()
+            },
+        ));
+        let (r, calls) = rig.run(&notepad());
+        let outcome = r.unwrap();
+        assert_eq!(
+            outcome,
+            InsertOutcome::Refused {
+                reason: RefuseReason::NeverTypeInRemote,
+                on_clipboard: false
+            }
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, Call::Write(_) | Call::Snapshot))
+        );
+        let m = outcome.message().unwrap();
+        assert!(!m.contains("Remote windows"), "{m}");
+        assert!(m.contains("paste last"), "{m}");
     }
 
     #[test]

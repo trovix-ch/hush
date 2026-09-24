@@ -237,6 +237,15 @@ pub struct Pipeline {
     shown: OverlayState,
 }
 
+/// Takes the field rather than the pipeline, so the caller can still read the other fields.
+fn matching(
+    inflight: &mut Option<Inflight>,
+    id: UtteranceId,
+    stage: Stage,
+) -> Option<&mut Inflight> {
+    inflight.as_mut().filter(|i| i.id == id && i.stage == stage)
+}
+
 impl Pipeline {
     pub fn new(cfg: PipelineConfig) -> Self {
         Self {
@@ -331,9 +340,7 @@ impl Pipeline {
     }
 
     fn inflight_mut(&mut self, id: UtteranceId, stage: Stage) -> Option<&mut Inflight> {
-        self.inflight
-            .as_mut()
-            .filter(|i| i.id == id && i.stage == stage)
+        matching(&mut self.inflight, id, stage)
     }
 
     fn on_down(&mut self, at: Instant, focus: FocusContext, fx: &mut Vec<Effect>) {
@@ -492,10 +499,9 @@ impl Pipeline {
         self.show_stage(fx, OverlayState::Transcribing);
     }
 
-    fn normalize_effect(&self, i: &Inflight) -> Effect {
+    fn normalize_effect(cfg: &PipelineConfig, history: &History, i: &Inflight) -> Effect {
         let exe = i.focus.exe.clone();
-        let previous = self
-            .history
+        let previous = history
             .last()
             .filter(|e| {
                 e.exe.is_some()
@@ -508,7 +514,7 @@ impl Pipeline {
             transcript: i.raw.clone(),
             ctx: NormalizeContext {
                 app: AppContext {
-                    style: self.cfg.apps.lookup(exe.as_deref()).style,
+                    style: cfg.apps.lookup(exe.as_deref()).style,
                     exe,
                     window_title: i.focus.title.clone(),
                 },
@@ -520,7 +526,7 @@ impl Pipeline {
     }
 
     fn on_transcript(&mut self, id: UtteranceId, t: Transcript, fx: &mut Vec<Effect>) {
-        let Some(i) = self.inflight_mut(id, Stage::Transcribing) else {
+        let Some(i) = matching(&mut self.inflight, id, Stage::Transcribing) else {
             return;
         };
         if t.text.trim().is_empty() {
@@ -530,19 +536,15 @@ impl Pipeline {
         i.raw = t.text;
         i.language = t.language;
         i.stage = Stage::Normalizing;
-        let effect = self.normalize_effect(self.inflight.as_ref().expect("checked above"));
-        fx.push(effect);
+        fx.push(Self::normalize_effect(&self.cfg, &self.history, i));
         self.show_stage(fx, OverlayState::Normalizing);
     }
 
     fn on_normalized(&mut self, id: UtteranceId, out: NormalizeOutput, fx: &mut Vec<Effect>) {
-        if self.inflight_mut(id, Stage::Normalizing).is_none() {
+        let Some(i) = self.inflight_mut(id, Stage::Normalizing) else {
             return;
-        }
-        let provenance = match (
-            &self.inflight.as_ref().expect("checked").llm_error,
-            out.provenance,
-        ) {
+        };
+        let provenance = match (&i.llm_error, out.provenance) {
             (Some(error), Provenance::Rules) => Provenance::LlmFailed {
                 stage: "normalizer".into(),
                 error: error.clone(),
@@ -626,7 +628,7 @@ impl Pipeline {
                 self.finish(fx);
             }
             Failure::Normalize(e) => {
-                let Some(i) = self.inflight_mut(id, Stage::Normalizing) else {
+                let Some(i) = matching(&mut self.inflight, id, Stage::Normalizing) else {
                     return;
                 };
                 if i.rules_only {
@@ -645,8 +647,7 @@ impl Pipeline {
                     tracing::info!(%id, error = %e, "normalizer failed; retrying with rules only");
                     i.rules_only = true;
                     i.llm_error = Some(e.to_string());
-                    let effect = self.normalize_effect(self.inflight.as_ref().expect("checked"));
-                    fx.push(effect);
+                    fx.push(Self::normalize_effect(&self.cfg, &self.history, i));
                 }
             }
             Failure::Insert(e) => {
