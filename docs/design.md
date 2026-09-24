@@ -213,7 +213,18 @@ driver streams to it, and sends them only for the oldest utterance in the pipeli
 speech is still transcribed in utterance order. If nothing closed before release, the
 whole recording goes to the engine in one call as before: a single call is no slower
 than several, and it keeps the no-speech path unchanged. A pipeline flag turns
-pre-transcription off for A/B measurement; the tail-latency gain is not yet measured.
+pre-transcription off for A/B measurement.
+
+*Amended 2026-09-24:* measured in the driver with Silero (§7, "Pre-transcription"),
+release-to-transcript p50 fell from 309 to 34 ms on a 30 s dictation and from 254 to
+50 ms on `jfk.wav`, at the cost of segment boundaries turning into sentence breaks in the
+transcript and, on the 30 s clip, up to three times the total GPU time per utterance.
+Decision: **off by default until the stitched text is as good as the single call.** The
+sentence-break damage is user-visible and outranks 250 ms of waiting. The fix to try
+first: close segments only on long pauses (about 700 ms, so boundaries fall on real
+sentence ends), and stitch with the engine's word timestamps so a segment's trailing
+period and the next segment's capital are dropped when the gap between them is short.
+The flag stays for measurement and for users who prefer speed.
 
 ### D7. Hotkey: our own low-level keyboard hook
 A `WH_KEYBOARD_LL` hook on a dedicated thread with its own message loop. It is the only
@@ -412,8 +423,9 @@ input contract is stable) rather than through a crate that pins a different `ort
 branches of every `If` and rejects the dead, ill-typed branches in the Silero export.
 Its probabilities matched onnxruntime to within 2e-6 on the bench fixtures, and it costs
 about 35 µs per 32 ms chunk in a release build (method: `chunk_cost` test in the audio crate,
-v6.2 model, this machine). It sits behind the audio crate's non-default `silero`
-feature until the driver uses it.
+v6.2 model, this machine). Since 2026-09-24 it is built by default and the driver uses
+it whenever its model file has been downloaded, falling back to the energy detector
+otherwise.
 
 ### D17. Speech runs on ggml/Vulkan; ONNX Runtime is a fallback behind a feature *(perishable)*
 Supersedes the default in D2, by the rule written in D13 before the numbers existed.
@@ -535,6 +547,41 @@ laptop-class CPUs remain unmeasured. `transcribe-cpp` exposes segment/word/token
 timestamps, a Whisper-only initial prompt, streaming and cancellation, and no VAD.
 
 Still to measure: Vulkan Parakeet on real microphone audio; a laptop CPU.
+
+### Pre-transcription, 2026-09-24
+Method: `hush simulate <wav> --runs 5` (3 for the 10 s and silence clips), release
+build, rules-only normalizer, Parakeet F16 on Vulkan device 1, Silero v6.2 VAD in the
+driver, default segmenter (300 / 400 / 200 ms, 20 s cap), RDP session. The WAV is
+streamed at real-time pace and the key is released when the clip ends. Latency is key-up
+to the transcript reaching the normalizer; "engine" is the summed inference of every
+call for the utterance.
+
+| clip | pre-transcribe | release→transcript p50 / p95 | total p50 / p95 | segments closed in hold | tail | engine |
+|---|---|---|---|---|---|---|
+| tts 30 s, cut 0.2 s after the last word | off | 309 / 470 | 312 / 475 | – | 30.4 s | 204–466 |
+| same | on | 34 / 39 | 37 / 42 | 10–12 | 1.5 s | 489–593 |
+| tts 30 s as recorded (0.8 s trailing silence) | off | 420 / 505 | 422 / 507 | – | 31.0 s | 413–504 |
+| same | on | 0.5 / 0.5 | 3.0 / 3.7 | 13–14 | none | 1143–1353 |
+| jfk 11 s (0.02 s trailing) | off | 254 / 340 | 257 / 342 | – | 11.0 s | 246–340 |
+| same | on | 50 / 54 | 52 / 58 | 3–4 | 0 or 3.0 s | 141–184 |
+
+A first `jfk` batch with pre-transcription on gave p50 145 / p95 192 ms from the same
+segmentation, so the run-to-run spread is wide; GPU clocks dropping between short calls
+are the suspect, unverified. The 10 s clip closes as one 9.2 s segment during its
+trailing silence, and its text is identical with the flag on and off; the silence clip
+inserts nothing either way.
+
+Findings. Segment boundaries become sentence breaks: `jfk` turns from "Americans, ask
+not what your country can do for you, ask what…" into "Americans. Ask not! What your
+country can do for you. Ask what…", and the 30 s clip gains "Also Please…" and
+"Tuesday. No wait. Wednesday." (the rule pass still resolves the self-correction). The
+same audio does not always segment the same way (10, 12 or 14 segments on the 30 s
+clip); the likely cause is that a pause is judged against the audio received so far
+while Silero confirms a start about 96 ms late, so a pause within that margin of
+`min_pause` closes or not depending on 50 ms delivery timing. Summed engine time grew
+up to threefold on the 30 s clip (13–14 calls) yet fell on `jfk` (4 calls); why short
+calls cost that much is not established.
+Pending: a real microphone; the LLM normalizer over pre-transcribed segments.
 
 ### Audio capture, 2026-09-24
 Method: `crates/audio/examples/record.rs`, release build, the only input device in this

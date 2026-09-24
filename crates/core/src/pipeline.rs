@@ -52,6 +52,8 @@ impl Default for PipelineConfig {
 impl PipelineConfig {
     pub fn from_config(c: &Config) -> Self {
         Self {
+            pre_transcribe: c.pipeline.pre_transcribe,
+            segmenter: c.pipeline.segmenter.clone(),
             hands_free_double_tap: c.hands_free_double_tap,
             max_recording: c.max_recording,
             history_len: c.history_len,
@@ -1846,12 +1848,16 @@ mod tests {
 
     #[test]
     fn from_config_carries_user_settings() {
-        let c = Config {
+        let mut c = Config {
             hands_free_double_tap: false,
             max_recording: Duration::from_secs(30),
             ..Config::default()
         };
+        c.pipeline.pre_transcribe = false;
+        c.pipeline.segmenter.min_pause = Duration::from_millis(700);
         let p = PipelineConfig::from_config(&c);
+        assert!(!p.pre_transcribe);
+        assert_eq!(p.segmenter, c.pipeline.segmenter);
         assert!(!p.hands_free_double_tap);
         assert_eq!(p.max_recording, Duration::from_secs(30));
         assert_eq!(p.apps, c.app_policies());

@@ -77,7 +77,12 @@ impl Args {
 struct RunReport {
     foreground_ok: bool,
     released: Option<Instant>,
-    transcript: Option<(Instant, String, Duration)>,
+    /// Sample counts of the audio sent to the engine before and after the key-up.
+    sent_during_hold: Vec<usize>,
+    sent_after_release: Vec<usize>,
+    done_during_hold: usize,
+    inference: Duration,
+    transcript: Option<(Instant, String)>,
     normalized: Option<(Instant, String, Provenance)>,
     inserted: Option<(Instant, String)>,
     delivered: bool,
@@ -86,11 +91,35 @@ struct RunReport {
     notepad: Vec<String>,
 }
 
+fn ms(a: Option<Instant>, b: Option<Instant>) -> Option<f64> {
+    Some(b?.saturating_duration_since(a?).as_secs_f64() * 1e3)
+}
+
 fn ms_between(a: Option<Instant>, b: Option<Instant>) -> String {
-    match (a, b) {
-        (Some(a), Some(b)) => format!("{:.1}", b.saturating_duration_since(a).as_secs_f64() * 1e3),
-        _ => "-".into(),
+    ms(a, b).map_or_else(|| "-".into(), |v| format!("{v:.1}"))
+}
+
+fn secs(samples: &[usize]) -> f64 {
+    samples.iter().sum::<usize>() as f64 / f64::from(SAMPLE_RATE)
+}
+
+/// Nearest rank, so with five runs p95 is the slowest.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let rank = (p * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+fn print_percentiles(label: &str, mut values: Vec<f64>) {
+    if values.is_empty() {
+        return;
     }
+    values.sort_by(f64::total_cmp);
+    println!(
+        "{label:<22} p50 {:>6.1} ms   p95 {:>6.1} ms   over {} runs",
+        percentile(&values, 0.5),
+        percentile(&values, 0.95),
+        values.len()
+    );
 }
 
 pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
@@ -150,6 +179,13 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         }
     };
 
+    let (vad, vad_label) = engines::load_vad();
+    println!("vad         {vad_label}");
+    println!(
+        "pipeline    pre_transcribe = {}, {:?}",
+        config.pipeline.pre_transcribe, config.pipeline.segmenter
+    );
+
     let (ui, _tray) = UiHandle::start(UiOptions {
         tray: false,
         ..Default::default()
@@ -166,6 +202,7 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         config,
         config_path: paths.config_file.clone(),
         recorder: Box::new(WavRecorder::new(pcm)),
+        vad,
         ui: ui.clone(),
         focus,
         hook: None,
@@ -205,11 +242,12 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         }
         while obs_rx.try_recv().is_ok() {}
         let down = Instant::now();
-        // At least a second, so the pipeline sees a hold rather than a tap.
-        let up = down + clip.max(Duration::from_secs(1));
         tx.send(Msg::Hotkey(HotkeyEvent::Down { at: down }))
             .context("driver is gone")?;
-        tx.send(Msg::Hotkey(HotkeyEvent::Up { at: up }))
+        // The key is held while the clip plays, at least a second so the pipeline sees a
+        // hold rather than a tap.
+        std::thread::sleep(clip.max(Duration::from_secs(1)));
+        tx.send(Msg::Hotkey(HotkeyEvent::Up { at: Instant::now() }))
             .context("driver is gone")?;
         let deadline = Instant::now() + RUN_TIMEOUT;
         loop {
@@ -223,18 +261,23 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
             };
             let now = Instant::now();
             match o {
-                Observed::Released => r.released = Some(now),
+                Observed::Released { at } => r.released = Some(at),
+                Observed::SegmentSent {
+                    samples,
+                    while_recording: true,
+                } => r.sent_during_hold.push(samples),
+                Observed::SegmentSent { samples, .. } => r.sent_after_release.push(samples),
+                Observed::SegmentDone { inference } => {
+                    r.inference += inference;
+                    if r.released.is_none() {
+                        r.done_during_hold += 1;
+                    }
+                }
                 Observed::NoSpeech => {
                     r.no_speech = true;
                     break;
                 }
-                Observed::Transcript { text, inference } => {
-                    let empty = text.trim().is_empty();
-                    r.transcript = Some((now, text, inference));
-                    if empty {
-                        break;
-                    }
-                }
+                Observed::Transcript { text } => r.transcript = Some((now, text)),
                 Observed::Normalized { text, provenance } => {
                     let empty = text.trim().is_empty();
                     r.normalized = Some((now, text, provenance));
@@ -277,26 +320,26 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
     ui.shutdown();
 
     println!(
-        "\n run | release->transcript | ->normalized | ->inserted | total ms | engine ms | outcome"
+        "\n run | release->transcript | ->normalized | ->inserted | total ms | engine ms | sent in hold | done in hold | tail s | outcome"
     );
     println!(
-        "-----|---------------------|--------------|------------|----------|-----------|--------"
+        "-----|---------------------|--------------|------------|----------|-----------|--------------|--------------|--------|--------"
     );
     for (i, r) in reports.iter().enumerate() {
         let t = r.transcript.as_ref().map(|t| t.0);
         let n = r.normalized.as_ref().map(|n| n.0);
         let ins = r.inserted.as_ref().map(|x| x.0);
         println!(
-            " {:>3} | {:>19} | {:>12} | {:>10} | {:>8} | {:>9} | {}",
+            " {:>3} | {:>19} | {:>12} | {:>10} | {:>8} | {:>9.1} | {:>12} | {:>12} | {:>6.2} | {}",
             i + 1,
             ms_between(r.released, t),
             ms_between(t, n),
             ms_between(n, ins),
             ms_between(r.released, ins.or(n).or(t)),
-            r.transcript
-                .as_ref()
-                .map(|t| format!("{:.1}", t.2.as_secs_f64() * 1e3))
-                .unwrap_or_else(|| "-".into()),
+            r.inference.as_secs_f64() * 1e3,
+            r.sent_during_hold.len(),
+            r.done_during_hold,
+            secs(&r.sent_after_release),
             r.inserted
                 .as_ref()
                 .map(|x| x.1.clone())
@@ -307,6 +350,21 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
                 })
         );
     }
+    println!();
+    print_percentiles(
+        "release->transcript",
+        reports
+            .iter()
+            .filter_map(|r| ms(r.released, r.transcript.as_ref().map(|t| t.0)))
+            .collect(),
+    );
+    print_percentiles(
+        "release->inserted",
+        reports
+            .iter()
+            .filter_map(|r| ms(r.released, r.inserted.as_ref().map(|x| x.0)))
+            .collect(),
+    );
     let all = reports.iter().all(|r| r.delivered);
     Ok(if all {
         ExitCode::SUCCESS
@@ -321,7 +379,18 @@ fn print_run(run: usize, r: &RunReport) {
     if r.no_speech {
         println!("  no speech detected; nothing inserted");
     }
-    if let Some((_, text, _)) = &r.transcript {
+    let lens = |v: &[usize]| {
+        v.iter()
+            .map(|n| format!("{:.2}", *n as f64 / f64::from(SAMPLE_RATE)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!(
+        "  segments:   during hold [{}] s, after release [{}] s",
+        lens(&r.sent_during_hold),
+        lens(&r.sent_after_release)
+    );
+    if let Some((_, text)) = &r.transcript {
         println!("  transcript: {text:?}");
     }
     if let Some((_, text, p)) = &r.normalized {

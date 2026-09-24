@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use hush_audio::silero::{SileroConfig, SileroVad};
+use hush_audio::vad::{EnergyVad, Vad};
 use hush_core::config::{EngineChoice, GpuPolicy, NormalizerChoice};
 use hush_core::normalize::Normalizer;
 use hush_core::stt::{Backend, SttEngine};
@@ -26,6 +28,35 @@ pub fn resolve_model(choice: &EngineChoice) -> Result<(&'static ModelManifest, P
     }
     let dir = models::default_model_dir(&model.id)?;
     Ok((model, dir))
+}
+
+pub fn vad_model() -> Result<(&'static ModelManifest, PathBuf)> {
+    let model = models::find(models::VAD_MODEL_ID)?;
+    let dir = models::default_model_dir(&model.id)?;
+    Ok((model, dir))
+}
+
+/// Silero when its model is on disk, the energy detector otherwise; the label says which
+/// one runs and why.
+pub fn load_vad() -> (Box<dyn Vad>, String) {
+    let silero = vad_model().and_then(|(model, dir)| {
+        if !model.is_present(&dir) {
+            bail!("{} is not downloaded; `hush doctor` fetches it", model.id);
+        }
+        let started = Instant::now();
+        let vad = SileroVad::load(&model.load_path(&dir), SileroConfig::default())?;
+        Ok((vad, model.id.as_str(), started.elapsed()))
+    });
+    match silero {
+        Ok((vad, id, load)) => (
+            Box::new(vad),
+            format!("Silero ({id}, load {} ms)", load.as_millis()),
+        ),
+        Err(e) => (
+            Box::new(EnergyVad::default()),
+            format!("energy, because {e:#}"),
+        ),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +242,28 @@ mod tests {
         let (model, dir) = resolve_model(&Config::default().engine).unwrap();
         assert_eq!(model.id, models::DEFAULT_MODEL_ID);
         assert!(dir.ends_with(model.id.as_str()));
+    }
+
+    #[test]
+    fn vad_manifest_entry_matches_the_pinned_model() {
+        use hush_audio::silero;
+        let (model, _) = vad_model().unwrap();
+        let [file] = model.files.as_slice() else {
+            panic!("{:?}", model.files);
+        };
+        assert_eq!(file.name, silero::MODEL_FILE);
+        assert_eq!(file.url, silero::MODEL_URL);
+        assert_eq!(file.size, silero::MODEL_SIZE);
+        assert_eq!(file.sha256.as_deref(), Some(silero::MODEL_SHA256));
+        assert_eq!(model.license, silero::MODEL_LICENSE);
+        assert_eq!(model.attribution, silero::MODEL_ATTRIBUTION);
+        assert!(
+            resolve_model(&EngineChoice {
+                model: model.id.clone(),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]

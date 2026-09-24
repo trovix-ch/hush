@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::insert::{AppPolicies, AppPolicy, Chord};
 use crate::normalize::Style;
+use crate::segment::SegmenterConfig;
 
 /// Written on first run. Must parse to `Config::default()`.
 pub const DEFAULT_CONFIG: &str = r#"# hush configuration. Every key is optional; a missing key takes the value shown.
@@ -38,6 +39,23 @@ kind = "rules"
 # base_url = "http://127.0.0.1:11434/v1"
 # model = "qwen3:4b-instruct-2507-q4_K_M"
 # timeout_ms = 5000
+
+[pipeline]
+# Transcribe each sentence as soon as you pause, while the key is still held, so the
+# release waits only for the last one. Off sends the whole recording at release.
+# Off by default: the engine punctuates every segment as a full sentence.
+pre_transcribe = false
+
+# How speech is cut into sentences for pre-transcription.
+[pipeline.segmenter]
+# Speech shorter than this does not end on a pause; it joins the next sentence.
+min_speech_ms = 300
+# A pause at least this long ends a sentence.
+min_pause_ms = 400
+# Audio kept before and after each sentence.
+pad_ms = 200
+# Longer speech without a pause is split at its quietest point.
+max_segment_ms = 20000
 
 # Per-app rules, matched on the executable name.
 # chord: ctrl-v | ctrl-shift-v | shift-insert; style: formal | casual | code | none
@@ -103,6 +121,22 @@ fn default_http_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipelineSettings {
+    pub pre_transcribe: bool,
+    pub segmenter: SegmenterConfig,
+}
+
+impl Default for PipelineSettings {
+    fn default() -> Self {
+        Self {
+            pre_transcribe: false,
+            segmenter: SegmenterConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppRule {
     pub exe: String,
@@ -125,6 +159,7 @@ pub struct Config {
     pub vocabulary: Vec<String>,
     pub engine: EngineChoice,
     pub normalizer: NormalizerChoice,
+    pub pipeline: PipelineSettings,
     #[serde(rename = "app")]
     pub apps: Vec<AppRule>,
 }
@@ -145,6 +180,7 @@ impl Default for Config {
             vocabulary: Vec::new(),
             engine: EngineChoice::default(),
             normalizer: NormalizerChoice::default(),
+            pipeline: PipelineSettings::default(),
             apps: vec![terminal("windowsterminal.exe"), terminal("conhost.exe")],
         }
     }
@@ -203,6 +239,20 @@ mod secs {
     }
 }
 
+pub(crate) mod millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_millis() as u64)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        u64::deserialize(d).map(Duration::from_millis)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +285,13 @@ mod tests {
             never_type: true,
             style: Style::Casual,
         });
+        c.pipeline.pre_transcribe = false;
+        c.pipeline.segmenter = SegmenterConfig {
+            min_speech: Duration::from_millis(250),
+            min_pause: Duration::from_millis(550),
+            pad: Duration::from_millis(150),
+            max_segment: Duration::from_secs(12),
+        };
         let text = c.to_toml().unwrap();
         assert_eq!(Config::from_toml(&text).unwrap(), c, "{text}");
         assert_eq!(
@@ -256,6 +313,11 @@ mod tests {
             }
         ));
         assert!(Config::from_toml("hot_key = \"CapsLock\"").is_err());
+        let c = Config::from_toml("[pipeline.segmenter]\npad_ms = 100\n").unwrap();
+        assert!(!c.pipeline.pre_transcribe);
+        assert_eq!(c.pipeline.segmenter.pad, Duration::from_millis(100));
+        assert_eq!(c.pipeline.segmenter.min_pause, Duration::from_millis(400));
+        assert!(Config::from_toml("[pipeline.segmenter]\npad = 100\n").is_err());
     }
 
     #[test]

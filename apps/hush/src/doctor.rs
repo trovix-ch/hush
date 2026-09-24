@@ -141,6 +141,44 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
         row("", "downloaded and verified");
     }
 
+    match engines::vad_model() {
+        Ok((vad, vad_dir)) if !vad.is_present(&vad_dir) => {
+            row(
+                "vad model",
+                format!(
+                    "{} missing; downloading {} KiB to {}",
+                    vad.id,
+                    vad.total_size() / 1024,
+                    vad_dir.display()
+                ),
+            );
+            match hush_stt::models::ensure_downloaded(vad, &vad_dir) {
+                Ok(()) => row("", "downloaded and verified"),
+                Err(e) => row("", format!("DOWNLOAD FAILED: {e}")),
+            }
+        }
+        Ok((vad, vad_dir)) => row(
+            "vad model",
+            format!("{} present in {}", vad.id, vad_dir.display()),
+        ),
+        Err(e) => row("vad model", format!("UNUSABLE: {e:#}")),
+    }
+    let (_, vad_label) = engines::load_vad();
+    row("vad", vad_label);
+    let seg = &config.pipeline.segmenter;
+    row(
+        "pipeline",
+        format!(
+            "pre_transcribe = {}; segmenter min_speech {} ms, min_pause {} ms, pad {} ms, \
+             max_segment {} ms",
+            config.pipeline.pre_transcribe,
+            seg.min_speech.as_millis(),
+            seg.min_pause.as_millis(),
+            seg.pad.as_millis(),
+            seg.max_segment.as_millis()
+        ),
+    );
+
     let started = Instant::now();
     let engine_ok = match engines::load_engine(&config.engine, &model.load_path(&dir)) {
         Ok((mut engine, s)) => {

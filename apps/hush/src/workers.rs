@@ -14,7 +14,7 @@ use hush_core::context::FocusContext;
 use hush_core::insert::{InsertError, InsertOutcome, InsertPolicy, Inserter, StrategyChain};
 use hush_core::normalize::{NormalizeError, NormalizeRequest, Normalizer};
 use hush_core::pipeline::{Event, Failure, NormalizeContext, Timer};
-use hush_core::stt::{DecodeOptions, SttEngine, SttError};
+use hush_core::stt::{DecodeOptions, SttEngine, SttError, Transcript};
 use hush_normalize::RuleNormalizer;
 use hush_platform_windows::clipboard::WinClipboard;
 use hush_platform_windows::focus::WinFocus;
@@ -38,8 +38,20 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> std::io::Result<JoinH
 
 pub struct SttJob {
     pub id: UtteranceId,
+    pub segment_index: u32,
     pub pcm: Vec<f32>,
     pub cancel: CancelToken,
+}
+
+fn no_speech(id: UtteranceId, segment_index: u32) -> Event {
+    Event::SegmentReady {
+        id,
+        segment_index,
+        transcript: Transcript {
+            utterance: id,
+            ..Default::default()
+        },
+    }
 }
 
 pub type EngineLoader =
@@ -73,13 +85,15 @@ pub fn spawn_stt(
             if job.cancel.is_cancelled() {
                 continue;
             }
-            let id = job.id;
+            let (id, segment_index) = (job.id, job.segment_index);
             let vad_started = Instant::now();
             let mut vad = EnergyVad::default();
             let mut events = vad.push(&job.pcm);
             events.extend(vad.finish());
             if !has_speech(&events) {
-                let _ = out.send(Msg::NoSpeech(id));
+                if out.send(Msg::Event(no_speech(id, segment_index))).is_err() {
+                    break;
+                }
                 continue;
             }
             let pcm = trim_silence(&job.pcm, &events, VAD_PAD);
@@ -104,7 +118,12 @@ pub fn spawn_stt(
                 }
             };
             let ev = match result {
-                Ok(t) => Event::TranscriptReady(id, t),
+                Ok(transcript) => Event::SegmentReady {
+                    id,
+                    segment_index,
+                    transcript,
+                },
+                Err(SttError::EmptyAudio) => no_speech(id, segment_index),
                 Err(e) => Event::Failed(id, Failure::Stt(e)),
             };
             if out.send(Msg::Event(ev)).is_err() {
@@ -350,18 +369,24 @@ mod tests {
         ));
         tx.send(SttJob {
             id: UtteranceId(1),
+            segment_index: 3,
             pcm: vec![0.0; 16_000],
             cancel: CancelToken::new(),
         })
         .unwrap();
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Msg::NoSpeech(UtteranceId(1))
-        ));
+        match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            Msg::Event(Event::SegmentReady {
+                id: UtteranceId(1),
+                segment_index: 3,
+                transcript,
+            }) => assert!(transcript.text.is_empty()),
+            _ => panic!("unexpected message"),
+        }
         let tone: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
         for id in [UtteranceId(2), UtteranceId(3)] {
             tx.send(SttJob {
                 id,
+                segment_index: 0,
                 pcm: tone.clone(),
                 cancel: CancelToken::new(),
             })

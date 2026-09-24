@@ -98,6 +98,7 @@ impl ModelManifest {
 }
 
 pub const DEFAULT_MODEL_ID: &str = "parakeet-tdt-0.6b-v3-f16-gguf";
+pub const VAD_MODEL_ID: &str = "silero-vad-v6.2";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

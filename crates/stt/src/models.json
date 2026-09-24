@@ -89,6 +89,21 @@
           "sha256": "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"
         }
       ]
+    },
+    {
+      "id": "silero-vad-v6.2",
+      "engine": "silero-vad",
+      "description": "Silero VAD v6.2, ONNX graph run on tract",
+      "license": "MIT",
+      "attribution": "Silero VAD by Silero Team (https://github.com/snakers4/silero-vad), licensed MIT.",
+      "files": [
+        {
+          "name": "silero_vad.onnx",
+          "url": "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2/src/silero_vad/data/silero_vad.onnx",
+          "size": 2327524,
+          "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+        }
+      ]
     }
   ]
 }

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use hush_audio::CpalRecorder;
 use hush_audio::display::LevelBallistics;
+use hush_audio::vad::Vad;
 use hush_core::UtteranceId;
 use hush_core::cancel::CancelToken;
 use hush_core::config::{Config, GpuPolicy};
@@ -38,7 +39,6 @@ pub enum Msg {
     Hotkey(HotkeyEvent),
     Tray(TrayEvent),
     Event(Event),
-    NoSpeech(UtteranceId),
     EngineReady(std::result::Result<EngineSummary, String>),
     /// `Err` means the app stays rules-only.
     NormalizerReady(std::result::Result<String, String>),
@@ -51,11 +51,22 @@ pub enum Msg {
 /// Carries no ids because a simulation runs one utterance at a time.
 #[derive(Debug, Clone)]
 pub enum Observed {
-    /// The recording is already stopped when this is sent.
-    Released,
+    /// The recording is already stopped when this is sent; `at` is the key-up.
+    Released {
+        at: Instant,
+    },
+    /// Audio handed to the speech worker: a closed segment, the tail, or the whole
+    /// recording.
+    SegmentSent {
+        samples: usize,
+        while_recording: bool,
+    },
+    SegmentDone {
+        inference: Duration,
+    },
+    /// The stitched transcript, as it goes to the normalizer.
     Transcript {
         text: String,
-        inference: Duration,
     },
     Normalized {
         text: String,
@@ -139,6 +150,16 @@ pub fn spawn_normalizer_upgrade(config: &Config, norm: Sender<NormCmd>, tx: Send
 pub struct Driver {
     pipeline: Pipeline,
     recorder: Box<dyn Recorder>,
+    vad: Box<dyn Vad>,
+    pre_transcribe: bool,
+    /// The utterance the recorder is capturing, set only once `start()` succeeded.
+    recording: Option<UtteranceId>,
+    /// `Transcribe` effects sent per utterance, which is the next segment's index.
+    segments_sent: HashMap<UtteranceId, u32>,
+    /// A live segment came back empty; reported only if nothing is inserted before the
+    /// pipeline goes idle, since other segments of the same utterance may carry text.
+    speechless: bool,
+    inserted: bool,
     notifier: WinNotifier,
     ui: UiHandle,
     focus: WinFocus,
@@ -160,6 +181,7 @@ pub struct DriverParts {
     pub config: Config,
     pub config_path: PathBuf,
     pub recorder: Box<dyn Recorder>,
+    pub vad: Box<dyn Vad>,
     pub ui: UiHandle,
     pub focus: WinFocus,
     pub hook: Option<HookHandle>,
@@ -173,6 +195,12 @@ impl Driver {
         Self {
             pipeline: Pipeline::new(PipelineConfig::from_config(&p.config)),
             recorder: p.recorder,
+            vad: p.vad,
+            pre_transcribe: p.config.pipeline.pre_transcribe,
+            recording: None,
+            segments_sent: HashMap::new(),
+            speechless: false,
+            inserted: false,
             notifier: WinNotifier::new(p.ui.clone()),
             ui: p.ui,
             focus: p.focus,
@@ -216,6 +244,7 @@ impl Driver {
                 self.last_level = Instant::now();
                 let level = self.level.update(self.recorder.level(), dt);
                 self.notifier.set_state(CoreOverlay::Listening { level });
+                self.stream_audio();
             }
             if let Some(h) = &self.hook {
                 h.set_escape_armed(self.pipeline.is_active());
@@ -238,23 +267,14 @@ impl Driver {
             Msg::Tray(t) => return self.on_tray(t),
             Msg::Event(ev) => {
                 self.observe_event(&ev);
-                self.feed(ev);
-            }
-            Msg::NoSpeech(id) => {
-                tracing::info!(%id, "no speech detected; nothing to insert");
-                self.observe(Observed::NoSpeech);
-                // Escape removed the token; the user has moved on, so say nothing.
-                let live = self.tokens.contains_key(&id);
-                self.feed(Event::TranscriptReady(
-                    id,
-                    hush_core::stt::Transcript {
-                        utterance: id,
-                        ..Default::default()
-                    },
-                ));
-                if live && !self.pipeline.is_recording() {
-                    self.notifier.toast("No speech detected");
+                if let Event::SegmentReady { id, transcript, .. } = &ev
+                    && transcript.text.trim().is_empty()
+                    // Escape removed the token; the user has moved on, so say nothing.
+                    && self.tokens.contains_key(id)
+                {
+                    self.speechless = true;
                 }
+                self.feed(ev);
             }
             Msg::EngineReady(r) => self.on_engine_ready(r),
             Msg::NormalizerReady(r) => {
@@ -296,9 +316,8 @@ impl Driver {
             return;
         }
         let o = match ev {
-            Event::TranscriptReady(_, t) => Observed::Transcript {
-                text: t.text.clone(),
-                inference: t.inference_time,
+            Event::SegmentReady { transcript, .. } => Observed::SegmentDone {
+                inference: transcript.inference_time,
             },
             Event::NormalizedReady(_, n) => Observed::Normalized {
                 text: n.text.clone(),
@@ -342,9 +361,10 @@ impl Driver {
             }
             HotkeyEvent::Up { at } => {
                 let was = self.pipeline.is_recording();
+                self.stream_audio();
                 self.feed(Event::HotkeyUp { at });
                 if was && !self.pipeline.is_recording() {
-                    self.observe(Observed::Released);
+                    self.observe(Observed::Released { at });
                 }
             }
             HotkeyEvent::Cancel { .. } => self.feed(Event::Escape),
@@ -461,6 +481,31 @@ impl Driver {
                 }
             }
         }
+        if !self.pipeline.is_active() {
+            if std::mem::take(&mut self.speechless) && !self.inserted {
+                tracing::info!("no speech detected; nothing to insert");
+                self.observe(Observed::NoSpeech);
+                self.notifier.toast("No speech detected");
+            }
+            self.inserted = false;
+        }
+    }
+
+    fn stream_audio(&mut self) {
+        let Some(id) = self.recording.filter(|_| self.pre_transcribe) else {
+            return;
+        };
+        let pcm = self.recorder.take_chunks();
+        if pcm.is_empty() {
+            return;
+        }
+        let vad = self.vad.push(&pcm);
+        self.feed(Event::Audio {
+            id,
+            at: Instant::now(),
+            pcm,
+            vad,
+        });
     }
 
     fn token(&mut self, id: UtteranceId) -> CancelToken {
@@ -472,22 +517,33 @@ impl Driver {
             Effect::StartRecording(id) => {
                 self.level.reset();
                 self.last_level = Instant::now();
-                self.recorder
-                    .start()
-                    .err()
-                    .map(|e| Event::Failed(id, Failure::Record(e)))
-            }
-            Effect::StopRecording(id) => match self.recorder.stop() {
-                Ok(rec) => {
-                    if rec.dropped_frames > 0 || rec.device_lost {
-                        tracing::warn!(%id, dropped = rec.dropped_frames, device_lost = rec.device_lost, "recording has gaps");
+                match self.recorder.start() {
+                    Ok(()) => {
+                        self.recording = Some(id);
+                        self.vad.reset();
+                        None
                     }
-                    tracing::debug!(%id, secs = rec.duration.as_secs_f64(), "recorded");
-                    Some(Event::Recorded(id, rec))
+                    Err(e) => {
+                        self.recording = None;
+                        Some(Event::Failed(id, Failure::Record(e)))
+                    }
                 }
-                Err(e) => Some(Event::Failed(id, Failure::Record(e))),
-            },
+            }
+            Effect::StopRecording(id) => {
+                self.recording = None;
+                match self.recorder.stop() {
+                    Ok(rec) => {
+                        if rec.dropped_frames > 0 || rec.device_lost {
+                            tracing::warn!(%id, dropped = rec.dropped_frames, device_lost = rec.device_lost, "recording has gaps");
+                        }
+                        tracing::debug!(%id, secs = rec.duration.as_secs_f64(), "recorded");
+                        Some(Event::Recorded(id, rec))
+                    }
+                    Err(e) => Some(Event::Failed(id, Failure::Record(e))),
+                }
+            }
             Effect::DiscardRecording(_) => {
+                self.recording = None;
                 self.recorder.cancel();
                 None
             }
@@ -499,10 +555,23 @@ impl Driver {
                 // Utterances are transcribed in id order, so older tokens are never needed
                 // again.
                 self.tokens.retain(|k, _| *k >= id);
+                self.segments_sent.retain(|k, _| *k >= id);
+                let next = self.segments_sent.entry(id).or_default();
+                let segment_index = *next;
+                *next += 1;
                 let cancel = self.token(id);
+                self.observe(Observed::SegmentSent {
+                    samples: pcm.len(),
+                    while_recording: self.pipeline.is_recording(),
+                });
                 self.workers
                     .stt
-                    .send(SttJob { id, pcm, cancel })
+                    .send(SttJob {
+                        id,
+                        segment_index,
+                        pcm,
+                        cancel,
+                    })
                     .err()
                     .map(|_| {
                         Event::Failed(
@@ -518,6 +587,11 @@ impl Driver {
                 transcript,
                 ctx,
             } => {
+                if !ctx.rules_only {
+                    self.observe(Observed::Transcript {
+                        text: transcript.clone(),
+                    });
+                }
                 let cancel = self.token(id);
                 self.workers
                     .norm
@@ -538,6 +612,7 @@ impl Driver {
                     })
             }
             Effect::Insert { id, text, target } => {
+                self.inserted = true;
                 let cancel = self.token(id);
                 self.workers
                     .insert
@@ -559,11 +634,16 @@ impl Driver {
                 if let Some(t) = self.tokens.remove(&id) {
                     t.cancel();
                 }
+                // A hands-free restart keeps the id but numbers its segments from 0 again.
+                self.segments_sent.remove(&id);
+                self.speechless = false;
                 None
             }
             Effect::Notify(state) => {
                 if let CoreOverlay::Error { message } = &state {
                     tracing::warn!(%message, "shown to the user");
+                    // The error says more than "no speech" would.
+                    self.speechless = false;
                 }
                 self.notifier.set_state(state);
                 None
@@ -677,6 +757,13 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         ..RecorderConfig::default()
     })
     .context("starting the audio thread")?;
+    let (vad, vad_label) = engines::load_vad();
+    tracing::info!(
+        vad = %vad_label,
+        pre_transcribe = config.pipeline.pre_transcribe,
+        segmenter = ?config.pipeline.segmenter,
+        "voice activity detection"
+    );
 
     let engine_choice = config.engine.clone();
     let status = tx.clone();
@@ -703,6 +790,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         config,
         config_path: paths.config_file.clone(),
         recorder: Box::new(recorder),
+        vad,
         ui,
         focus,
         hook: Some(hook),

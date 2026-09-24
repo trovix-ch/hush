@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::stt::SAMPLE_RATE;
 
 /// Offsets count from the first sample pushed since the last reset.
@@ -17,14 +19,19 @@ pub enum VadEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SegmenterConfig {
     /// Voiced time a segment needs before a pause may close it; shorter speech stays open
     /// and joins the next segment rather than being dropped.
+    #[serde(rename = "min_speech_ms", with = "crate::config::millis")]
     pub min_speech: Duration,
+    #[serde(rename = "min_pause_ms", with = "crate::config::millis")]
     pub min_pause: Duration,
+    #[serde(rename = "pad_ms", with = "crate::config::millis")]
     pub pad: Duration,
     /// Longer speech without a pause is split at the quietest point of its second half.
+    #[serde(rename = "max_segment_ms", with = "crate::config::millis")]
     pub max_segment: Duration,
 }
 

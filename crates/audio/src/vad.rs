@@ -1,5 +1,5 @@
-//! The energy detector is the default; the neural one needs no native runtime but is
-//! behind a feature until something uses it.
+//! The energy detector needs no model file, so it stands in whenever the neural one's
+//! model is missing.
 
 use std::time::Duration;
 

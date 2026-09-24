@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use hush_audio::resample::StreamResampler;
@@ -40,29 +40,33 @@ pub fn read_16k_mono(path: &Path) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Hands out the same clip on every `stop()`.
+/// Streams the clip at real-time pace from `start()`, as a microphone would, and hands
+/// out the whole clip on every `stop()`.
 pub struct WavRecorder {
     pcm: Vec<f32>,
-    recording: bool,
+    started: Option<Instant>,
+    streamed: usize,
 }
 
 impl WavRecorder {
     pub fn new(pcm: Vec<f32>) -> Self {
         Self {
             pcm,
-            recording: false,
+            started: None,
+            streamed: 0,
         }
     }
 }
 
 impl Recorder for WavRecorder {
     fn start(&mut self) -> Result<(), RecorderError> {
-        self.recording = true;
+        self.started = Some(Instant::now());
+        self.streamed = 0;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<Recording, RecorderError> {
-        if !std::mem::take(&mut self.recording) {
+        if self.started.take().is_none() {
             return Err(RecorderError::State("not recording"));
         }
         Ok(Recording {
@@ -74,7 +78,18 @@ impl Recorder for WavRecorder {
     }
 
     fn cancel(&mut self) {
-        self.recording = false;
+        self.started = None;
+    }
+
+    fn take_chunks(&mut self) -> Vec<f32> {
+        let Some(started) = self.started else {
+            return Vec::new();
+        };
+        let due = ((started.elapsed().as_secs_f64() * f64::from(SAMPLE_RATE)) as usize)
+            .min(self.pcm.len());
+        let from = self.streamed.min(due);
+        self.streamed = due;
+        self.pcm[from..due].to_vec()
     }
 
     fn level(&self) -> f32 {
@@ -119,5 +134,21 @@ mod tests {
         let rec = r.stop().unwrap();
         assert_eq!(rec.pcm.len(), 1600);
         assert_eq!(rec.duration, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn chunks_arrive_at_real_time_pace_and_form_a_prefix() {
+        let clip: Vec<f32> = (0..1600).map(|i| i as f32).collect();
+        let mut r = WavRecorder::new(clip.clone());
+        assert!(r.take_chunks().is_empty(), "not recording");
+        r.start().unwrap();
+        let first = r.take_chunks();
+        assert!(first.len() < 800, "{} samples at once", first.len());
+        std::thread::sleep(Duration::from_millis(150));
+        let mut streamed = first;
+        streamed.extend(r.take_chunks());
+        assert_eq!(streamed, clip);
+        assert!(r.take_chunks().is_empty());
+        assert_eq!(r.stop().unwrap().pcm, clip);
     }
 }
