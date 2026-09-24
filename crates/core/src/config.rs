@@ -1,5 +1,6 @@
 //! User configuration: one TOML file, every key optional.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,11 @@ max_recording_secs = 120
 history_len = 10
 # Words and phrases spelled exactly as you want them.
 vocabulary = []
+# More of them, one per line, `#` starts a comment. Re-read when it changes. A relative
+# path is relative to this file.
+# vocabulary_file = "vocabulary.txt"
+# Style for apps no rule below matches: formal | casual | code | none
+default_style = "casual"
 
 [engine]
 # Model id from the download manifest.
@@ -43,7 +49,7 @@ kind = "rules"
 [pipeline]
 # Transcribe each sentence as soon as you pause, while the key is still held, so the
 # release waits only for the last one. Off sends the whole recording at release.
-# Off by default: the engine punctuates every segment as a full sentence.
+# Off by default: a long pause inside a sentence can still come out as a full stop.
 pre_transcribe = false
 
 # How speech is cut into sentences for pre-transcription.
@@ -51,13 +57,23 @@ pre_transcribe = false
 # Speech shorter than this does not end on a pause; it joins the next sentence.
 min_speech_ms = 300
 # A pause at least this long ends a sentence.
-min_pause_ms = 400
+min_pause_ms = 700
 # Audio kept before and after each sentence.
 pad_ms = 200
 # Longer speech without a pause is split at its quietest point.
 max_segment_ms = 20000
+# How late the voice detector reports that speech started; a pause is judged only
+# after this much more audio, so the same recording always splits the same way.
+vad_latency_ms = 100
+# Where the words either side of a split are closer than this, the sentence end the
+# engine put there is removed and the next word lowercased.
+join_gap_ms = 400
+# ... and joined with a comma if they are at least this far apart.
+comma_gap_ms = 300
 
-# Per-app rules, matched on the executable name.
+# Per-app rules, matched on the executable name, case-insensitively; exe = "*" sets the
+# rule for every other app. Known terminals and editors already get code style from a
+# built-in table (`hush doctor` prints it); a rule here for the same exe replaces it.
 # chord: ctrl-v | ctrl-shift-v | shift-insert; style: formal | casual | code | none
 [[app]]
 exe = "windowsterminal.exe"
@@ -148,6 +164,9 @@ pub struct Config {
     pub max_recording: Duration,
     pub history_len: usize,
     pub vocabulary: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vocabulary_file: Option<PathBuf>,
+    pub default_style: Style,
     pub engine: EngineChoice,
     pub normalizer: NormalizerChoice,
     pub pipeline: PipelineSettings,
@@ -169,6 +188,8 @@ impl Default for Config {
             max_recording: Duration::from_secs(120),
             history_len: 10,
             vocabulary: Vec::new(),
+            vocabulary_file: None,
+            default_style: Style::Casual,
             engine: EngineChoice::default(),
             normalizer: NormalizerChoice::default(),
             pipeline: PipelineSettings::default(),
@@ -196,21 +217,97 @@ impl Config {
 
     pub fn app_policies(&self) -> AppPolicies {
         AppPolicies {
-            default: AppPolicy::default(),
+            default: self.default_app_policy(),
             by_exe: self
-                .apps
-                .iter()
-                .map(|r| {
-                    (
-                        r.exe.to_ascii_lowercase(),
-                        AppPolicy {
-                            chord: r.chord,
-                            never_type: r.never_type,
-                            style: r.style,
-                        },
-                    )
-                })
+                .effective_app_rules()
+                .into_iter()
+                .map(|r| (r.exe, r.policy))
                 .collect(),
+        }
+    }
+
+    /// The `*` rule if there is one, else `default_style` with the default chord.
+    pub fn default_app_policy(&self) -> AppPolicy {
+        self.apps
+            .iter()
+            .rfind(|r| r.exe.trim() == WILDCARD)
+            .map_or_else(
+                || AppPolicy {
+                    style: self.default_style,
+                    ..AppPolicy::default()
+                },
+                AppRule::policy,
+            )
+    }
+
+    /// User rules first, then the built-in rows no user rule names. A later user rule for
+    /// the same exe wins over an earlier one.
+    pub fn effective_app_rules(&self) -> Vec<EffectiveAppRule> {
+        let mut out: Vec<EffectiveAppRule> = Vec::new();
+        for r in self.apps.iter().rev() {
+            let exe = r.exe.trim().to_ascii_lowercase();
+            if exe == WILDCARD || out.iter().any(|e| e.exe == exe) {
+                continue;
+            }
+            out.push(EffectiveAppRule {
+                exe,
+                policy: r.policy(),
+                builtin: false,
+            });
+        }
+        out.reverse();
+        for &(exe, chord) in BUILTIN_CODE_APPS {
+            if !out.iter().any(|e| e.exe == exe) {
+                out.push(EffectiveAppRule {
+                    exe: exe.into(),
+                    policy: AppPolicy {
+                        chord,
+                        never_type: false,
+                        style: Style::Code,
+                    },
+                    builtin: true,
+                });
+            }
+        }
+        out
+    }
+}
+
+const WILDCARD: &str = "*";
+
+/// Terminals and editors, where a capital letter or an added period breaks a command.
+/// Terminals get the paste chord they accept without configuration: conhost and PuTTY
+/// take Shift+Insert, WezTerm and Alacritty bind Ctrl+Shift+V, and Ctrl+V reaches a shell
+/// as a literal ^V in several of them.
+pub const BUILTIN_CODE_APPS: &[(&str, Chord)] = &[
+    ("windowsterminal.exe", Chord::ShiftInsert),
+    ("conhost.exe", Chord::ShiftInsert),
+    ("cmd.exe", Chord::ShiftInsert),
+    ("powershell.exe", Chord::ShiftInsert),
+    ("pwsh.exe", Chord::ShiftInsert),
+    ("putty.exe", Chord::ShiftInsert),
+    ("wezterm-gui.exe", Chord::CtrlShiftV),
+    ("alacritty.exe", Chord::CtrlShiftV),
+    ("code.exe", Chord::CtrlV),
+    ("cursor.exe", Chord::CtrlV),
+    ("idea64.exe", Chord::CtrlV),
+    ("rider64.exe", Chord::CtrlV),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveAppRule {
+    /// Lower-case.
+    pub exe: String,
+    pub policy: AppPolicy,
+    pub builtin: bool,
+}
+
+impl AppRule {
+    fn policy(&self) -> AppPolicy {
+        AppPolicy {
+            chord: self.chord,
+            never_type: self.never_type,
+            style: self.style,
         }
     }
 }
@@ -282,6 +379,9 @@ mod tests {
             min_pause: Duration::from_millis(550),
             pad: Duration::from_millis(150),
             max_segment: Duration::from_secs(12),
+            vad_latency: Duration::from_millis(120),
+            join_gap: Duration::from_millis(500),
+            comma_gap: Duration::from_millis(250),
         };
         let text = c.to_toml().unwrap();
         assert_eq!(Config::from_toml(&text).unwrap(), c, "{text}");
@@ -307,7 +407,7 @@ mod tests {
         let c = Config::from_toml("[pipeline.segmenter]\npad_ms = 100\n").unwrap();
         assert!(!c.pipeline.pre_transcribe);
         assert_eq!(c.pipeline.segmenter.pad, Duration::from_millis(100));
-        assert_eq!(c.pipeline.segmenter.min_pause, Duration::from_millis(400));
+        assert_eq!(c.pipeline.segmenter.min_pause, Duration::from_millis(700));
         assert!(Config::from_toml("[pipeline.segmenter]\npad = 100\n").is_err());
     }
 
@@ -327,5 +427,88 @@ mod tests {
             Chord::ShiftInsert
         );
         assert_eq!(p.lookup(None), &AppPolicy::default());
+    }
+
+    fn rule(exe: &str, style: Style) -> AppRule {
+        AppRule {
+            exe: exe.into(),
+            chord: Chord::CtrlV,
+            never_type: false,
+            style,
+        }
+    }
+
+    #[test]
+    fn app_rule_matching_exact_wildcard_case_and_builtin_override() {
+        let mut c = Config {
+            apps: vec![],
+            ..Config::default()
+        };
+        let p = c.app_policies();
+        assert_eq!(p.lookup(Some("Code.EXE")).style, Style::Code);
+        assert_eq!(p.lookup(Some("wezterm-gui.exe")).chord, Chord::CtrlShiftV);
+        assert_eq!(p.lookup(Some("slack.exe")).style, Style::Casual);
+        assert_eq!(p.lookup(None).style, Style::Casual);
+
+        c.default_style = Style::Formal;
+        assert_eq!(
+            c.app_policies().lookup(Some("slack.exe")).style,
+            Style::Formal
+        );
+
+        c.apps = vec![
+            rule("SLACK.exe", Style::Casual),
+            rule("code.exe", Style::Formal),
+            rule("*", Style::None),
+        ];
+        let p = c.app_policies();
+        assert_eq!(p.lookup(Some("slack.exe")).style, Style::Casual);
+        assert_eq!(p.lookup(Some("CODE.exe")).style, Style::Formal);
+        assert_eq!(p.lookup(Some("code.exe")).chord, Chord::CtrlV);
+        assert_eq!(
+            p.lookup(Some("notepad.exe")).style,
+            Style::None,
+            "`*` beats default_style"
+        );
+        assert_eq!(p.lookup(None).style, Style::None);
+        assert_eq!(
+            p.lookup(Some("pwsh.exe")).style,
+            Style::Code,
+            "a built-in row is more specific than `*`"
+        );
+
+        let rules = c.effective_app_rules();
+        assert!(!rules.iter().any(|r| r.exe == "*"));
+        let code: Vec<_> = rules.iter().filter(|r| r.exe == "code.exe").collect();
+        assert_eq!(code.len(), 1);
+        assert!(!code[0].builtin);
+        assert_eq!(
+            rules.iter().filter(|r| r.builtin).count(),
+            BUILTIN_CODE_APPS.len() - 1
+        );
+    }
+
+    #[test]
+    fn a_later_duplicate_user_rule_wins() {
+        let c = Config {
+            apps: vec![
+                rule("slack.exe", Style::Casual),
+                rule("Slack.exe", Style::Formal),
+            ],
+            ..Config::default()
+        };
+        assert_eq!(
+            c.app_policies().lookup(Some("slack.exe")).style,
+            Style::Formal
+        );
+    }
+
+    #[test]
+    fn vocabulary_file_and_default_style_round_trip() {
+        let c = Config::from_toml("vocabulary_file = 'C:/x/words.txt'\ndefault_style = 'code'\n")
+            .unwrap();
+        assert_eq!(c.vocabulary_file, Some(PathBuf::from("C:/x/words.txt")));
+        assert_eq!(c.default_style, Style::Code);
+        assert_eq!(Config::from_toml(&c.to_toml().unwrap()).unwrap(), c);
     }
 }

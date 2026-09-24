@@ -226,6 +226,25 @@ sentence ends), and stitch with the engine's word timestamps so a segment's trai
 period and the next segment's capital are dropped when the gap between them is short.
 The flag stays for measurement and for users who prefer speed.
 
+*Amended 2026-09-24:* the fix was built and measured (§7, "Pre-transcription after the
+fixes"), and **the flag stays off**. What changed: segments close only after 700 ms of
+silence; a pause counts only once 100 ms more audio has arrived than `min_pause` asks
+for, which covers the detector's late speech-start report and makes the cuts the same
+on every run; the engine times words, and segments are joined on the real silence
+between the last word of one and the first word of the next. Under 400 ms, a trailing
+`.` or `!` is removed (a `.` stays before "I" or a vocabulary word), a comma is added
+from 300 ms, and the next word is lowercased; a segment the engine left without a
+sentence end always has its successor lowercased. On the 30 s dictation the stitched
+text is now identical to the single call. On `jfk` it is not: "Americans. Ask not!
+What" against "Americans, ask not what". Those two pauses are 1024 and 832 ms of real
+silence, longer than the 560–640 ms before the dictation's true sentence ends. Pause
+length does not say whether a boundary is a comma or a full stop, so no gap threshold
+fixes both clips. The planned 600 ms threshold turned two of the dictation's sentence
+ends into commas, which is why the shipped threshold is 400 ms. That threshold now
+joins only boundaries cut inside speech. The next thing to try is giving each segment
+the previous segment's last second or so of audio as context, so the engine decides
+the punctuation at the boundary with the words on both sides.
+
 ### D7. Hotkey: our own low-level keyboard hook
 A `WH_KEYBOARD_LL` hook on a dedicated thread with its own message loop. It is the only
 mechanism that gives key-up, modifier-only keys, and the ability to swallow the key.
@@ -582,6 +601,33 @@ while Silero confirms a start about 96 ms late, so a pause within that margin of
 up to threefold on the 30 s clip (13–14 calls) yet fell on `jfk` (4 calls); why short
 calls cost that much is not established.
 Pending: a real microphone; the LLM normalizer over pre-transcribed segments.
+
+### Pre-transcription after the fixes, 2026-09-24
+Method: as above, 5 runs per row, both clips as recorded (0.8 s and 0.02 s trailing
+silence), RDP session. "Diffs" compares the stitched transcript with the single call
+token by token (words and punctuation marks). Gaps are the word-to-word silences at
+each boundary, taken from the pipeline's debug log.
+
+| clip | setting | segments (hold+tail) | tail s | release→transcript p50 / p95 | engine ms | diffs vs single call |
+|---|---|---|---|---|---|---|
+| jfk | off | 0+1 | 11.0 | 250 / 360 | 209–360 | – |
+| jfk | min_pause 400 | 4+0, once 3+1 | 0 or 3.0 | 45 / 207 | 283–445 | 3 |
+| jfk | 700 | 2+1 | 5.8 | 194 / 194 | 361–397 | 2 |
+| jfk | 1000 | 2+1 | 5.8 | 198 / 211 | 394–447 | 2 |
+| jfk | 700, word stitch, join 400 ms, latency margin | 2+1 | 5.8 | 197 / 237 | 360–433 | 2 (gaps 1024, 832 ms) |
+| 30 s | off | 0+1 | 31.0 | 407 / 538 | 399–538 | – |
+| 30 s | min_pause 400 | 13+0, once 14+0 | 0 | 0.6 / 0.9 | 1351–1472 | 7, once 8 |
+| 30 s | 700 | 6+0 | 0 | 97 / 202 | 873–1098 | 0 |
+| 30 s | 1000 | 2+1 | 8.9 | 225 / 268 | 631–667 | 1 |
+| 30 s | 700, word stitch, join 600 ms | 6+0 | 0 | 112 / 198 | 643–1108 | 2 (sentence ends at 560, 592 ms made commas) |
+| 30 s | 700, word stitch, join 400 ms, latency margin | 5+1 | 3.3 | 36 / 108 | 993–1103 | 0 |
+| 30 s | 400, latency margin, no joining | 7+0 | 0 | 0.7 / 0.9 | 817–1079 | 1 |
+
+With the 100 ms latency margin every configuration segmented identically on all five
+runs; without it, 400 ms gave 13 or 14 segments. The margin moves one boundary in the
+30 s clip from the hold into the tail, which costs about 3 s of tail audio. Even with
+5–7 calls, the summed engine time is still about 2.5× the single call on the 30 s clip.
+Why short calls cost that much is still not established.
 
 ### Audio capture, 2026-09-24
 Method: `crates/audio/examples/record.rs`, release build, the only input device in this

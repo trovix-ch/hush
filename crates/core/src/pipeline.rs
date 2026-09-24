@@ -12,7 +12,7 @@ use crate::insert::{AppPolicies, InsertError, InsertOutcome};
 use crate::normalize::{AppContext, NormalizeError, NormalizeOutput, Provenance};
 use crate::notify::{OverlayState, ProvenanceHint, Sound};
 use crate::recorder::{RecorderError, Recording};
-use crate::segment::{Segmenter, SegmenterConfig, Stitcher, VadEvent};
+use crate::segment::{Cut, Segmenter, SegmenterConfig, Stitcher, VadEvent};
 use crate::stt::{SttError, Transcript};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,8 @@ pub struct PipelineConfig {
     /// only the tail. Takes effect only for a driver that sends `Event::Audio`.
     pub pre_transcribe: bool,
     pub segmenter: SegmenterConfig,
+    /// Words whose capital survives when segments are joined mid-sentence.
+    pub vocabulary: Vec<String>,
     pub hands_free_double_tap: bool,
     pub tap_max: Duration,
     /// Measured from the first tap's release to the second tap's key-down.
@@ -38,6 +40,7 @@ impl Default for PipelineConfig {
         Self {
             pre_transcribe: true,
             segmenter: SegmenterConfig::default(),
+            vocabulary: Vec::new(),
             hands_free_double_tap: true,
             tap_max: Duration::from_millis(250),
             tap_pair_window: Duration::from_millis(250),
@@ -54,6 +57,7 @@ impl PipelineConfig {
         Self {
             pre_transcribe: c.pipeline.pre_transcribe,
             segmenter: c.pipeline.segmenter.clone(),
+            vocabulary: c.vocabulary.clone(),
             hands_free_double_tap: c.hands_free_double_tap,
             max_recording: c.max_recording,
             history_len: c.history_len,
@@ -262,7 +266,7 @@ struct Inflight {
 struct Segmented {
     id: UtteranceId,
     segmenter: Segmenter,
-    held: VecDeque<Vec<f32>>,
+    held: VecDeque<Cut>,
     results: Stitcher,
     /// Until the press can no longer turn out to be a tap, whose audio is thrown away.
     committed: bool,
@@ -270,12 +274,12 @@ struct Segmented {
 }
 
 impl Segmented {
-    fn new(id: UtteranceId, cfg: &SegmenterConfig, committed: bool) -> Self {
+    fn new(id: UtteranceId, cfg: &PipelineConfig, committed: bool) -> Self {
         Self {
             id,
-            segmenter: Segmenter::new(cfg),
+            segmenter: Segmenter::new(&cfg.segmenter),
             held: VecDeque::new(),
-            results: Stitcher::default(),
+            results: Stitcher::new(&cfg.segmenter, &cfg.vocabulary),
             committed,
             recorded: false,
         }
@@ -428,8 +432,7 @@ impl Pipeline {
                     fx.push(Effect::StartRecording(id));
                     self.capture = Capture::HandsFree { id, focus: first };
                     if self.drop_segments(id, fx) {
-                        self.segs
-                            .push(Segmented::new(id, &self.cfg.segmenter, true));
+                        self.segs.push(Segmented::new(id, &self.cfg, true));
                     }
                 } else {
                     // The window closed but its timer has not fired yet.
@@ -494,8 +497,7 @@ impl Pipeline {
             focus,
         };
         if self.cfg.pre_transcribe {
-            self.segs
-                .push(Segmented::new(id, &self.cfg.segmenter, false));
+            self.segs.push(Segmented::new(id, &self.cfg, false));
         }
         self.notify(fx, OverlayState::Listening { level: 0.0 });
     }
@@ -530,9 +532,12 @@ impl Pipeline {
         let Some(s) = self.segs.iter_mut().find(|s| s.id == head && s.committed) else {
             return;
         };
-        while let Some(pcm) = s.held.pop_front() {
-            s.results.expect();
-            fx.push(Effect::Transcribe { id: head, pcm });
+        while let Some(cut) = s.held.pop_front() {
+            s.results.expect(cut.offset);
+            fx.push(Effect::Transcribe {
+                id: head,
+                pcm: cut.pcm,
+            });
         }
     }
 
@@ -691,7 +696,7 @@ impl Pipeline {
         let Some(index) = index.or_else(|| s.results.oldest_missing()) else {
             return;
         };
-        if s.results.set(index, t.text, t.language, t.inference_time) {
+        if s.results.set(index, t) {
             self.try_complete(id, fx);
         }
     }
@@ -712,6 +717,12 @@ impl Pipeline {
             %id,
             segments = s.results.expected(),
             inference_ms = s.results.inference().as_secs_f64() * 1e3,
+            gaps_ms = ?s
+                .results
+                .gaps()
+                .iter()
+                .map(|g| g.map(|g| g.as_millis()))
+                .collect::<Vec<_>>(),
             "segments stitched"
         );
         self.transcribed(
@@ -984,8 +995,19 @@ mod tests {
     }
 
     impl T {
+        /// The pause and gap lengths the segment tests are written against, not the
+        /// shipped defaults.
         fn new() -> Self {
-            Self::with(PipelineConfig::default())
+            Self::with(PipelineConfig {
+                segmenter: SegmenterConfig {
+                    min_pause: Duration::from_millis(400),
+                    vad_latency: Duration::from_millis(100),
+                    join_gap: Duration::from_millis(600),
+                    comma_gap: Duration::from_millis(300),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
         }
 
         fn with(cfg: PipelineConfig) -> Self {
@@ -1200,6 +1222,37 @@ mod tests {
         assert!(t.segment(1, 1, "duplicate").is_empty());
         let fx = t.segment(1, 0, "first");
         assert_eq!(normalized_text(&fx), Some("first second"));
+    }
+
+    #[test]
+    fn segments_are_stitched_on_their_place_in_the_recording() {
+        let timed = |text: &str, from_ms: u64, to_ms: u64| Transcript {
+            text: text.into(),
+            words: vec![crate::stt::Segment {
+                text: text.into(),
+                start: Duration::from_millis(from_ms),
+                end: Duration::from_millis(to_ms),
+            }],
+            ..Default::default()
+        };
+        let mut t = T::new();
+        t.down(0);
+        t.two_segments_during_hold(1, 0);
+        t.up(3100);
+        t.recorded_ms(1, 3100);
+        // The second segment's audio starts 1400 ms in, so its word at 200 ms is at
+        // 1600 ms: 550 ms after the first segment's last word.
+        t.p.handle(Event::SegmentReady {
+            id: id(1),
+            segment_index: 0,
+            transcript: timed("My fellow Americans.", 100, 1050),
+        });
+        let fx = t.p.handle(Event::SegmentReady {
+            id: id(1),
+            segment_index: 1,
+            transcript: timed("Ask not.", 200, 900),
+        });
+        assert_eq!(normalized_text(&fx), Some("My fellow Americans, ask not."));
     }
 
     #[test]

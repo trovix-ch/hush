@@ -331,14 +331,14 @@ mod tests {
             closed.extend(seg.push(block, &ev));
         }
         let tail = seg.finish(&[]);
-        let secs = |v: &[Vec<f32>]| -> Vec<f32> {
+        let secs = |v: &[hush_core::segment::Cut]| -> Vec<f32> {
             v.iter()
-                .map(|s| s.len() as f32 / SAMPLE_RATE as f32)
+                .map(|s| s.pcm.len() as f32 / SAMPLE_RATE as f32)
                 .collect()
         };
         eprintln!("closed {:?} tail {:?}", secs(&closed), secs(&tail));
         assert!(closed.len() >= 2, "{:?}", secs(&closed));
-        assert!(tail.iter().map(Vec::len).sum::<usize>() < pcm.len() / 2);
+        assert!(tail.iter().map(|c| c.pcm.len()).sum::<usize>() < pcm.len() / 2);
     }
 
     #[test]

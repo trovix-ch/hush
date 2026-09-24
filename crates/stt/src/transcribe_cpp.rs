@@ -173,8 +173,10 @@ impl TranscribeCppEngine {
             .map_err(load_err)?;
 
         let caps = model.capabilities();
+        // Word times are what segment stitching measures pauses with.
         let timestamps = match caps.max_timestamp_kind {
             tc::TimestampKind::None => tc::TimestampKind::None,
+            tc::TimestampKind::Word | tc::TimestampKind::Token => tc::TimestampKind::Word,
             _ => tc::TimestampKind::Segment,
         };
         let id = model_id(&model.arch(), &model.variant());
@@ -288,11 +290,13 @@ impl SttEngine for TranscribeCppEngine {
         let inference_time = started.elapsed();
         let audio_len = Duration::from_secs_f64(pcm.len() as f64 / f64::from(SAMPLE_RATE));
         let segments = to_segments(&tr, audio_len);
+        let words = to_words(&tr);
         let text = normalise_ws(&tr.text);
         Ok(Transcript {
             utterance: opts.utterance,
             text,
             segments,
+            words,
             language: tr.language.clone().or_else(|| opts.language.clone()),
             inference_time,
         })
@@ -346,6 +350,20 @@ fn to_segments(tr: &tc::Transcript, audio_len: Duration) -> Vec<Segment> {
     }]
 }
 
+fn to_words(tr: &tc::Transcript) -> Vec<Segment> {
+    tr.words
+        .iter()
+        .filter_map(|w| {
+            let text = normalise_ws(&w.text);
+            (!text.is_empty()).then(|| Segment {
+                text,
+                start: ms(w.t0_ms),
+                end: ms(w.t1_ms),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +395,38 @@ mod tests {
         assert_eq!(segs[0].text, "Hello there.");
         assert_eq!(segs[1].start, Duration::from_millis(1000));
         assert_eq!(segs[1].end, Duration::from_millis(1400));
+    }
+
+    #[test]
+    fn word_times_are_carried_over() {
+        let tr = tc::Transcript {
+            words: vec![
+                tc::Word {
+                    t0_ms: 80,
+                    t1_ms: 400,
+                    text: " Ask".into(),
+                    ..Default::default()
+                },
+                tc::Word {
+                    t0_ms: 400,
+                    t1_ms: 400,
+                    text: " ".into(),
+                    ..Default::default()
+                },
+                tc::Word {
+                    t0_ms: 480,
+                    t1_ms: 720,
+                    text: "not.".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let words = to_words(&tr);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "Ask");
+        assert_eq!(words[1].start, Duration::from_millis(480));
+        assert_eq!(words[1].end, Duration::from_millis(720));
     }
 
     #[test]

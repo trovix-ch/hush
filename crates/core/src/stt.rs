@@ -68,6 +68,9 @@ pub struct Transcript {
     /// Segments joined, whitespace normalised.
     pub text: String,
     pub segments: Vec<Segment>,
+    /// One entry per word, relative to the start of the audio; empty when the engine
+    /// does not time words.
+    pub words: Vec<Segment>,
     pub language: Option<String>,
     pub inference_time: Duration,
 }

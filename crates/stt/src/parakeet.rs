@@ -195,6 +195,7 @@ impl SttEngine for ParakeetEngine {
             utterance: opts.utterance,
             text,
             segments,
+            words: Vec::new(),
             language: opts.language.clone(),
             inference_time,
         })
