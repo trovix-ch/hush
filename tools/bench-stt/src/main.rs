@@ -4,25 +4,36 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use hush_core::gpu::{self, GpuRequest, GpuSelector};
 use hush_core::stt::{Backend, DecodeOptions, SAMPLE_RATE, SttEngine};
-use hush_stt::{TranscribeCppEngine, TranscribeCppOptions, models, transcribe_cpp};
+use hush_stt::{RemoteEngine, RemoteOptions, models};
+use hush_stt_worker::{TranscribeCppEngine, TranscribeCppOptions, transcribe_cpp};
 
 const USAGE: &str = "\
-usage: bench-stt <wav-path> [--engine transcribe-cpp|ort] [--backend vulkan|cpu|directml]
-                 [--device N] [--runs N] [--language en] [--model <id>]
-                 [--model-dir <path>] [--threads N] [--joint-cpu]
+usage: bench-stt <wav-path> [--engine transcribe-cpp|remote|ort] [--backend vulkan|cpu|directml]
+                 [--gpu auto|<pci>|<name>] [--runs N] [--language en] [--model <id>]
+                 [--model-dir <path>] [--threads N] [--joint-cpu] [--worker <path>]
+                 [--gap-ms N] [--kick] [--kick-lead-ms N] [--kick-every-ms N]
        bench-stt --list-devices
 
-  --engine     transcribe-cpp (default) or ort (only in builds with the `ort-engine`
-               feature)
-  --backend    default vulkan for transcribe-cpp, directml for ort
-  --device     transcribe-cpp: index among Vulkan devices (see --list-devices);
-               ort: DXGI adapter index. Default: the runtime's choice
+  --engine     transcribe-cpp (default, in this process), remote (the same engine in
+               hush-stt-worker, as the app runs it) or ort (only in builds with the
+               `ort-engine` feature)
+  --worker     remote only: the worker executable (default: next to bench-stt)
+  --backend    default vulkan for transcribe-cpp and remote, directml for ort
+  --gpu        transcribe-cpp and remote on Vulkan: auto (default; the discrete card
+               with the most free memory), a PCI bus id such as 05:00, or part of the
+               device name, as hush's engine.device takes. ort uses the default adapter
   --model      manifest id; default parakeet-tdt-0.6b-v3-f16-gguf for transcribe-cpp;
                for ort parakeet-tdt-0.6b-v3 on directml, -int8 on cpu
   --model-dir  load from this directory instead of the default models root
   --threads    CPU threads (default: half the logical cores)
   --joint-cpu  ort only: run the decoder/joint graph on the CPU even on directml
+  --gap-ms     idle this long before every timed run, as dictation does between
+               utterances (default 0: back to back)
+  --kick       call the engine's nudge before every timed run, as the app does at
+               key-down, then wait --kick-lead-ms (default 1000) before transcribing
+  --kick-every-ms  with --kick, nudge again at this interval during the lead
 
 After the timed runs, one more run on the first 90% of the clip reports what an
 utterance of a length the engine has not seen before costs.";
@@ -30,12 +41,14 @@ utterance of a length the engine has not seen before costs.";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Engine {
     TranscribeCpp,
+    Remote,
     Ort,
 }
 
 struct Args {
     wav: PathBuf,
     engine: Engine,
+    worker: Option<PathBuf>,
     backend: Option<Backend>,
     runs: usize,
     language: Option<String>,
@@ -43,7 +56,15 @@ struct Args {
     model_dir: Option<PathBuf>,
     joint_on_cpu: bool,
     threads: Option<usize>,
-    device: Option<usize>,
+    gpu: GpuSelector,
+    gap: Duration,
+    kick: bool,
+    kick_lead: Duration,
+    kick_every: Option<Duration>,
+}
+
+fn millis(v: String, name: &str) -> Result<Duration> {
+    Ok(Duration::from_millis(v.parse().context(name.to_string())?))
 }
 
 fn parse_args() -> Result<Option<Args>> {
@@ -52,6 +73,7 @@ fn parse_args() -> Result<Option<Args>> {
     let mut args = Args {
         wav: PathBuf::new(),
         engine: Engine::TranscribeCpp,
+        worker: None,
         backend: None,
         runs: 5,
         language: None,
@@ -59,7 +81,11 @@ fn parse_args() -> Result<Option<Args>> {
         model_dir: None,
         joint_on_cpu: false,
         threads: None,
-        device: None,
+        gpu: GpuSelector::Auto,
+        gap: Duration::ZERO,
+        kick: false,
+        kick_lead: Duration::from_secs(1),
+        kick_every: None,
     };
     while let Some(a) = it.next() {
         let mut value = |name: &str| it.next().with_context(|| format!("{name} needs a value"));
@@ -67,10 +93,12 @@ fn parse_args() -> Result<Option<Args>> {
             "--engine" => {
                 args.engine = match value("--engine")?.to_ascii_lowercase().as_str() {
                     "transcribe-cpp" | "ggml" => Engine::TranscribeCpp,
+                    "remote" => Engine::Remote,
                     "ort" => Engine::Ort,
                     other => bail!("unknown engine `{other}`\n{USAGE}"),
                 }
             }
+            "--worker" => args.worker = Some(value("--worker")?.into()),
             "--backend" => {
                 args.backend = Some(match value("--backend")?.to_ascii_lowercase().as_str() {
                     "vulkan" => Backend::Vulkan,
@@ -84,18 +112,27 @@ fn parse_args() -> Result<Option<Args>> {
             "--model" => args.model = Some(value("--model")?),
             "--model-dir" => args.model_dir = Some(value("--model-dir")?.into()),
             "--threads" => args.threads = Some(value("--threads")?.parse().context("--threads")?),
-            "--device" => args.device = Some(value("--device")?.parse().context("--device")?),
+            "--gpu" => {
+                args.gpu = value("--gpu")?
+                    .parse()
+                    .map_err(|e: String| anyhow::anyhow!("--gpu: {e}"))?;
+            }
             "--joint-cpu" => args.joint_on_cpu = true,
+            "--gap-ms" => args.gap = millis(value("--gap-ms")?, "--gap-ms")?,
+            "--kick" => args.kick = true,
+            "--kick-lead-ms" => {
+                args.kick_lead = millis(value("--kick-lead-ms")?, "--kick-lead-ms")?;
+            }
+            "--kick-every-ms" => {
+                let every = millis(value("--kick-every-ms")?, "--kick-every-ms")?;
+                if every.is_zero() {
+                    bail!("--kick-every-ms must be positive");
+                }
+                args.kick_every = Some(every);
+            }
             "--list-devices" => {
                 for d in transcribe_cpp::vulkan_devices() {
-                    println!(
-                        "vulkan {}: {} ({}) id={} {:.1} GiB",
-                        d.index,
-                        d.description,
-                        d.name,
-                        d.device_id.as_deref().unwrap_or("?"),
-                        d.memory_total as f64 / (1u64 << 30) as f64
-                    );
+                    println!("{}", d.table_row());
                 }
                 return Ok(None);
             }
@@ -130,19 +167,35 @@ fn median(v: &[Duration]) -> Duration {
     }
 }
 
+/// The PCI id `--gpu` names, by the same enumeration and policy hush uses.
+fn resolve_gpu(selector: &GpuSelector) -> Result<String> {
+    let devices = transcribe_cpp::vulkan_devices();
+    let r = gpu::resolve(&GpuRequest::Selector(selector.clone()), &devices)
+        .map_err(|e| anyhow::anyhow!("--gpu: {e}"))?;
+    let d = &devices[r.order[0]];
+    eprintln!("gpu: {} ({})", d.label(), r.why);
+    d.pci
+        .clone()
+        .with_context(|| format!("{} reports no PCI bus id", d.label()))
+}
+
 /// The lines describe the runtime that actually loaded.
 fn build_engine(
     args: &Args,
     backend: Backend,
     load_path: &std::path::Path,
 ) -> Result<(Box<dyn SttEngine>, Vec<String>)> {
+    let gpu = match (args.engine, backend) {
+        (Engine::TranscribeCpp | Engine::Remote, Backend::Vulkan) => Some(resolve_gpu(&args.gpu)?),
+        _ => None,
+    };
     match args.engine {
         Engine::TranscribeCpp => {
             let engine = TranscribeCppEngine::with_options(
                 load_path,
                 TranscribeCppOptions {
                     backend,
-                    gpu_device: args.device,
+                    gpu,
                     threads: args.threads,
                 },
             )?;
@@ -152,6 +205,30 @@ fn build_engine(
             let notes = vec![
                 format!("transcribe.cpp: {}", transcribe_cpp::library_version()),
                 format!("cpu threads:    {threads}"),
+            ];
+            Ok((Box::new(engine), notes))
+        }
+        Engine::Remote => {
+            let worker = match &args.worker {
+                Some(w) => w.clone(),
+                None => hush_stt::remote::default_worker_path()?,
+            };
+            let engine = RemoteEngine::new(RemoteOptions {
+                gpu,
+                threads: args.threads,
+                ..RemoteOptions::new(worker.clone(), load_path.to_path_buf(), backend)
+            })?;
+            let notes = vec![
+                format!(
+                    "worker:         {} (pid {})",
+                    worker.display(),
+                    engine.worker_pid().unwrap_or_default()
+                ),
+                format!(
+                    "worker load:    {:.1} ms model, {:.1} ms warm-up (inside the worker)",
+                    ms(engine.load_time()),
+                    ms(engine.warm_up_time())
+                ),
             ];
             Ok((Box::new(engine), notes))
         }
@@ -171,10 +248,7 @@ fn build_ort(
             backend,
             joint_on_cpu: args.joint_on_cpu,
             intra_threads: args.threads,
-            gpu_device: args
-                .device
-                .map(|d| i32::try_from(d).context("--device"))
-                .transpose()?,
+            gpu_device: None,
         },
     )?;
     let notes = vec![
@@ -191,6 +265,24 @@ fn build_ort(
     _load_path: &std::path::Path,
 ) -> Result<(Box<dyn SttEngine>, Vec<String>)> {
     bail!("this build has no ONNX Runtime engine; rebuild with `--features ort-engine`")
+}
+
+/// Stands in for key-down: nudge, then the user speaks for `lead` before releasing.
+fn kick(engine: &mut dyn SttEngine, lead: Duration, every: Option<Duration>) -> Result<()> {
+    let start = Instant::now();
+    let t = Instant::now();
+    engine.nudge()?;
+    eprintln!("nudge: {:.1} ms", ms(t.elapsed()));
+    if let Some(every) = every {
+        let mut next = every;
+        while next < lead {
+            std::thread::sleep(next.saturating_sub(start.elapsed()));
+            engine.nudge()?;
+            next += every;
+        }
+    }
+    std::thread::sleep(lead.saturating_sub(start.elapsed()));
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -210,12 +302,12 @@ fn main() -> Result<()> {
     let audio_secs = audio.len() as f64 / f64::from(SAMPLE_RATE);
 
     let backend = args.backend.unwrap_or(match args.engine {
-        Engine::TranscribeCpp => Backend::Vulkan,
+        Engine::TranscribeCpp | Engine::Remote => Backend::Vulkan,
         Engine::Ort => Backend::DirectMl,
     });
     let model_id = args.model.clone().unwrap_or_else(|| {
         match (args.engine, backend) {
-            (Engine::TranscribeCpp, _) => models::DEFAULT_MODEL_ID,
+            (Engine::TranscribeCpp | Engine::Remote, _) => models::DEFAULT_MODEL_ID,
             (Engine::Ort, Backend::Cpu) => "parakeet-tdt-0.6b-v3-int8",
             (Engine::Ort, _) => "parakeet-tdt-0.6b-v3",
         }
@@ -245,14 +337,36 @@ fn main() -> Result<()> {
         ..Default::default()
     };
     let mut times = Vec::with_capacity(args.runs);
+    let mut calls = Vec::with_capacity(args.runs);
     let mut last = None;
-    for _ in 0..args.runs {
+    for i in 0..args.runs {
+        std::thread::sleep(args.gap);
+        if args.kick {
+            kick(engine.as_mut(), args.kick_lead, args.kick_every)?;
+        }
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let t = Instant::now();
         let tr = engine.transcribe(&audio, &opts)?;
+        let call = t.elapsed();
+        eprintln!(
+            "run {i}: start {unix_ms} unix ms, {:.1} ms, call {:.1} ms",
+            ms(tr.inference_time),
+            ms(call)
+        );
         times.push(tr.inference_time);
+        calls.push(call);
         last = Some(tr);
     }
     let last = last.expect("runs >= 1");
     let med = median(&times);
+    // For the worker this is the pipe: audio out, transcript back, heartbeats aside.
+    let overheads: Vec<Duration> = calls
+        .iter()
+        .zip(&times)
+        .map(|(c, t)| c.saturating_sub(*t))
+        .collect();
 
     // Dictation never repeats a length, so a backend that specialises per input shape
     // looks better on repeated runs than it will in use.
@@ -291,6 +405,27 @@ fn main() -> Result<()> {
             .join(", ")
     );
     println!("median:         {:.1} ms", ms(med));
+    println!(
+        "call median:    {:.1} ms (overhead over inference: median {:.2} ms, max {:.2} ms)",
+        ms(median(&calls)),
+        ms(median(&overheads)),
+        ms(overheads.iter().max().copied().unwrap_or_default())
+    );
+    println!(
+        "gap:            {} ms{}",
+        args.gap.as_millis(),
+        if args.kick {
+            format!(
+                ", kick {} ms before each run{}",
+                args.kick_lead.as_millis(),
+                args.kick_every
+                    .map(|e| format!(", again every {} ms", e.as_millis()))
+                    .unwrap_or_default()
+            )
+        } else {
+            String::new()
+        }
+    );
     match novel_time {
         Some(d) => println!("novel length:   {:.1} ms (first 90% of the clip)", ms(d)),
         None => println!("novel length:   n/a (clip too short)"),

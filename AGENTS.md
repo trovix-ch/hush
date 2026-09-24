@@ -76,10 +76,11 @@ contradicts, the code is right and the prose gets fixed or deleted in the same c
    returns. No locks, no allocation, no logging, no key-state queries. The watchdog
    exists because this still happens under load.
 2. **Trusting a clipboard render as proof of insertion, or restoring on a timer.**
-   Windows asks the owner to render a delayed format once per write; the first reader
-   gets the render and later readers get the copy silently. Restore policy is decided
-   by who read first. A fixed delay is how the reference project pasted the old
-   clipboard for two years.
+   Windows renders a delayed format for the first reader and hands later readers the
+   copy silently; readers that race each trigger a render and each render bumps the
+   sequence number, which is not a foreign write. Restore policy is decided by who
+   read first. A fixed delay is how the reference project pasted the old clipboard for
+   two years.
 3. **Letting LLM output reach the inserter without validation**, or streaming it into
    the target. The validator is the last line between a dictated question and its
    answer landing in someone's Slack.
@@ -133,11 +134,12 @@ cargo build --release -p hush
 In Git Bash the same two are `export VULKAN_SDK='C:\VulkanSDK\1.4.357.0'` and
 `export PATH="/c/VulkanSDK/1.4.357.0/Bin:/c/Program Files/CMake/bin:$PATH"`.
 
-`cargo build --release -p hush --no-default-features` leaves the embedded LLM out (no
-libclang needed); cleanup is then rules-only or over HTTP. The default build puts
-`transcribe.dll` and four `ggml*.dll` next to `hush.exe`, and the exe needs them: speech
-and llama.cpp each vendor their own ggml, so speech is linked as a DLL to keep the two
-apart.
+Build both binaries: `cargo build --release -p hush -p hush-stt-worker`. Speech runs
+in `hush-stt-worker.exe`, which must sit next to `hush.exe`; nothing else is needed
+beside them. The split exists because transcribe.cpp and llama.cpp each vendor their
+own ggml and clash in one process, and because a GPU driver crash then costs one
+utterance instead of the app. `--no-default-features` leaves the embedded LLM out (no
+libclang needed); cleanup is then rules-only or over HTTP.
 
 - `hush doctor` reports devices, model, engine backend and the normalizer.
 - `hush simulate <wav> [--runs N]` runs one dictation from a WAV into Notepad
@@ -145,10 +147,11 @@ apart.
 - `bench-stt` and `bench-normalize` measure engines and normalizers in isolation.
 - Config: `%APPDATA%\hush\config.toml`. Models: `%LOCALAPPDATA%\hush\models`.
   Logs: `%LOCALAPPDATA%\hush\logs`.
-- With two GPUs, pin `engine.gpu_device` to the card not running Ollama or another
-  busy LLM; sharing one card with a busy LLM tripled speech latency in measurement. The
-  embedded LLM follows `engine.gpu_device` unless `normalizer.gpu_device` is set; sharing
-  the card with it cost nothing measurable (design §7).
+- GPUs are chosen by `engine.device` and `normalizer.device`: `"auto"` (discrete card
+  with the most free memory), a PCI bus id such as `"0000:05:00.0"`, or a name
+  substring. Never an index: Vulkan orders devices differently in an RDP session and on
+  the console. Sharing one card with a busy external LLM tripled speech latency in
+  measurement; sharing it with the embedded LLM cost nothing measurable (design §7).
 
 Gates before a change is done:
 

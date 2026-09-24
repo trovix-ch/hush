@@ -9,7 +9,7 @@ use hush_normalize::{rules, should_use_llm};
 use serde::Deserialize;
 
 const USAGE: &str = "usage: bench-normalize [--normalizer http|llama-cpp] [--base-url URL] \
-[--model NAME]... [--gguf PATH] [--pci BUS | --device N] [--runs N] [--fixtures PATH] \
+[--model NAME]... [--gguf PATH] [--gpu auto|PCI|NAME] [--runs N] [--fixtures PATH] \
 [--timeout-ms MS] [--case SUBSTRING] [--rules-only]
 
   --normalizer http (default) or llama-cpp, the embedded one
@@ -17,8 +17,8 @@ const USAGE: &str = "usage: bench-normalize [--normalizer http|llama-cpp] [--bas
   --model      http: model name; repeat or comma-separate for several (default
                qwen3:4b-instruct-2507-q4_K_M)
   --gguf       llama-cpp: model file (default: the one `hush doctor` downloads)
-  --pci        llama-cpp: Vulkan device whose PCI bus id contains this
-  --device     llama-cpp: Vulkan device index, as `hush doctor` lists them (default 0)
+  --gpu        llama-cpp: auto (default), a PCI bus id such as 05:00, or part of the
+               device name, as hush's normalizer.device takes
   --runs       LLM runs per case, for latency percentiles (default 3)
   --fixtures   fixtures TOML (default: the one shipped with this tool)
   --timeout-ms per-request timeout (default 5000)
@@ -36,8 +36,7 @@ struct Args {
     base_url: String,
     models: Vec<String>,
     gguf: Option<PathBuf>,
-    pci: Option<String>,
-    device: Option<usize>,
+    gpu: hush_core::gpu::GpuSelector,
     runs: usize,
     fixtures: PathBuf,
     timeout: Duration,
@@ -51,8 +50,7 @@ fn parse_args() -> Result<Args> {
         base_url: "http://localhost:11434/v1".into(),
         models: Vec::new(),
         gguf: None,
-        pci: None,
-        device: None,
+        gpu: hush_core::gpu::GpuSelector::Auto,
         runs: 3,
         fixtures: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/transcripts.toml"),
         timeout: Duration::from_secs(5),
@@ -74,8 +72,11 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--gguf" => a.gguf = Some(value()?.into()),
-            "--pci" => a.pci = Some(value()?),
-            "--device" => a.device = Some(value()?.parse().context("--device")?),
+            "--gpu" => {
+                a.gpu = value()?
+                    .parse()
+                    .map_err(|e: String| anyhow::anyhow!("--gpu: {e}"))?;
+            }
             "--base-url" => a.base_url = value()?,
             "--model" => a.models.extend(
                 value()?
@@ -303,13 +304,9 @@ fn load_llama(args: &Args) -> Result<(String, Llm)> {
         .clone()
         .or_else(default_gguf)
         .context("no --gguf and no LOCALAPPDATA")?;
-    let device = match (&args.pci, args.device) {
-        (Some(p), _) => DeviceChoice::Pci(p.clone()),
-        (None, Some(i)) => DeviceChoice::VulkanIndex(i),
-        (None, None) => DeviceChoice::FirstGpu,
-    };
+    let device = DeviceChoice::Select(args.gpu.clone());
     for d in llama_cpp::vulkan_devices()? {
-        println!("vulkan {}: {} [{}]", d.vulkan_index, d.description, d.pci);
+        println!("{}", d.gpu.table_row());
     }
     let started = Instant::now();
     let n = LlamaCppNormalizer::load(LlamaCppConfig {

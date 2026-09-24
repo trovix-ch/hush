@@ -9,12 +9,17 @@ rust-version.workspace = true
 [features]
 default = ["llama-cpp"]
 # The embedded LLM normalizer; without it cleanup is rules-only or over HTTP.
-llama-cpp = ["hush-normalize/llama-cpp", "hush-stt/transcribe-shared"]
+llama-cpp = ["hush-normalize/llama-cpp"]
+# Speech inside this process (`engine.in_process = true`) instead of hush-stt-worker.exe,
+# for debugging. transcribe.cpp then comes as DLLs next to hush.exe so its ggml cannot
+# collide with llama.cpp's; built together with the worker, the worker uses them too.
+in-process-stt = ["dep:hush-stt-worker", "hush-stt-worker/shared"]
 
 [dependencies]
 hush-core = { path = "../../crates/core" }
 hush-audio = { path = "../../crates/audio" }
 hush-stt = { path = "../../crates/stt" }
+hush-stt-worker = { path = "../hush-stt-worker", optional = true }
 hush-normalize = { path = "../../crates/normalize", default-features = false }
 hush-platform-windows ={ path = "../../crates/platform-windows" }
 anyhow = "1"

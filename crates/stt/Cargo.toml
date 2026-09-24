@@ -1,21 +1,15 @@
 [package]
 name = "hush-stt"
-description = "Speech-to-text engine implementations"
+description = "Model manifest, the speech worker client and the ONNX fallback engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-build = "build.rs"
 
 [features]
 default = []
 # Off by default: no ONNX Runtime in default builds; ggml/Vulkan measured about 2x faster.
 ort-engine = ["dep:parakeet-rs", "dep:ort"]
-# transcribe.cpp and its ggml as DLLs next to the exe. Needed when llama.cpp is linked
-# into the same binary: both vendor a static ggml (0.20 and 0.24), and two static copies
-# collide at link time (LNK2005). Only transcribe can move out, because its Rust side
-# calls no ggml function directly and llama-cpp-2's does.
-transcribe-shared = ["transcribe-cpp/shared"]
 
 [dependencies]
 hush-core ={ path = "../core" }
@@ -26,13 +20,17 @@ serde_json = "1"
 directories = "6"
 sha2 = "0.10"
 ureq = "3"
-# Pinned exactly: 0.x native bindings with no semver promise between patches.
-transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
 # Pinned exactly: pre-1.0 ONNX wrappers that break API in patches and must agree on `ort`.
 parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["cpu", "ort-defaults", "api-28"] }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "api-28"] }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["directml"] }
 ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["directml"] }
 

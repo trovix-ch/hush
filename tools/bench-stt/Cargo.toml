@@ -14,6 +14,7 @@ ort-engine = ["hush-stt/ort-engine"]
 [dependencies]
 hush-core = { path = "../../crates/core" }
 hush-stt ={ path = "../../crates/stt" }
+hush-stt-worker = { path = "../../apps/hush-stt-worker" }
 anyhow = "1"
 hound = "3.5"
 # Pinned: v4 and v5 both shipped in 2026 with incompatible APIs.

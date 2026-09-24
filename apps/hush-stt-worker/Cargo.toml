@@ -1,0 +1,33 @@
+[package]
+name = "hush-stt-worker"
+description = "The transcribe.cpp speech engine, and the process hush runs it in"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+[features]
+default = []
+# transcribe.cpp and its ggml as DLLs next to the exe. Needed when llama.cpp is linked
+# into the same binary: both vendor a static ggml (0.20 and 0.24), and two static copies
+# collide at link time (LNK2005). Only transcribe can move out, because its Rust side
+# calls no ggml function directly and llama-cpp-2's does. The worker itself links
+# statically unless something built with it asks for this.
+shared = ["transcribe-cpp/shared"]
+
+[dependencies]
+hush-core = { path = "../../crates/core" }
+hush-stt = { path = "../../crates/stt" }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# Pinned exactly: 0.x native bindings with no semver promise between patches.
+transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[lints]
+workspace = true

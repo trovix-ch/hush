@@ -45,6 +45,11 @@ pub struct SttJob {
     pub cancel: CancelToken,
 }
 
+pub enum SttCmd {
+    Job(SttJob),
+    Nudge,
+}
+
 fn no_speech(id: UtteranceId, segment_index: u32) -> Event {
     Event::SegmentReady {
         id,
@@ -64,8 +69,8 @@ pub type EngineLoader =
 pub fn spawn_stt(
     load: EngineLoader,
     out: Sender<Msg>,
-) -> std::io::Result<(Sender<SttJob>, JoinHandle<()>)> {
-    let (tx, rx) = mpsc::channel::<SttJob>();
+) -> std::io::Result<(Sender<SttCmd>, JoinHandle<()>)> {
+    let (tx, rx) = mpsc::channel::<SttCmd>();
     let join = spawn("hush-stt", move || {
         let loaded = match catch_unwind(AssertUnwindSafe(load)) {
             Ok(Ok(loaded)) => Ok(loaded),
@@ -82,7 +87,23 @@ pub fn spawn_stt(
                 Err(reason)
             }
         };
-        for job in rx {
+        for cmd in rx {
+            let job = match cmd {
+                SttCmd::Job(job) => job,
+                SttCmd::Nudge => {
+                    if let Ok(e) = engine.as_mut() {
+                        match catch_unwind(AssertUnwindSafe(|| e.nudge())) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => tracing::debug!(error = %err, "gpu nudge failed"),
+                            Err(p) => {
+                                engine =
+                                    Err(format!("engine panicked: {}", panic_text(p.as_ref())));
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
             // Escape already moved the pipeline on; nobody is waiting for this answer.
             if job.cancel.is_cancelled() {
                 continue;
@@ -462,12 +483,14 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Msg::EngineReady(Err(_))
         ));
-        tx.send(SttJob {
+        // A nudge answers nothing, even with no engine.
+        tx.send(SttCmd::Nudge).unwrap();
+        tx.send(SttCmd::Job(SttJob {
             id: UtteranceId(1),
             segment_index: 3,
             pcm: vec![0.0; 16_000],
             cancel: CancelToken::new(),
-        })
+        }))
         .unwrap();
         match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
             Msg::Event(Event::SegmentReady {
@@ -479,12 +502,12 @@ mod tests {
         }
         let tone: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
         for id in [UtteranceId(2), UtteranceId(3)] {
-            tx.send(SttJob {
+            tx.send(SttCmd::Job(SttJob {
                 id,
                 segment_index: 0,
                 pcm: tone.clone(),
                 cancel: CancelToken::new(),
-            })
+            }))
             .unwrap();
             match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
                 Msg::Event(Event::Failed(got, Failure::Stt(SttError::Load(reason)))) => {

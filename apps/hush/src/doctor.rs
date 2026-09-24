@@ -2,9 +2,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
-use hush_core::config::{Config, NormalizerChoice};
+use hush_core::config::{Config, GpuPolicy, NormalizerChoice};
 use hush_core::normalize::{AppContext, NormalizeRequest, Provenance, Style};
-use hush_core::stt::{DecodeOptions, SAMPLE_RATE};
+use hush_core::stt::{Backend, DecodeOptions, SAMPLE_RATE};
 use hush_core::{CancelToken, UtteranceId};
 use hush_platform_windows::focus;
 use hush_platform_windows::hook::HotkeyConfig;
@@ -95,25 +95,7 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
         Err(e) => println!("  cannot list: {e}"),
     }
 
-    println!("\nvulkan devices");
-    let devices = engines::describe_vulkan_devices(config.engine.gpu_device);
-    for d in &devices {
-        println!("  {d}");
-    }
-    if devices.is_empty() {
-        println!("  none");
-    }
-    match config.engine.gpu_device {
-        Some(i) if i >= devices.len() => {
-            println!("  engine.gpu_device = {i} does not exist")
-        }
-        Some(_) => {}
-        None if devices.len() > 1 => println!(
-            "  engine.gpu_device is unset: the runtime picks, which may be an integrated GPU \
-             or the card running your LLM"
-        ),
-        None => {}
-    }
+    print_gpus(&config);
 
     println!();
     let (model, dir) = match engines::resolve_model(&config.engine) {
@@ -186,14 +168,29 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
     let started = Instant::now();
     let engine_ok = match engines::load_engine(&config.engine, &model.load_path(&dir)) {
         Ok((mut engine, s)) => {
+            let device = s.device.as_deref().unwrap_or("device not reported");
             row(
                 "engine",
+                match &s.worker {
+                    Some(w) => format!(
+                        "remote worker {} on {:?} ({device}); {}",
+                        w.pid,
+                        s.backend,
+                        w.path.display()
+                    ),
+                    None => format!("in process on {:?} ({device})", s.backend),
+                },
+            );
+            row(
+                "",
                 format!(
-                    "{} on {:?} ({}); load {} ms, warm-up {} ms; policy {:?}",
+                    "{}; load {} ms{}, warm-up {} ms; policy {:?}",
                     s.model,
-                    s.backend,
-                    s.device.as_deref().unwrap_or("device not reported"),
                     s.load.as_millis(),
+                    s.worker
+                        .as_ref()
+                        .map(|w| format!(" (model {} ms of it)", w.model_load.as_millis()))
+                        .unwrap_or_default(),
                     s.warm_up.as_millis(),
                     config.engine.gpu
                 ),
@@ -204,6 +201,23 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
                     format!("GPU FALLBACK: speech runs on the CPU because {why}"),
                 );
             }
+            row(
+                "",
+                match (config.engine.gpu_nudge, s.backend) {
+                    (_, Backend::Cpu) => "gpu nudge: not used on the CPU".to_string(),
+                    (false, _) => "gpu nudge: off (engine.gpu_nudge = false)".to_string(),
+                    (true, _) => {
+                        let t = Instant::now();
+                        match engine.nudge() {
+                            Ok(()) => format!(
+                                "gpu nudge: on while recording; one pass {:.0} ms",
+                                t.elapsed().as_secs_f64() * 1e3
+                            ),
+                            Err(e) => format!("gpu nudge: on, but it failed: {e}"),
+                        }
+                    }
+                },
+            );
             let silence = vec![0.0f32; SAMPLE_RATE as usize];
             let t = Instant::now();
             match engine.transcribe(&silence, &DecodeOptions::default()) {
@@ -311,6 +325,70 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
     } else {
         println!("the speech engine cannot load; dictation will not work");
         Ok(ExitCode::FAILURE)
+    }
+}
+
+/// The device table as the speech worker lists it, and where each stage will run and why.
+fn print_gpus(config: &Config) {
+    println!("\ngpus (Vulkan; free memory is a snapshot, other processes' use included)");
+    let devices = match engines::gpu_devices(&config.engine) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("  cannot list: {e:#}");
+            Vec::new()
+        }
+    };
+    let cpu_only = config.engine.gpu == GpuPolicy::CpuOnly;
+    let llm = matches!(config.normalizer, NormalizerChoice::LlamaCpp { .. });
+    let first = |p: &Result<engines::GpuPlan, String>| {
+        p.as_ref().ok().and_then(|p| p.candidates.first().cloned())
+    };
+    let speech = (!cpu_only).then(|| engines::speech_gpu(&config.engine));
+    let language = (!cpu_only && llm).then(|| engines::llm_gpu(config));
+    let speech_pci = speech.as_ref().and_then(first);
+    let llm_pci = language.as_ref().and_then(first);
+    for d in &devices {
+        let mut users = Vec::new();
+        if speech_pci.is_some() && speech_pci == d.pci {
+            users.push("speech");
+        }
+        if llm_pci.is_some() && llm_pci == d.pci {
+            users.push("llm");
+        }
+        let mark = if users.is_empty() {
+            String::new()
+        } else {
+            format!("  <- {}", users.join(", "))
+        };
+        println!("  {}{mark}", d.table_row());
+    }
+    if devices.is_empty() {
+        println!("  none");
+    }
+    let describe = |key: &str, p: Option<Result<engines::GpuPlan, String>>| match p {
+        None => format!("{key}: CPU (engine.gpu = \"cpu-only\")"),
+        Some(Ok(p)) => match p.candidates.split_first() {
+            None => format!("{key}: {}", p.why),
+            Some((first, [])) => format!("{key}: {first} ({})", p.why),
+            Some((first, rest)) => format!("{key}: {first} ({}), then {}", p.why, rest.join(", ")),
+        },
+        Some(Err(e)) => format!("{key}: no GPU, {e}"),
+    };
+    println!(
+        "  {}",
+        describe(
+            &format!("speech (engine.device = \"{}\")", config.engine.device),
+            speech
+        )
+    );
+    if let NormalizerChoice::LlamaCpp { device, .. } = &config.normalizer {
+        println!(
+            "  {}",
+            describe(&format!("llm (normalizer.device = \"{device}\")"), language)
+        );
+    }
+    for w in config.deprecations() {
+        println!("  DEPRECATED: {w}");
     }
 }
 

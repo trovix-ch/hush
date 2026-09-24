@@ -89,7 +89,8 @@ pub enum SttError {
     Cancelled,
     #[error("deadline passed")]
     Deadline,
-    /// The engine must be rebuilt; retrying on the same instance is pointless.
+    /// The in-flight request is lost. An engine that owns a child process restarts it
+    /// and serves the next request; an in-process engine has to be rebuilt.
     #[error("backend died: {0}")]
     BackendDied(String),
 }
@@ -108,6 +109,12 @@ pub trait SttEngine: Send {
 
     /// Load weights and run one dummy pass so the first real call pays no warm-up cost.
     fn warm_up(&mut self) -> Result<(), SttError>;
+
+    /// A cheap pass that raises an idle GPU's clocks ahead of a real call. Called at
+    /// key-down, while the user is still speaking; engines with nothing to ramp do nothing.
+    fn nudge(&mut self) -> Result<(), SttError> {
+        Ok(())
+    }
 
     /// `pcm` is 16 kHz mono in [-1, 1].
     fn transcribe(&mut self, pcm: &[f32], opts: &DecodeOptions) -> Result<Transcript, SttError>;

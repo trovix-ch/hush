@@ -30,11 +30,15 @@ the install, set them for the session (PowerShell):
 ```powershell
 $env:VULKAN_SDK = 'C:\VulkanSDK\1.4.357.0'
 $env:PATH = "C:\VulkanSDK\1.4.357.0\Bin;C:\Program Files\CMake\bin;$env:PATH"
-cargo build --release -p hush
+cargo build --release -p hush -p hush-stt-worker
 ```
 
-The binary needs the `transcribe.dll` and `ggml*.dll` built next to it; copy them along.
+Speech runs in a child process, `hush-stt-worker.exe`, which must sit next to `hush.exe`
+(or be named by `engine.worker_path`); copy both. Neither needs a DLL beside it. If the
+GPU driver crashes the worker, hush loses that one utterance and restarts it.
 `--no-default-features` builds without the embedded language model (and without LLVM).
+`--features in-process-stt` adds `engine.in_process = true`, speech inside hush for
+debugging, which then needs the `transcribe.dll` and `ggml*.dll` built next to it.
 
 - `hush` runs the app. Hold **Right Ctrl**, speak, release. Tray → Quit (or
   Ctrl+C in its console) exits.
@@ -43,9 +47,14 @@ The binary needs the `transcribe.dll` and `ggml*.dll` built next to it; copy the
 - `hush simulate <wav> [--target notepad|foreground] [--runs N]` runs one
   dictation from a WAV through the whole pipeline and prints per-stage timings.
 - Config: `%APPDATA%\hush\config.toml`, written on first run with every key
-  commented. With two GPUs, set `engine.gpu_device` to the one not running another LLM
-  server (`doctor` lists them); the built-in language model follows it unless
-  `normalizer.gpu_device` says otherwise. Logs: `%LOCALAPPDATA%\hush\logs\`.
+  commented. `engine.device = "auto"` (the default) puts speech on the discrete GPU
+  with the most free memory, skipping integrated GPUs; the built-in language model
+  follows speech unless `normalizer.device` says otherwise. To pin a card, write its
+  PCI bus id as `doctor` prints it (`"0000:05:00.0"` or `"05:00"`) or part of its
+  name; with two GPUs, pin speech to the one not running another LLM server. Device
+  indexes are not accepted: Windows numbers the GPUs differently in console and
+  remote sessions. The old `gpu_device` index still works for now, with a warning.
+  Logs: `%LOCALAPPDATA%\hush\logs\`.
 
 ## Principles
 

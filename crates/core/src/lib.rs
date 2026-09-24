@@ -4,6 +4,7 @@
 pub mod cancel;
 pub mod config;
 pub mod context;
+pub mod gpu;
 pub mod history;
 pub mod insert;
 pub mod normalize;

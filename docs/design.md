@@ -199,7 +199,8 @@ gave 29 before the per-app `<app>` wording changed the prompt (§7). llama.cpp a
 transcribe.cpp each vendor a static ggml (0.24 and 0.20), whose symbols collide at link
 time, so the default build links transcribe.cpp as a DLL. The process therefore holds two
 ggml copies and two Vulkan instances: D13's single GPU runtime is not met until both
-build against one ggml.
+build against one ggml. *(2026-09-24: superseded by D12's worker process, which keeps
+the two copies in separate processes and needs no DLL.)*
 
 Two caveats the review panel made explicit:
 - The HTTP path proves prompt *correctness*, not latency and not grammar safety. It
@@ -305,10 +306,14 @@ history services, RDP layers and apps that snapshot the clipboard on activation 
 produce render requests. So:
 
 Measured 2026-09-24 (`spikes/clipboard-receipt/`): **Windows requests a delayed format
-from the owner exactly once per write.** The first reader triggers the render; every
-later reader gets the stored copy and the owner hears nothing. There is no "last
-render" and no quiet window to wait for. The signal is therefore *who read first*, and
-the policy follows from that:
+from the owner for the first reader only.** Every later reader gets the stored copy and
+the owner hears nothing. There is no "last render" and no quiet window to wait for. The
+signal is therefore *who read first*, and the policy follows from that. Corrected later
+the same day on the console session: readers that race the first one (a remote-access
+tool reading every write within 50 ms) each trigger a render, and each render bumps the
+clipboard sequence number; the owner must count its own renders as non-writes or it
+mistakes them for a foreign write and never restores. The spike could not see this
+under RDP because nothing there read that eagerly.
 
 - A short gap (20–50 ms) separates the clipboard write from the paste chord. Any read
   in that gap is a third party (measured: the RDP clipboard process reads within 1 ms
@@ -413,6 +418,34 @@ Milestones 0–2 run in-process. The contracts in D14 are shaped so the boundary
 adapter, not a rewrite: owned request data, ids, deadlines, cancellation, and error
 variants for a dead backend.
 
+*Amended 2026-09-24 (milestone 3):* built. Speech runs in `hush-stt-worker.exe` next to
+`hush.exe`, behind the same `SttEngine` trait. The pipe carries length-prefixed frames,
+a JSON header plus raw little-endian `f32` audio (a 30 s utterance is 1.9 MB, never
+base64), with request ids, cancel messages and a heartbeat every second. A worker that
+exits, closes the pipe, writes a malformed frame or misses heartbeats for 5 s fails the
+request in flight with `BackendDied` and is restarted in the background; the next
+request waits for the replacement. One that has not stopped 2 s after a cancel or a
+passed deadline is killed and restarted, since a hang inside the driver keeps the
+heartbeat thread alive. Workers sit in a kill-on-close job object, so none outlives a
+crashed hush. The worker points its own stdout at stderr and keeps a private copy for
+the protocol: one stray `printf` from native code would otherwise corrupt the framing.
+Its log reaches hush's at debug level, and the last line goes into the `BackendDied`
+message. `engine.in_process = true` keeps the old path for debugging, in builds with the
+`in-process-stt` feature.
+
+This also ends the DLL split in D5: transcribe.cpp links statically into the worker and
+llama.cpp statically into hush, and neither exe needs anything beside it except the VC++
+runtime and the Vulkan loader (checked with `dumpbin /dependents` and a run from a
+directory holding only the two exes). The engine lives in the worker's package rather
+than behind a feature of `hush-stt`: Cargo unifies features across everything built in
+one invocation, and a workspace build then linked both static ggml copies into hush's
+test binary (LNK2005). D13's one-runtime goal is still unmet, but the two ggml copies
+no longer share a process. Cost: under 1.3 ms per call, measured in §7, and 20–150 ms of
+process start at load. Crash test: the worker aborted 30 ms into a 30 s
+transcription, the call returned `BackendDied`, a replacement was ready 1.9 s later and
+served the next call, on the CPU and on Vulkan (`hush-stt-worker` integration tests,
+gated on `HUSH_TEST_TC_MODEL`).
+
 ### D13. GPU policy is explicit, and milestone 0 is a decision gate
 Engines are constructed under a policy: `RequireGpu`, `PreferGpu` or `CpuOnly`. Under
 `RequireGpu` a backend that cannot load fails loudly; under `PreferGpu` the fallback is
@@ -425,6 +458,23 @@ numbers exist: if DirectML fails to initialise on the development GPU, or Vulkan
 within 20 % of DirectML latency on the 10 s clip, the default becomes the Vulkan path
 and ONNX Runtime is dropped from the speech side before milestone 1. One GPU runtime
 for speech and LLM means one crash surface and one process to isolate.
+
+*Amended 2026-09-24:* the device is named by PCI bus id, never by Vulkan index. The
+index order differed between the console session (integrated GPU first) and an RDP
+session (05:00, integrated, 01:00), so `gpu_device = 1` put speech on the integrated
+GPU over RDP at 636 ms for the 10 s clip (§7, "Speech after idle"). `engine.device` and
+`normalizer.device` take `auto` (the default), a PCI id, or part of a device name; the
+old index is read for one release with a warning. `auto` drops integrated, CPU and
+virtual devices when a discrete GPU exists and takes the one with the most free memory
+(the driver's memory budget, which counts other processes' allocations), so a card
+another model already fills loses; free memory within 1 GiB is a tie broken by PCI id,
+so two idle cards do not swap between sessions. The app resolves once per process on
+the speech worker's device list and sends the PCI id in the worker's load request;
+the language model follows speech unless configured otherwise, and gets the same
+ordered list. Under `require-gpu` a card that fails to load is an error; under
+`prefer-gpu` the next candidate is tried, then the CPU, and each failure is logged.
+Rejected: a second Vulkan loader (`ash`) for enumeration, since both ggml copies
+already report type, PCI id and budgeted free memory.
 
 ### D14. Core contracts, completed before the state machine is written *(perishable)*
 The engine traits alone cannot drive the pipeline. Before the state machine exists in
@@ -475,6 +525,11 @@ second engine of D2 costs no extra runtime.
   shaders (seconds), and the driver caches them on disk afterwards.
 - Two GPUs on the development machine: the speech engine and the LLM must be pinned to
   a device explicitly. Sharing one GPU with a busy LLM tripled DirectML latency.
+- *Amended 2026-09-24:* the 75 ms holds only on an awake card; after the idle gap that
+  real dictation always has it was 237 ms, so the driver runs a 1 s dummy pass every
+  250 ms while the key is held (`engine.gpu_nudge`, on by default, ignored on the CPU),
+  which brings release-time speech back to 75 ms for about 5 W during the hold (§7,
+  "Speech after idle").
 - The int8 Parakeet ONNX variant invented "Thank you." on pure silence; F16 and fp32
   returned empty. VAD dropping silent recordings (D3) is not optional.
 
@@ -489,20 +544,26 @@ next successful one. Nothing dictated is lost to a later dictation.
 ```
 Cargo.toml                 workspace
 crates/
-  core/                    types, config, state machine, contracts (SttEngine, Normalizer, Inserter,
-                           Recorder, Notifier — the last three arrive with D14), no platform code
-  audio/                   capture, ring buffer, resampling, VAD
-  stt/                     engines: parakeet (ort/DirectML); whisper behind a feature later
-  normalize/               rules, prompt building, validation, OpenAI-HTTP backend; llama.cpp later
-  platform-windows/        hook, focus context, clipboard/insert, overlay, tray, sound, paths
+  core/                    contracts (SttEngine, Normalizer, Inserter, Recorder, Notifier), the
+                           pipeline state machine, segmenter and stitcher, config, history,
+                           cancellation; no platform or inference dependencies
+  audio/                   capture, resampling, energy and Silero VAD
+  stt/                     model manifest and downloader, the worker protocol and the remote
+                           engine client; the ONNX engine behind a non-default feature
+  normalize/               rules, prompt, validation, the shared LLM path, embedded llama.cpp
+                           and OpenAI-HTTP backends
+  platform-windows/        hook, focus context, clipboard/insert, input, overlay, tray, sound
 apps/
-  hush/                    the binary: wiring, config loading, tray menu
+  hush/                    the app: driver, workers, doctor, simulate
+  hush-stt-worker/         child process that links transcribe.cpp and runs the speech engine
 tools/
-  bench/                   CLI: wav → engine → text with timings; transcript → normalizer with timings
+  bench-stt/, bench-normalize/   measurement harnesses and fixtures
+spikes/                    standalone experiments with their own workspaces and dated READMEs
 docs/
 ```
 
-`core` compiles on every platform and has tests. `platform-windows` is `cfg(windows)`.
+Updated 2026-09-24 after milestone 3. `core` compiles on every platform and carries
+most tests. `platform-windows` is `cfg(windows)`.
 
 ## 6. Milestones
 
@@ -595,8 +656,9 @@ call for the utterance.
 | same | on | 50 / 54 | 52 / 58 | 3–4 | 0 or 3.0 s | 141–184 |
 
 A first `jfk` batch with pre-transcription on gave p50 145 / p95 192 ms from the same
-segmentation, so the run-to-run spread is wide; GPU clocks dropping between short calls
-are the suspect, unverified. The 10 s clip closes as one 9.2 s segment during its
+segmentation, so the run-to-run spread is wide; GPU clocks dropping between calls cost
+up to 4.5 times (see "Speech after idle" below), not re-checked against this spread.
+The 10 s clip closes as one 9.2 s segment during its
 trailing silence, and its text is identical with the flag on and off; the silence clip
 inserts nothing either way.
 
@@ -672,7 +734,8 @@ configuration, times in ms from key release; RDP session, so every insert is
 
 The pipeline outside the engine calls adds under 0.3 ms. Two things are unexplained:
 the speech time alternates between about 72 and about 180 ms when runs are 2 s apart
-but not when back to back (GPU clock ramp is the obvious suspect, unverified), and the
+but not when back to back (the GPU dropping its clocks; confirmed and mitigated, see
+"Speech after idle" below), and the
 LLM round trip is about 220 ms here against 100 ms p50 in the isolated benchmark
 (the benchmark reused one HTTP agent; the app's first-request cost or the different
 prompt size are candidates). Both are inside the budget and both get measured before
@@ -770,10 +833,81 @@ pass had the split configuration slower (cleanup 395 against 280 ms p50) and did
 reproduce, so single runs of this benchmark are noise. Speech takes about 230–280 ms in
 every configuration including rules-only, against 75 ms back to back in `bench-stt`
 (measured again today). The rules-only row shows it is not the LLM; the 11 s between
-runs is the suspect, as in the unexplained alternation under "Whole pipeline" above
-(unverified). The Ninja-built and the Visual-Studio-built speech libraries measured the
+runs let the card fall to its idle clocks (confirmed later the same day, see "Speech
+after idle" below). The Ninja-built and the Visual-Studio-built speech libraries measured the
 same in `bench-stt` (72–79 ms medians, interleaved). Cleanup is 240 ms rather
 than 105 because this utterance produces about 25 tokens.
+
+### Speech worker process, 2026-09-24
+Method: release build, `bench-stt <clip> --engine transcribe-cpp|remote --device 1
+--runs 10`, back to back after warm-up, Vulkan on the RTX 5060 Ti at PCI 05:00, console
+session; another benchmark was running on the AMD integrated GPU at the time. The pipe
+overhead is the wall-clock `transcribe` call minus the inference time the worker
+measures, so it covers copying the audio, both pipe transfers and the JSON.
+
+| clip | in process, p50 ms | worker, p50 ms | pipe overhead p50 / max ms |
+|---|---|---|---|
+| tts 3 s | 35.7 | 34.4 | 0.26 / 0.36 |
+| tts 10 s | 72.0 | 71.9 | 0.29 / 0.43 |
+| tts 30 s (1.9 MB of audio) | 193.3 | 190.6 | 1.18 / 1.27 |
+
+Text was identical both ways. Model load inside the worker matched in process (1.56–1.58
+s against 1.54 s); starting the process added 15–150 ms. `hush simulate
+tools/bench-stt/fixtures/tts-10s-fillers.wav --runs 3 --normalizer llama-cpp`, run from a
+directory holding only `hush.exe` and `hush-stt-worker.exe` with a system-only PATH:
+release to transcript p50 84.5 ms, to inserted text 368 ms, the language model on the
+same card as the worker.
+
+### Speech after idle: GPU clocks, 2026-09-24
+Method: release build, the 10 s clip, Parakeet F16 on the RTX 5060 Ti at PCI 05:00,
+console session, 8 runs per row. `bench-stt <clip> --pci 05:00 --runs 8 --gap-ms N`
+idles N ms before each run; `--kick` calls the engine's nudge (one 1 s silent pass),
+repeats it every `--kick-every-ms`, and transcribes `--kick-lead-ms` after the first,
+standing in for key-down, speaking and release. The card's state is `nvidia-smi
+--query-gpu=clocks.sm,clocks.mem,pstate,power.draw -lms 100`, sampled just before each
+call; it lags by up to 100 ms.
+
+| idle before the call | p50 ms | runs (ms) | state before the call (of 8) |
+|---|---|---|---|
+| none, back to back | 76 | 74–78 | P0, memory 14001 MHz: 8 |
+| 2 s | 187 | 77–196 | P0/P3: 5, P5: 3 (two with memory at 810 MHz) |
+| 5 s | 204 | 75–319 | P8 (memory 405 MHz): 4, P5: 2, P3: 2 |
+| 11 s | 237 | 225–335 | P8: 7, P5: 1 |
+
+| after 11 s idle | 1 s before release | 10 s before release |
+|---|---|---|
+| no nudge | 237 (the row above) | – |
+| one nudge at key-down | 76, three runs 183–185 | 237, all P8 again |
+| nudge every 1000 ms | same as one | 189 |
+| nudge every 500 ms | 73, max 77 | 77, max 79 |
+| nudge every 250 ms | 72, max 75 | 76, max 79 |
+
+So the gap was the card's power state: memory clocks drop to 810 MHz within about 2 s
+and to 405 MHz (P8) by 11 s, and the next call runs 2.5–4.5 times slower. One nudge
+wears off before a 10 s utterance ends. A cold nudge takes 100–320 ms (median about
+150), a warm one 22 ms (`hush doctor`), all while the user is still speaking. Power on the card: 6.1 W at P8,
+11–12 W while nudging, so about 5–6 W extra and only while the key is held. Keeping the
+card awake for the 30 s warm-microphone window instead would cost the same 5–6 W per
+use, over the 1 W allowance, and still leave the first utterance after it cold, so it
+was rejected.
+
+`hush simulate <clip> --runs 8`, rules only, the same card, speech in the worker
+process, console session; without nudges the card idles for the hold plus about 2 s
+between runs. p50 / p95 ms from key release to transcript:
+
+| clip | `engine.gpu_nudge = false` | nudge every 500 ms | nudge every 250 ms (shipped) |
+|---|---|---|---|
+| tts 10 s | 277 / 293 | 75 / 167 (16 runs) | 75 / 114 (16 runs, one over 100) |
+| tts 3 s | 113 / 219 | 37 / 97 | 37 / 39 |
+
+At 500 ms the card still fell to P5 for about a quarter of the hold and three of 16
+releases landed there; 250 ms halved that for 0.5 W. A nudge still running at release
+delays the transcription by up to one warm pass (seen once, 24 ms). The Vulkan device
+order also moved during the day: in the RDP session it was the 05:00 card, the
+integrated GPU, the 01:00 card; in the console session the integrated GPU came first and
+05:00 was index 1 (two observations each way, cause not established). An index in
+`engine.gpu_device` therefore names a different card depending on how the user is
+logged in, and the integrated GPU takes 636 ms for the 10 s clip.
 
 ## 8. Build requirements on the development machine *(perishable, 2026-09-24)*
 
@@ -782,7 +916,8 @@ and LLVM 23 (both installed today), Vulkan SDK (installing today, for the D13 sp
 Ollama 0.34, two RTX 5060 Ti 16 GB, Ryzen 9 9900X, 93 GB RAM. Absent: CUDA toolkit
 (not needed under D2/D5), Node.js (not needed). Since the embedded LLM (milestone 3):
 Ninja 1.13 (`uv tool install ninja`) and LLVM's libclang are required, and the machine
-also has an AMD integrated GPU that Vulkan lists first, as device 0.
+also has an AMD integrated GPU, which Vulkan lists first in a console session and second
+in an RDP session (see "Speech after idle" in §7).
 
 The design was reviewed by an outside three-model panel on 2026-09-24
 (`docs/research/2026-09-24-design-review-panel.md`); D4, D5, D7, D8, D10 and D12 were

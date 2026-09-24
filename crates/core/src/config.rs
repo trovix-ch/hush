@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::gpu::{GpuRequest, GpuSelector};
 use crate::insert::{AppPolicies, AppPolicy, Chord};
 use crate::normalize::Style;
 use crate::segment::SegmenterConfig;
@@ -33,9 +34,19 @@ default_style = "casual"
 model = "parakeet-tdt-0.6b-v3-f16-gguf"
 # require-gpu | prefer-gpu | cpu-only
 gpu = "prefer-gpu"
-# Vulkan device index, as `hush doctor` lists them. Unset lets the runtime pick,
-# which may be an integrated GPU or the card running your LLM.
-# gpu_device = 1
+# Which GPU: "auto" takes the discrete card with the most free memory, so not an
+# integrated GPU and not a card another model already fills. A PCI bus id from
+# `hush doctor` ("0000:05:00.0" or "05:00") or part of the device name pins one.
+device = "auto"
+# Speech runs in hush-stt-worker.exe, next to hush.exe, so a GPU driver crash restarts
+# the worker instead of taking hush down. true runs it inside hush, for debugging; only
+# builds with the `in-process-stt` feature can.
+in_process = false
+# worker_path = 'C:\path\to\hush-stt-worker.exe'
+# An idle GPU drops its clocks after a few seconds and the next transcription runs about
+# three times slower. true runs short dummy passes while you speak so the card is awake
+# at release. Ignored when speech runs on the CPU.
+gpu_nudge = true
 
 [normalizer]
 # llama-cpp | http | rules. Dictation is rules-only until the language model has loaded,
@@ -43,8 +54,8 @@ gpu = "prefer-gpu"
 kind = "llama-cpp"
 # Model id from the download manifest; `hush doctor` downloads it.
 model = "qwen3-4b-instruct-2507-q4_k_m"
-# Vulkan device index, as `hush doctor` lists them. Unset uses engine.gpu_device.
-# gpu_device = 0
+# "auto" runs on the same GPU as speech; a PCI bus id or part of a name pins another.
+device = "auto"
 timeout_ms = 5000
 # LLM cleanup through a local OpenAI-compatible server instead, e.g. Ollama:
 # kind = "http"
@@ -109,9 +120,18 @@ pub enum GpuPolicy {
 pub struct EngineChoice {
     pub model: String,
     pub gpu: GpuPolicy,
-    /// Vulkan device index.
+    pub device: GpuSelector,
+    /// Deprecated: a Vulkan index, whose order differs between console and remote
+    /// sessions. Read, used while `device` is auto, and warned about.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_device: Option<usize>,
+    /// Speech inside the app process rather than the worker; debugging only.
+    pub in_process: bool,
+    /// Unset means the worker next to the executable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_path: Option<PathBuf>,
+    /// Wake the GPU at key-down and keep it awake while recording. Ignored on the CPU.
+    pub gpu_nudge: bool,
 }
 
 impl Default for EngineChoice {
@@ -119,8 +139,25 @@ impl Default for EngineChoice {
         Self {
             model: "parakeet-tdt-0.6b-v3-f16-gguf".into(),
             gpu: GpuPolicy::default(),
+            device: GpuSelector::Auto,
             gpu_device: None,
+            in_process: false,
+            worker_path: None,
+            gpu_nudge: true,
         }
+    }
+}
+
+impl EngineChoice {
+    pub fn gpu_request(&self) -> GpuRequest {
+        legacy_or(&self.device, self.gpu_device)
+    }
+}
+
+fn legacy_or(device: &GpuSelector, legacy: Option<usize>) -> GpuRequest {
+    match (device, legacy) {
+        (GpuSelector::Auto, Some(i)) => GpuRequest::LegacyIndex(i),
+        (s, _) => GpuRequest::Selector(s.clone()),
     }
 }
 
@@ -132,7 +169,10 @@ pub enum NormalizerChoice {
     LlamaCpp {
         #[serde(default = "default_llm_model")]
         model: String,
-        /// Vulkan device index; unset means the speech engine's device.
+        /// Auto means the speech engine's device.
+        #[serde(default)]
+        device: GpuSelector,
+        /// Deprecated, as `EngineChoice::gpu_device`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         gpu_device: Option<usize>,
         #[serde(default = "default_llm_timeout_ms")]
@@ -151,8 +191,24 @@ impl Default for NormalizerChoice {
     fn default() -> Self {
         Self::LlamaCpp {
             model: default_llm_model(),
+            device: GpuSelector::Auto,
             gpu_device: None,
             timeout_ms: default_llm_timeout_ms(),
+        }
+    }
+}
+
+impl NormalizerChoice {
+    /// `None` when the language model follows the speech engine's device.
+    pub fn gpu_request(&self) -> Option<GpuRequest> {
+        match self {
+            Self::LlamaCpp {
+                device, gpu_device, ..
+            } => match legacy_or(device, *gpu_device) {
+                GpuRequest::Selector(GpuSelector::Auto) => None,
+                r => Some(r),
+            },
+            Self::Rules | Self::Http { .. } => None,
         }
     }
 }
@@ -242,6 +298,35 @@ impl Config {
 
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         toml::to_string(self).map_err(|e| ConfigError::Serialize(e.to_string()))
+    }
+
+    /// Keys still read for one release, each with what to write instead.
+    pub fn deprecations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut index = |key: &str, i: usize, device: &GpuSelector| {
+            let effect = if *device == GpuSelector::Auto {
+                "still used for now"
+            } else {
+                "ignored, because device is set"
+            };
+            out.push(format!(
+                "{key}.gpu_device = {i} is deprecated ({effect}): Vulkan numbers the devices \
+                 differently in console and remote sessions. Write {key}.device = \"<PCI bus \
+                 id>\" from `hush doctor`, or \"auto\""
+            ));
+        };
+        if let Some(i) = self.engine.gpu_device {
+            index("engine", i, &self.engine.device);
+        }
+        if let NormalizerChoice::LlamaCpp {
+            device,
+            gpu_device: Some(i),
+            ..
+        } = &self.normalizer
+        {
+            index("normalizer", *i, device);
+        }
+        out
     }
 
     pub fn app_policies(&self) -> AppPolicies {
@@ -390,7 +475,10 @@ mod tests {
             ..Config::default()
         };
         c.engine.gpu = GpuPolicy::RequireGpu;
-        c.engine.gpu_device = Some(1);
+        c.engine.device = "0000:05:00.0".parse().unwrap();
+        c.engine.in_process = true;
+        c.engine.worker_path = Some(r"C:\hush\hush-stt-worker.exe".into());
+        c.engine.gpu_nudge = false;
         c.normalizer = NormalizerChoice::Http {
             base_url: "http://127.0.0.1:11434/v1".into(),
             model: "qwen3:4b-instruct-2507-q4_K_M".into(),
@@ -538,6 +626,7 @@ mod tests {
             Config::default().normalizer,
             NormalizerChoice::LlamaCpp {
                 model: "qwen3-4b-instruct-2507-q4_k_m".into(),
+                device: GpuSelector::Auto,
                 gpu_device: None,
                 timeout_ms: 5000,
             }
@@ -547,7 +636,8 @@ mod tests {
         let c = Config {
             normalizer: NormalizerChoice::LlamaCpp {
                 model: "other-model".into(),
-                gpu_device: Some(1),
+                device: GpuSelector::Name("RTX 5060".into()),
+                gpu_device: None,
                 timeout_ms: 800,
             },
             ..Config::default()
@@ -563,6 +653,68 @@ mod tests {
         assert!(
             Config::from_toml("[normalizer]\nkind = \"llama-cpp\"\nbase_url = \"x\"\n").is_err()
         );
+    }
+
+    #[test]
+    fn gpu_device_takes_auto_a_pci_id_or_a_name_and_never_an_index() {
+        use crate::gpu::PciAddress;
+
+        let engine = |toml: &str| Config::from_toml(&format!("[engine]\n{toml}\n"));
+        assert_eq!(
+            engine("").unwrap().engine.gpu_request(),
+            GpuRequest::Selector(GpuSelector::Auto)
+        );
+        assert_eq!(
+            engine("device = \"auto\"").unwrap().engine.device,
+            GpuSelector::Auto
+        );
+        let pci = engine("device = \"0000:05:00.0\"").unwrap();
+        assert_eq!(
+            pci.engine.device,
+            GpuSelector::Pci(PciAddress::parse("0000:05:00.0").unwrap())
+        );
+        assert!(pci.to_toml().unwrap().contains("device = \"0000:05:00.0\""));
+        assert!(matches!(
+            engine("device = \"05:00\"").unwrap().engine.device,
+            GpuSelector::Pci(PciAddress {
+                bus: 5,
+                domain: None,
+                ..
+            })
+        ));
+        assert_eq!(
+            engine("device = \"RTX 5060\"").unwrap().engine.device,
+            GpuSelector::Name("RTX 5060".into())
+        );
+        assert!(engine("device = 1").is_err());
+        assert!(engine("device = \"1\"").is_err());
+        assert!(engine("device = \"\"").is_err());
+        assert!(Config::default().deprecations().is_empty());
+
+        let legacy = Config::from_toml(
+            "[engine]\ngpu_device = 1\n[normalizer]\nkind = \"llama-cpp\"\ngpu_device = 0\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.engine.gpu_request(), GpuRequest::LegacyIndex(1));
+        assert_eq!(
+            legacy.normalizer.gpu_request(),
+            Some(GpuRequest::LegacyIndex(0))
+        );
+        let warnings = legacy.deprecations();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("engine.device"), "{}", warnings[0]);
+        assert_eq!(
+            Config::from_toml(&legacy.to_toml().unwrap()).unwrap(),
+            legacy
+        );
+
+        let both = engine("device = \"05:00\"\ngpu_device = 1").unwrap();
+        assert!(matches!(
+            both.engine.gpu_request(),
+            GpuRequest::Selector(GpuSelector::Pci(_))
+        ));
+        assert!(both.deprecations()[0].contains("ignored"));
+        assert_eq!(Config::default().normalizer.gpu_request(), None);
     }
 
     #[test]

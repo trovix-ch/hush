@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use hush_core::gpu::{self, GpuDevice, GpuKind, GpuRequest, GpuSelector, PciAddress};
 use hush_core::stt::{
     Backend, Caps, DecodeOptions, EngineInfo, SAMPLE_RATE, Segment, SttEngine, SttError, Transcript,
 };
@@ -17,9 +18,9 @@ const CANCEL_POLL: Duration = Duration::from_millis(5);
 #[derive(Debug, Clone)]
 pub struct TranscribeCppOptions {
     pub backend: Backend,
-    /// Index among Vulkan devices only. `None` lets ggml pick, which may be an integrated
-    /// GPU or the card the LLM is using.
-    pub gpu_device: Option<usize>,
+    /// PCI bus id. `None` on Vulkan applies the auto policy, never ggml's own default,
+    /// which may be an integrated GPU or the card the LLM is using.
+    pub gpu: Option<String>,
     /// `None` picks half the logical cores: ggml's spin-waiting threads lose throughput
     /// when they share a physical core.
     pub threads: Option<usize>,
@@ -29,35 +30,53 @@ impl TranscribeCppOptions {
     pub fn new(backend: Backend) -> Self {
         Self {
             backend,
-            gpu_device: None,
+            gpu: None,
             threads: None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DeviceSummary {
-    /// Position among Vulkan devices only.
-    pub index: usize,
-    pub name: String,
-    pub description: String,
-    pub device_id: Option<String>,
-    pub memory_total: u64,
+/// The one enumeration of GPUs that the worker, the app and `bench-stt` all use.
+pub fn vulkan_devices() -> Vec<GpuDevice> {
+    tc_vulkan_devices().iter().map(summary).collect()
 }
 
-pub fn vulkan_devices() -> Vec<DeviceSummary> {
+fn tc_vulkan_devices() -> Vec<tc::Device> {
     tc::devices()
         .into_iter()
         .filter(|d| d.kind.eq_ignore_ascii_case("vulkan"))
-        .enumerate()
-        .map(|(index, d)| DeviceSummary {
-            index,
-            name: d.name,
-            description: d.description,
-            device_id: d.device_id,
-            memory_total: d.memory_total,
-        })
         .collect()
+}
+
+fn summary(d: &tc::Device) -> GpuDevice {
+    GpuDevice {
+        description: d.description.trim().to_string(),
+        pci: d.device_id.clone(),
+        kind: match d.device_type {
+            tc::DeviceType::Gpu => GpuKind::Discrete,
+            tc::DeviceType::Igpu => GpuKind::Integrated,
+            _ => GpuKind::Other,
+        },
+        memory_total: d.memory_total,
+        memory_free: d.memory_free,
+    }
+}
+
+/// The device a PCI id names, or the auto policy's first choice.
+fn pick_device(gpu: Option<&str>) -> Result<tc::Device, SttError> {
+    let mut devices = tc_vulkan_devices();
+    let listed: Vec<GpuDevice> = devices.iter().map(summary).collect();
+    let request = match gpu {
+        Some(pci) => GpuRequest::Selector(GpuSelector::Pci(
+            PciAddress::parse(pci)
+                .ok_or_else(|| SttError::Backend(format!("`{pci}` is not a PCI bus id")))?,
+        )),
+        None => GpuRequest::Selector(GpuSelector::Auto),
+    };
+    let chosen = gpu::resolve(&request, &listed).map_err(SttError::Backend)?;
+    let first = chosen.order[0];
+    tracing::debug!(device = %listed[first].label(), why = %chosen.why, "Vulkan device");
+    Ok(devices.swap_remove(first))
 }
 
 pub fn library_version() -> String {
@@ -80,15 +99,11 @@ fn load_err(e: tc::Error) -> SttError {
 impl TranscribeCppEngine {
     /// Fails rather than falling back to the CPU when Vulkan was requested and no Vulkan
     /// device took the weights.
-    pub fn new(
-        model_path: &Path,
-        backend: Backend,
-        gpu_device: Option<usize>,
-    ) -> Result<Self, SttError> {
+    pub fn new(model_path: &Path, backend: Backend, gpu: Option<String>) -> Result<Self, SttError> {
         Self::with_options(
             model_path,
             TranscribeCppOptions {
-                gpu_device,
+                gpu,
                 ..TranscribeCppOptions::new(backend)
             },
         )
@@ -108,7 +123,7 @@ impl TranscribeCppEngine {
                 )));
             }
         };
-        if opts.backend == Backend::Cpu && opts.gpu_device.is_some() {
+        if opts.backend == Backend::Cpu && opts.gpu.is_some() {
             return Err(SttError::Backend(
                 "a GPU device was given for the CPU backend".into(),
             ));
@@ -116,15 +131,9 @@ impl TranscribeCppEngine {
         if opts.backend == Backend::Vulkan && !tc::backend_available(tc::Backend::Vulkan) {
             return Err(SttError::Backend("no Vulkan device is available".into()));
         }
-        let device = match opts.gpu_device {
-            None => None,
-            Some(i) => Some(
-                tc::devices()
-                    .into_iter()
-                    .filter(|d| d.kind.eq_ignore_ascii_case("vulkan"))
-                    .nth(i)
-                    .ok_or_else(|| SttError::Backend(format!("no Vulkan device with index {i}")))?,
-            ),
+        let device = match opts.backend {
+            Backend::Vulkan => Some(pick_device(opts.gpu.as_deref())?),
+            _ => None,
         };
 
         let model = tc::Model::load_with(
@@ -278,6 +287,17 @@ impl SttEngine for TranscribeCppEngine {
             let silence = vec![0.0f32; SAMPLE_RATE as usize * secs];
             self.run(&silence, &opts)?;
         }
+        Ok(())
+    }
+
+    /// One second because warm-up already built that graph shape; a new length would
+    /// compile shaders in the middle of the utterance.
+    fn nudge(&mut self) -> Result<(), SttError> {
+        if self.info.backend == Backend::Cpu {
+            return Ok(());
+        }
+        let silence = vec![0.0f32; SAMPLE_RATE as usize];
+        self.run(&silence, &DecodeOptions::default())?;
         Ok(())
     }
 
@@ -460,7 +480,7 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, SttError::Backend(_)));
-        let err = TranscribeCppEngine::new(Path::new("x.gguf"), Backend::Cpu, Some(0))
+        let err = TranscribeCppEngine::new(Path::new("x.gguf"), Backend::Cpu, Some("05:00".into()))
             .err()
             .unwrap();
         assert!(matches!(err, SttError::Backend(_)));

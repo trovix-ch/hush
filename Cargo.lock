@@ -166,6 +166,7 @@ dependencies = [
  "hound",
  "hush-core",
  "hush-stt",
+ "hush-stt-worker",
  "rubato",
  "tracing",
  "tracing-subscriber",
@@ -1382,6 +1383,7 @@ dependencies = [
  "hush-normalize",
  "hush-platform-windows",
  "hush-stt",
+ "hush-stt-worker",
  "serde_json",
  "tracing",
  "tracing-appender",
@@ -1460,8 +1462,21 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "transcribe-cpp",
  "ureq",
+ "windows",
+]
+
+[[package]]
+name = "hush-stt-worker"
+version = "0.1.0"
+dependencies = [
+ "hush-core",
+ "hush-stt",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "transcribe-cpp",
+ "windows",
 ]
 
 [[package]]

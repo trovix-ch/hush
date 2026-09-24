@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use hush_core::config::GpuPolicy;
+use hush_core::gpu::{self, GpuDevice, GpuKind, GpuRequest, GpuSelector, PciAddress};
 use hush_core::normalize::{
     AppContext, NormalizeError, NormalizeOutput, NormalizeRequest, Normalizer, Style,
 };
@@ -44,16 +45,20 @@ const ALL_LAYERS: u32 = 999;
 const PROBE: &str = "\u{1}PROBE\u{1}";
 const WARM_TRANSCRIPT: &str = "um so this is uh a short warm up sentence";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceChoice {
-    /// The first discrete GPU, else the first integrated one: Vulkan lists an iGPU first
-    /// on a desktop with both.
-    #[default]
-    FirstGpu,
-    /// PCI bus id as the driver reports it, e.g. `0000:05:00.0`; a substring matches.
-    Pci(String),
-    /// Position among the Vulkan devices, which is how `hush doctor` numbers them.
-    VulkanIndex(usize),
+    /// Resolved on llama.cpp's own device list.
+    Select(GpuSelector),
+    /// PCI bus ids in the order to try them. The caller resolved them on the speech
+    /// engine's list, so the language model lands where speech did; the PCI id is what
+    /// cannot drift between the two ggml copies.
+    Pci(Vec<String>),
+}
+
+impl Default for DeviceChoice {
+    fn default() -> Self {
+        Self::Select(GpuSelector::Auto)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,11 +75,7 @@ pub struct LlamaCppConfig {
 pub struct Device {
     /// ggml's device index, which model loading takes.
     pub ggml_index: usize,
-    pub vulkan_index: usize,
-    pub description: String,
-    /// Empty when the driver does not report one.
-    pub pci: String,
-    pub integrated: bool,
+    pub gpu: GpuDevice,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,30 +213,59 @@ pub fn vulkan_devices() -> Result<Vec<Device>, NormalizeError> {
         if !c_string(reg).eq_ignore_ascii_case("vulkan") {
             continue;
         }
+        let pci = c_string(props.device_id);
         out.push(Device {
             ggml_index: i,
-            vulkan_index: out.len(),
-            description: c_string(props.description),
-            pci: c_string(props.device_id),
-            integrated: props.type_ == llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_IGPU,
+            gpu: GpuDevice {
+                description: c_string(props.description).trim().to_string(),
+                pci: (!pci.is_empty()).then_some(pci),
+                kind: match props.type_ {
+                    llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_GPU => GpuKind::Discrete,
+                    llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_IGPU => GpuKind::Integrated,
+                    _ => GpuKind::Other,
+                },
+                memory_total: props.memory_total as u64,
+                memory_free: props.memory_free as u64,
+            },
         });
     }
     Ok(out)
 }
 
-pub fn select<'a>(choice: &DeviceChoice, devices: &'a [Device]) -> Option<&'a Device> {
+/// The devices to try in order, and why; `Err` when none matches.
+pub fn candidates<'a>(
+    choice: &DeviceChoice,
+    devices: &'a [Device],
+) -> Result<(Vec<&'a Device>, String), String> {
     match choice {
-        DeviceChoice::FirstGpu => devices
-            .iter()
-            .find(|d| !d.integrated)
-            .or_else(|| devices.first()),
-        DeviceChoice::Pci(pci) => {
-            let want = pci.trim().to_ascii_lowercase();
-            devices
-                .iter()
-                .find(|d| !want.is_empty() && d.pci.to_ascii_lowercase().contains(&want))
+        DeviceChoice::Select(sel) => {
+            let listed: Vec<GpuDevice> = devices.iter().map(|d| d.gpu.clone()).collect();
+            let r = gpu::resolve(&GpuRequest::Selector(sel.clone()), &listed)?;
+            Ok((r.order.into_iter().map(|i| &devices[i]).collect(), r.why))
         }
-        DeviceChoice::VulkanIndex(i) => devices.iter().find(|d| d.vulkan_index == *i),
+        DeviceChoice::Pci(ids) => {
+            let found: Vec<&Device> = ids
+                .iter()
+                .filter_map(|id| {
+                    let want = PciAddress::parse(id)?;
+                    devices
+                        .iter()
+                        .find(|d| d.gpu.pci_address().is_some_and(|a| want.matches(&a)))
+                })
+                .collect();
+            if found.is_empty() {
+                return Err(format!(
+                    "llama.cpp lists none of {} (it has: {})",
+                    ids.join(", "),
+                    devices
+                        .iter()
+                        .map(|d| d.gpu.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            Ok((found, "PCI ids in the caller's order".into()))
+        }
     }
 }
 
@@ -522,21 +552,29 @@ fn load_model(backend: &LlamaBackend, cfg: &LlamaCppConfig) -> Result<Loaded, No
         return Ok((load(None)?, None, None));
     }
     let devices = vulkan_devices()?;
-    let gpu_err = match select(&cfg.device, &devices) {
-        Some(d) => match load(Some(d)) {
-            Ok(m) => return Ok((m, Some(format!("{} [{}]", d.description, d.pci)), None)),
-            Err(e) => format!("loading on {} failed: {e}", d.description),
-        },
-        None => format!(
-            "no Vulkan device matches {:?} (found {})",
-            cfg.device,
-            devices
-                .iter()
-                .map(|d| format!("{} {} [{}]", d.vulkan_index, d.description, d.pci))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
+    let mut failures = Vec::new();
+    match candidates(&cfg.device, &devices) {
+        Ok((order, why)) => {
+            for d in order {
+                match load(Some(d)) {
+                    Ok(m) => {
+                        tracing::info!(device = %d.gpu.label(), %why, "language model GPU");
+                        return Ok((m, Some(d.gpu.label()), None));
+                    }
+                    Err(e) => {
+                        let failed = format!("loading on {} failed: {e}", d.gpu.label());
+                        tracing::warn!(reason = %failed, "language model GPU did not load");
+                        failures.push(failed);
+                        if cfg.gpu == GpuPolicy::RequireGpu {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => failures.push(e),
+    }
+    let gpu_err = failures.join("; ");
     if cfg.gpu == GpuPolicy::RequireGpu {
         return Err(NormalizeError::Unavailable(format!(
             "gpu = \"require-gpu\" and {gpu_err}"
@@ -586,42 +624,51 @@ impl Normalizer for LlamaCppNormalizer {
 mod tests {
     use super::*;
 
-    fn dev(ggml_index: usize, vulkan_index: usize, pci: &str) -> Device {
+    fn dev(ggml_index: usize, pci: &str, free_gib: u64) -> Device {
         Device {
             ggml_index,
-            vulkan_index,
-            description: format!("GPU {vulkan_index}"),
-            pci: pci.into(),
-            integrated: pci.is_empty(),
+            gpu: GpuDevice {
+                description: format!("GPU {ggml_index}"),
+                pci: (!pci.is_empty()).then(|| pci.to_string()),
+                kind: if pci.is_empty() {
+                    GpuKind::Integrated
+                } else {
+                    GpuKind::Discrete
+                },
+                memory_total: 16 << 30,
+                memory_free: free_gib << 30,
+            },
         }
     }
 
-    #[test]
-    fn device_is_chosen_by_pci_id_or_vulkan_index() {
-        let devs = [dev(0, 0, "0000:01:00.0"), dev(1, 1, "0000:05:00.0")];
-        let pick = |c: DeviceChoice| select(&c, &devs).map(|d| d.ggml_index);
-        assert_eq!(pick(DeviceChoice::FirstGpu), Some(0));
-        assert_eq!(pick(DeviceChoice::Pci("05:00".into())), Some(1));
-        assert_eq!(pick(DeviceChoice::Pci("0000:01:00.0".into())), Some(0));
-        assert_eq!(pick(DeviceChoice::Pci("09:00".into())), None);
-        assert_eq!(pick(DeviceChoice::Pci(" ".into())), None);
-        assert_eq!(pick(DeviceChoice::VulkanIndex(1)), Some(1));
-        assert_eq!(pick(DeviceChoice::VulkanIndex(2)), None);
-        assert_eq!(select(&DeviceChoice::FirstGpu, &[]), None);
+    fn pick(c: DeviceChoice, devs: &[Device]) -> Vec<usize> {
+        candidates(&c, devs)
+            .map(|(order, _)| order.iter().map(|d| d.ggml_index).collect())
+            .unwrap_or_default()
     }
 
     #[test]
-    fn default_device_skips_an_integrated_gpu_listed_first() {
-        let desktop = [dev(0, 0, ""), dev(1, 1, "0000:05:00.0")];
-        assert_eq!(
-            select(&DeviceChoice::FirstGpu, &desktop).map(|d| d.vulkan_index),
-            Some(1)
-        );
-        let laptop = [dev(0, 0, "")];
-        assert_eq!(
-            select(&DeviceChoice::FirstGpu, &laptop).map(|d| d.vulkan_index),
-            Some(0)
-        );
+    fn device_is_chosen_by_pci_id_in_the_callers_order() {
+        let devs = [dev(1, "0000:01:00.0", 15), dev(2, "0000:05:00.0", 15)];
+        let pci = |ids: &[&str]| DeviceChoice::Pci(ids.iter().map(|s| s.to_string()).collect());
+        assert_eq!(pick(pci(&["0000:05:00.0"]), &devs), [2]);
+        assert_eq!(pick(pci(&["05:00", "01:00"]), &devs), [2, 1]);
+        assert_eq!(pick(pci(&["09:00", "01:00"]), &devs), [1]);
+        assert!(candidates(&pci(&["09:00"]), &devs).is_err());
+        assert!(candidates(&pci(&[" "]), &devs).is_err());
+    }
+
+    #[test]
+    fn auto_skips_an_integrated_gpu_and_a_busy_card() {
+        let desktop = [
+            dev(0, "", 40),
+            dev(1, "0000:01:00.0", 9),
+            dev(2, "0000:05:00.0", 15),
+        ];
+        assert_eq!(pick(DeviceChoice::default(), &desktop), [2, 1]);
+        let laptop = [dev(0, "", 8)];
+        assert_eq!(pick(DeviceChoice::default(), &laptop), [0]);
+        assert!(candidates(&DeviceChoice::default(), &[]).is_err());
     }
 
     #[test]
@@ -654,7 +701,7 @@ mod tests {
             model_path: path.into(),
             model_id: "test".into(),
             device: std::env::var("HUSH_TEST_LLAMA_PCI")
-                .map_or(DeviceChoice::FirstGpu, DeviceChoice::Pci),
+                .map_or(DeviceChoice::default(), |p| DeviceChoice::Pci(vec![p])),
             gpu: GpuPolicy::RequireGpu,
             timeout: DEFAULT_TIMEOUT,
         })

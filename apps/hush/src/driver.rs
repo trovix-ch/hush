@@ -19,6 +19,7 @@ use hush_core::normalize::{Provenance, Style};
 use hush_core::notify::{Notifier, OverlayState as CoreOverlay, Sound};
 use hush_core::pipeline::{Effect, Event, Failure, Pipeline, PipelineConfig, Stage};
 use hush_core::recorder::{Recorder, RecorderConfig};
+use hush_core::stt::Backend;
 use hush_platform_windows::focus::WinFocus;
 use hush_platform_windows::hook::{HookHandle, HotkeyConfig, HotkeyEvent, HotkeyHook};
 use hush_platform_windows::overlay::OverlayState;
@@ -30,13 +31,67 @@ use hush_platform_windows::ui_thread::{
 use crate::engines::{self, EngineSummary, NormalizerReady};
 use crate::setup::{self, Paths};
 use crate::workers::{
-    self, EngineLoader, InsertCmd, NormCmd, NormJob, SttJob, Timers, Vocabulary, outcome_label,
+    self, EngineLoader, InsertCmd, NormCmd, NormJob, SttCmd, SttJob, Timers, Vocabulary,
+    outcome_label,
 };
 
 const LEVEL_PERIOD: Duration = Duration::from_millis(50);
 
 /// Older text is more likely a different thought than the start of this one.
 const PREVIOUS_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// At 500 ms the card still dropped a power state for a quarter of the hold, and a
+/// release landing there took twice as long; 1000 ms kept nothing awake.
+const GPU_NUDGE_EVERY: Duration = Duration::from_millis(250);
+
+/// When to wake the speech GPU. An idle card falls to its lowest power state within
+/// seconds and the next transcription then runs about three times slower, so the nudges
+/// start at key-down and repeat for as long as the user speaks.
+#[derive(Debug)]
+struct GpuNudge {
+    wanted: bool,
+    on_gpu: bool,
+    /// Set while recording.
+    last: Option<Instant>,
+}
+
+impl GpuNudge {
+    fn new(wanted: bool) -> Self {
+        Self {
+            wanted,
+            on_gpu: false,
+            last: None,
+        }
+    }
+
+    fn engine_loaded(&mut self, backend: Backend) {
+        self.on_gpu = backend != Backend::Cpu;
+    }
+
+    /// Whether to nudge now, at recording start.
+    fn start(&mut self, now: Instant) -> bool {
+        if !(self.wanted && self.on_gpu) {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    /// Whether to nudge again, while still recording.
+    fn tick(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(t) if now.saturating_duration_since(t) >= GPU_NUDGE_EVERY => {
+                self.last = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.last = None;
+    }
+}
 
 /// The pipeline has already required the same app and a delivered insertion; the age
 /// check is here because only the driver sees the clock when the insertion landed.
@@ -107,7 +162,7 @@ pub enum Observed {
 }
 
 pub struct Workers {
-    pub stt: Sender<SttJob>,
+    pub stt: Sender<SttCmd>,
     pub norm: Sender<NormCmd>,
     pub insert: Sender<InsertCmd>,
     pub timers: Timers,
@@ -192,6 +247,7 @@ pub struct Driver {
     paused: bool,
     config_path: PathBuf,
     gpu_policy: GpuPolicy,
+    gpu_nudge: GpuNudge,
     engine: Option<String>,
     normalizer: String,
     observer: Option<Sender<Observed>>,
@@ -236,6 +292,7 @@ impl Driver {
             paused: false,
             config_path: p.config_path,
             gpu_policy: p.config.engine.gpu,
+            gpu_nudge: GpuNudge::new(p.config.engine.gpu_nudge),
             engine: None,
             normalizer: "rules".into(),
             observer: p.observer,
@@ -272,6 +329,9 @@ impl Driver {
                 let level = self.level.update(self.recorder.level(), dt);
                 self.notifier.set_state(CoreOverlay::Listening { level });
                 self.stream_audio();
+                if self.gpu_nudge.tick(Instant::now()) {
+                    self.nudge();
+                }
             }
             if let Some(h) = &self.hook {
                 h.set_escape_armed(self.pipeline.is_active());
@@ -481,6 +541,7 @@ impl Driver {
     fn on_engine_ready(&mut self, r: std::result::Result<EngineSummary, String>) {
         match r {
             Ok(s) => {
+                self.gpu_nudge.engine_loaded(s.backend);
                 tracing::info!(
                     model = %s.model,
                     backend = ?s.backend,
@@ -562,6 +623,10 @@ impl Driver {
         });
     }
 
+    fn nudge(&self) {
+        let _ = self.workers.stt.send(SttCmd::Nudge);
+    }
+
     fn token(&mut self, id: UtteranceId) -> CancelToken {
         self.tokens.entry(id).or_default().clone()
     }
@@ -575,6 +640,9 @@ impl Driver {
                     Ok(()) => {
                         self.recording = Some(id);
                         self.vad.reset();
+                        if self.gpu_nudge.start(Instant::now()) {
+                            self.nudge();
+                        }
                         None
                     }
                     Err(e) => {
@@ -585,6 +653,7 @@ impl Driver {
             }
             Effect::StopRecording(id) => {
                 self.recording = None;
+                self.gpu_nudge.stop();
                 match self.recorder.stop() {
                     Ok(rec) => {
                         if rec.dropped_frames > 0 || rec.device_lost {
@@ -598,6 +667,7 @@ impl Driver {
             }
             Effect::DiscardRecording(_) => {
                 self.recording = None;
+                self.gpu_nudge.stop();
                 self.recorder.cancel();
                 None
             }
@@ -620,12 +690,12 @@ impl Driver {
                 });
                 self.workers
                     .stt
-                    .send(SttJob {
+                    .send(SttCmd::Job(SttJob {
                         id,
                         segment_index,
                         pcm,
                         cancel,
-                    })
+                    }))
                     .err()
                     .map(|_| {
                         Event::Failed(
@@ -780,7 +850,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         hotkey = %config.hotkey,
         model = %model.id,
         gpu = ?config.engine.gpu,
-        gpu_device = ?config.engine.gpu_device,
+        device = ?config.engine.device,
         remote_session = hush_platform_windows::focus::is_remote_session(),
         elevated = hush_platform_windows::focus::self_elevated(),
         "starting"
@@ -903,5 +973,51 @@ mod tests {
         assert_eq!(recent_previous(prev(), ago(300), now), None);
         assert_eq!(recent_previous(prev(), None, now), None);
         assert_eq!(recent_previous(None, ago(1), now), None);
+    }
+
+    fn nudges(n: &mut GpuNudge, start: Instant, ticks: &[u64]) -> usize {
+        let mut sent = usize::from(n.start(start));
+        for &ms in ticks {
+            sent += usize::from(n.tick(start + Duration::from_millis(ms)));
+        }
+        n.stop();
+        sent
+    }
+
+    #[test]
+    fn a_recording_start_nudges_exactly_once() {
+        let mut n = GpuNudge::new(true);
+        n.engine_loaded(Backend::Vulkan);
+        let t0 = Instant::now();
+        let short: Vec<u64> = (1..GPU_NUDGE_EVERY.as_millis() as u64)
+            .step_by(50)
+            .collect();
+        assert_eq!(nudges(&mut n, t0, &short), 1);
+        assert_eq!(nudges(&mut n, t0 + Duration::from_secs(20), &short), 1);
+    }
+
+    #[test]
+    fn nudges_repeat_while_recording_and_stop_with_it() {
+        let mut n = GpuNudge::new(true);
+        n.engine_loaded(Backend::Vulkan);
+        let t0 = Instant::now();
+        let every = GPU_NUDGE_EVERY.as_millis() as u64;
+        let ticks: Vec<u64> = (1..=10 * every + 1).step_by(50).collect();
+        assert_eq!(nudges(&mut n, t0, &ticks), 11);
+        assert!(!n.tick(t0 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn no_nudge_when_disabled_on_the_cpu_or_before_the_engine_loads() {
+        let t0 = Instant::now();
+        let ticks = [5_000, 10_000];
+        let mut off = GpuNudge::new(false);
+        off.engine_loaded(Backend::Vulkan);
+        assert_eq!(nudges(&mut off, t0, &ticks), 0);
+        let mut cpu = GpuNudge::new(true);
+        cpu.engine_loaded(Backend::Cpu);
+        assert_eq!(nudges(&mut cpu, t0, &ticks), 0);
+        let mut loading = GpuNudge::new(true);
+        assert_eq!(nudges(&mut loading, t0, &ticks), 0);
     }
 }
