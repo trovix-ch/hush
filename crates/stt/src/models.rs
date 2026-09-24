@@ -175,8 +175,19 @@ pub fn find(id: &str) -> Result<&'static ModelManifest, ModelError> {
         .ok_or_else(|| ModelError::UnknownModel(id.to_string()))
 }
 
+/// Names a models directory to use instead of the default, for a first-run test that must
+/// not touch the real models, or for models kept on another drive.
+pub const MODELS_DIR_ENV: &str = "HUSH_MODELS_DIR";
+
 /// Local, not Roaming: these are gigabytes and must never sync with a roaming profile.
 pub fn default_models_root() -> Result<PathBuf, ModelError> {
+    models_root(std::env::var_os(MODELS_DIR_ENV))
+}
+
+fn models_root(override_dir: Option<std::ffi::OsString>) -> Result<PathBuf, ModelError> {
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     let dirs = directories::ProjectDirs::from("", "", "hush").ok_or(ModelError::NoDataDir)?;
     Ok(models_root_from_data_local(dirs.data_local_dir()))
 }
@@ -195,21 +206,48 @@ pub fn default_model_dir(model_id: &str) -> Result<PathBuf, ModelError> {
     Ok(default_models_root()?.join(model_id))
 }
 
+/// Bytes of the whole model on disk so far, partial files included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub done: u64,
+    pub total: u64,
+}
+
 /// Blocking; resumes partial downloads.
 pub fn ensure_downloaded(model: &ModelManifest, dir: &Path) -> Result<(), ModelError> {
+    ensure_downloaded_with(model, dir, &mut |_| {})
+}
+
+/// As [`ensure_downloaded`]; `progress` hears every chunk written, so it must be cheap.
+pub fn ensure_downloaded_with(
+    model: &ModelManifest,
+    dir: &Path,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<(), ModelError> {
     fs::create_dir_all(dir).map_err(io_err(dir))?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
         .build()
         .into();
+    let total = model.total_size();
+    let mut finished = 0;
     for file in &model.files {
         let dest = dir.join(&file.name);
-        if fs::metadata(&dest).is_ok_and(|m| m.len() == file.size) {
-            continue;
+        if !fs::metadata(&dest).is_ok_and(|m| m.len() == file.size) {
+            tracing::info!(model = %model.id, file = %file.name, size = file.size, "downloading");
+            download_file(&agent, file, &dest, &mut |done| {
+                progress(Progress {
+                    done: finished + done,
+                    total,
+                })
+            })?;
         }
-        tracing::info!(model = %model.id, file = %file.name, size = file.size, "downloading");
-        download_file(&agent, file, &dest)?;
+        finished += file.size;
+        progress(Progress {
+            done: finished,
+            total,
+        });
     }
     Ok(())
 }
@@ -220,7 +258,12 @@ fn part_path(dest: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn download_file(agent: &ureq::Agent, file: &ModelFile, dest: &Path) -> Result<(), ModelError> {
+fn download_file(
+    agent: &ureq::Agent,
+    file: &ModelFile,
+    dest: &Path,
+    progress: &mut dyn FnMut(u64),
+) -> Result<(), ModelError> {
     let part = part_path(dest);
     let mut have = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
     if have > file.size {
@@ -259,7 +302,7 @@ fn download_file(agent: &ureq::Agent, file: &ModelFile, dest: &Path) -> Result<(
             have = 0;
         }
         let mut reader = resp.into_body().into_reader();
-        copy_with_progress(&mut reader, &mut out, file, have, &part)?;
+        copy_with_progress(&mut reader, &mut out, file, have, &part, progress)?;
         out.sync_all().map_err(io_err(&part))?;
     }
 
@@ -293,11 +336,13 @@ fn copy_with_progress(
     file: &ModelFile,
     start: u64,
     part: &Path,
+    progress: &mut dyn FnMut(u64),
 ) -> Result<(), ModelError> {
     let mut buf = vec![0u8; 1 << 20];
     let mut done = start;
     let began = Instant::now();
     let mut last_log = Instant::now();
+    progress(done);
     loop {
         let n = reader.read(&mut buf).map_err(|e| ModelError::Http {
             url: file.url.clone(),
@@ -308,6 +353,7 @@ fn copy_with_progress(
         }
         out.write_all(&buf[..n]).map_err(io_err(part))?;
         done += n as u64;
+        progress(done);
         if last_log.elapsed() >= Duration::from_secs(5) {
             last_log = Instant::now();
             let secs = began.elapsed().as_secs_f64().max(1e-3);
@@ -462,11 +508,28 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn default_model_dir_is_under_local_app_data() {
+        if std::env::var_os(MODELS_DIR_ENV).is_some() {
+            eprintln!("skipped: {MODELS_DIR_ENV} is set");
+            return;
+        }
         let dir = default_model_dir("parakeet-tdt-0.6b-v3").unwrap();
         assert!(dir.ends_with(r"hush\models\parakeet-tdt-0.6b-v3"));
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             assert!(dir.starts_with(local));
         }
+    }
+
+    #[test]
+    fn a_models_dir_override_wins_unless_empty() {
+        assert_eq!(
+            models_root(Some("D:/scratch/models".into())).unwrap(),
+            Path::new("D:/scratch/models")
+        );
+        assert_ne!(
+            models_root(Some("".into())).unwrap(),
+            Path::new(""),
+            "an empty override falls back to the default"
+        );
     }
 
     #[test]

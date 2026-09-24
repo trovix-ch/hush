@@ -40,8 +40,16 @@ GPU driver crashes the worker, hush loses that one utterance and restarts it.
 `--features in-process-stt` adds `engine.in_process = true`, speech inside hush for
 debugging, which then needs the `transcribe.dll` and `ggml*.dll` built next to it.
 
-- `hush` runs the app. Hold **Right Ctrl**, speak, release. Tray → Quit (or
-  Ctrl+C in its console) exits.
+- `hush` runs the app. Hold **Right Ctrl**, speak, release. Tray → Quit exits. On
+  the first start it downloads whatever model is missing, speech first, with the
+  progress in the overlay pill; dictation works rules-only once speech is in, and a
+  failed download resumes from the tray's "Retry download". The tray's "Start with
+  Windows" writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\hush` and
+  `start_with_windows` in the config; the app re-points the entry if `hush.exe` moved.
+- hush is a Windows-subsystem program so that it opens no console window, at the price
+  that a shell no longer waits for `doctor` or `simulate` and their output lands after
+  the next prompt unless piped (`hush doctor | Out-Host`); with no terminal to attach
+  to, they write to `%LOCALAPPDATA%\hush\logs\console.log`.
 - `hush doctor` checks microphone, GPUs, the speech and language models (downloads
   them if missing), engine load and the normalizer.
 - `hush simulate <wav> [--target notepad|foreground] [--runs N]` runs one
@@ -54,7 +62,13 @@ debugging, which then needs the `transcribe.dll` and `ggml*.dll` built next to i
   name; with two GPUs, pin speech to the one not running another LLM server. Device
   indexes are not accepted: Windows numbers the GPUs differently in console and
   remote sessions. The old `gpu_device` index still works for now, with a warning.
-  Logs: `%LOCALAPPDATA%\hush\logs\`.
+  Logs: `%LOCALAPPDATA%\hush\logs\`. Models: `%LOCALAPPDATA%\hush\models\`, or the
+  directory in `HUSH_MODELS_DIR` (to try the first run without touching the real
+  models, or to keep them on another drive).
+- `tools\release\release.ps1` builds both executables, checks with `dumpbin` that they
+  load only system DLLs, the VC++ runtime and the Vulkan loader, and writes
+  `target\release\hush-<version>-windows-x64.zip` with the licences and a README.
+  `.github/workflows/ci.yml` runs the gates and a release build on `windows-latest`.
 
 ## Principles
 

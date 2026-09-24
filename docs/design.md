@@ -48,7 +48,10 @@ implementations get selected.
   states and a live level meter. It never takes focus.
 - A short **start/stop sound**, played before the microphone opens.
 - **Tray icon** with: pause, paste last transcript, copy last transcript, open config,
-  quit. No main window in v1; configuration is a TOML file opened in the editor.
+  start with Windows (per-user Run key, no admin), retry download, about, quit. Its
+  colour shows state: gray idle or paused, green listening, amber processing, red on
+  error. No main window and no console window; configuration is a TOML file opened in
+  the editor, and `doctor`/`simulate` attach to the terminal they were started from.
 - **Personal dictionary**: a list of words and phrases spelled exactly as the user wants.
 - **Per-app rules** keyed on executable name: paste method, style (formal / casual /
   code / none), and "never insert here".
@@ -274,7 +277,14 @@ Rules the hook must obey (from the Windows contract and prior-art bugs):
   unhook on the owning thread, reinstall, and end the current recording as if the key
   was released. Recovery from a stalled callback takes about 1.5 s because only the
   hook thread may reinstall and it is the one stalled. Keystrokes between removal and
-  reinstall are lost; that is inherent and accepted.
+  reinstall are lost; that is inherent and accepted. Amended 2026-09-24: measured here, a
+  callback that overruns the timeout (about 300 ms per event) loses only that event and
+  the hook stays installed even through a 6 s stall, so under load a disagreement is
+  only a suspicion and the watchdog reinstalls only after three tagged probes about
+  250 ms apart all go unanswered, which rides out an 800 ms stall and still recovers a
+  silently removed hook in about 0.9 s. The remaining edge: a release dropped during
+  such a lag is invisible (a swallowed key never shows in the physical key state), so
+  the recording runs on until the next press, Escape or the duration cap.
 - If the foreground window is elevated and we are not, the hook sees nothing; detect
   and tell the user rather than fail silently. Confirmed by hand 2026-09-24: the
   hotkey simply does nothing in an admin window. Since no event arrives, the warning
@@ -407,6 +417,13 @@ Models are downloaded on first run from a manifest (URL, size, SHA-256, license)
 resume and hash verification, into `%LOCALAPPDATA%` so they never roam. Parakeet is
 CC-BY-4.0 and the attribution is shown in the tray "about" entry. The binary ships with
 no models embedded.
+
+*Amended 2026-09-24 (milestone 3):* the app provisions itself. On launch with models
+missing it starts anyway, downloads them one at a time with speech first while a
+persistent overlay pill shows progress, brings each engine up as its model lands, and
+is usable rules-only as soon as speech is ready. A failed download leaves an alert pill
+up until acted on and a "Retry download" tray entry; a transient notice may pass over it
+but never clears it. `doctor` remains the diagnostic, not a prerequisite.
 
 ### D12. Crash isolation for GPU inference ships with the first self-contained build
 Handy's worst Windows bugs are Vulkan device-lost crashes taking the app down. Running
@@ -587,7 +604,9 @@ most tests. `platform-windows` is `cfg(windows)`.
   that smoke test passes.
 - **M3 — self-contained.** Embedded llama.cpp (Vulkan) as the default normalizer,
   model downloader with first-run flow, inference in a child process (D12),
-  run-at-startup. The first build for people who are not us.
+  run-at-startup. The first build for people who are not us. *Reached 2026-09-24:*
+  a release zip holds `hush.exe`, `hush-stt-worker.exe`, licences and attributions;
+  both depend only on system DLLs, the VC++ runtime and the Vulkan loader.
 - **M4 — breadth and Tier 2.** Whisper engine (Vulkan) for the long-tail languages,
   CPU-only defaults with the punctuation model, per-app overrides UI, command mode on
   selected text, installer.

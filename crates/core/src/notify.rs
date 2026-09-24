@@ -38,6 +38,16 @@ pub enum OverlayState {
     Error {
         message: String,
     },
+    /// Long-running work outside dictation, shown until replaced. `fraction` in
+    /// `0.0..=1.0`.
+    Progress {
+        message: String,
+        fraction: f32,
+    },
+    /// An error that stays up until replaced, because the user has to act on it.
+    Alert {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +65,10 @@ pub trait Notifier: Send {
     fn play(&mut self, sound: Sound);
     /// A message that outlives the overlay.
     fn toast(&mut self, message: &str);
+    /// Shown whenever the overlay would otherwise be hidden, so work outside dictation (a
+    /// model download, a failure the user must act on) survives the transient states
+    /// that pass over it. `None` clears it.
+    fn set_background(&mut self, state: Option<OverlayState>);
 }
 
 #[cfg(test)]

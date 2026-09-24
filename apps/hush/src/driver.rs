@@ -29,7 +29,9 @@ use hush_platform_windows::ui_thread::{
 };
 
 use crate::engines::{self, EngineSummary, NormalizerReady};
+use crate::provision::{self, DownloadEvent, DownloadState, Needed, Role};
 use crate::setup::{self, Paths};
+use crate::startup;
 use crate::workers::{
     self, EngineLoader, InsertCmd, NormCmd, NormJob, SttCmd, SttJob, Timers, Vocabulary,
     outcome_label,
@@ -123,7 +125,20 @@ pub enum Msg {
     PasteLastDone(std::result::Result<InsertOutcome, InsertError>),
     /// Shown until replaced, unlike a toast.
     Status(String),
+    Download(DownloadEvent),
+    /// A voice detector loaded after its model arrived; it replaces the running one
+    /// between recordings, never during one.
+    VadReady(Box<dyn Vad>, String),
     Quit,
+}
+
+/// What the first-run downloader left the driver to handle.
+#[derive(Default)]
+pub struct FirstRun {
+    /// Dictation cannot start until the speech model is on disk.
+    pub speech_pending: bool,
+    /// Tells the downloader to try a failed model again.
+    pub retry: Option<Sender<()>>,
 }
 
 /// Carries no ids because a simulation runs one utterance at a time.
@@ -255,6 +270,11 @@ pub struct Driver {
     level: LevelBallistics,
     last_delivered: Option<Instant>,
     app_override: Option<AppOverride>,
+    pending_vad: Option<Box<dyn Vad>>,
+    first_run: FirstRun,
+    /// The latest download news, until its model is done.
+    download: Option<DownloadEvent>,
+    start_with_windows: bool,
 }
 
 pub struct DriverParts {
@@ -269,11 +289,13 @@ pub struct DriverParts {
     pub rx: Receiver<Msg>,
     pub observer: Option<Sender<Observed>>,
     pub app_override: Option<AppOverride>,
+    pub first_run: FirstRun,
 }
 
 impl Driver {
     pub fn new(p: DriverParts) -> Self {
         Self {
+            start_with_windows: p.config.start_with_windows,
             pipeline: Pipeline::new(PipelineConfig::from_config(&p.config)),
             recorder: p.recorder,
             vad: p.vad,
@@ -300,6 +322,9 @@ impl Driver {
             level: LevelBallistics::default(),
             last_delivered: None,
             app_override: p.app_override,
+            pending_vad: None,
+            first_run: p.first_run,
+            download: None,
         }
     }
 
@@ -421,8 +446,59 @@ impl Driver {
                     self.ui.set_overlay(OverlayState::Status { message: s });
                 }
             }
+            Msg::Download(ev) => self.on_download(ev),
+            Msg::VadReady(vad, label) => {
+                tracing::info!(vad = %label, "voice detection upgraded");
+                if self.pipeline.is_recording() {
+                    self.pending_vad = Some(vad);
+                } else {
+                    self.vad = vad;
+                }
+            }
         }
         true
+    }
+
+    /// Downloads live in the overlay's background, so a dictation or a notice passes over
+    /// them and they come back when it hides.
+    fn on_download(&mut self, ev: DownloadEvent) {
+        let quiet = self.pipeline.is_active() || self.paused;
+        match &ev.state {
+            DownloadState::Progress(_) => {
+                self.notifier.set_background(Some(ev.overlay()));
+                self.download = Some(ev);
+            }
+            DownloadState::Done => {
+                tracing::info!(model = ev.role.label(), "downloaded and verified");
+                self.download = None;
+                self.notifier.set_background(None);
+                if ev.role == Role::Speech {
+                    self.first_run.speech_pending = false;
+                    if !quiet {
+                        self.ui.set_overlay(OverlayState::Status {
+                            message: "Loading speech model…".into(),
+                        });
+                    }
+                }
+            }
+            DownloadState::Failed(_) => {
+                self.ui.set_retry_enabled(true);
+                self.notifier.play(Sound::Error);
+                self.notifier.set_background(Some(ev.overlay()));
+                // A loading status would otherwise hold the failure back until it cleared.
+                if !quiet {
+                    self.notifier.set_state(ev.overlay());
+                }
+                self.download = Some(ev);
+            }
+        }
+        self.update_tooltip();
+    }
+
+    fn download_failed(&self) -> bool {
+        self.download
+            .as_ref()
+            .is_some_and(|d| matches!(d.state, DownloadState::Failed(_)))
     }
 
     fn observe_event(&self, ev: &Event) {
@@ -453,6 +529,14 @@ impl Driver {
                 // The hook stays installed while paused so the key is still swallowed
                 // rather than typing a stray Ctrl into the target.
                 if self.paused {
+                    return;
+                }
+                if self.first_run.speech_pending {
+                    tracing::info!("hotkey before the speech model arrived");
+                    self.notifier.play(Sound::Error);
+                    if let Some(d) = &self.download {
+                        self.notifier.set_state(d.overlay());
+                    }
                     return;
                 }
                 let t = Instant::now();
@@ -533,9 +617,54 @@ impl Driver {
                     tracing::warn!(error = %e, path = %self.config_path.display(), "could not open the config");
                 }
             }
+            TrayEvent::RetryDownload => {
+                // The entry can be clicked once more before its disable lands; a queued
+                // retry would then silently eat the next failure.
+                if self.download_failed()
+                    && let Some(retry) = &self.first_run.retry
+                    && retry.send(()).is_ok()
+                {
+                    self.ui.set_retry_enabled(false);
+                    self.download = None;
+                    let retrying = CoreOverlay::Progress {
+                        message: "Retrying the download…".into(),
+                        fraction: 0.0,
+                    };
+                    self.notifier.set_background(Some(retrying.clone()));
+                    self.notifier.set_state(retrying);
+                    self.update_tooltip();
+                }
+            }
+            TrayEvent::ToggleStartWithWindows => self.toggle_start_with_windows(),
             TrayEvent::About => self.ui.show_about(),
         }
         true
+    }
+
+    fn toggle_start_with_windows(&mut self) {
+        let want = !self.start_with_windows;
+        let applied = std::env::current_exe()
+            .context("locating hush.exe")
+            .and_then(|exe| startup::set(want, &exe, &self.config_path));
+        match applied {
+            Ok(()) => {
+                tracing::info!(start_with_windows = want, "start with Windows toggled");
+                self.start_with_windows = want;
+                self.notifier.toast(if want {
+                    "hush will start with Windows"
+                } else {
+                    "hush will not start with Windows"
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "start with Windows");
+                self.ui.set_overlay(OverlayState::Error {
+                    message: format!("Start with Windows: {e:#}"),
+                });
+            }
+        }
+        // The menu ticked itself on the click; this puts it back to the truth on failure.
+        self.ui.set_start_with_windows(self.start_with_windows);
     }
 
     fn on_engine_ready(&mut self, r: std::result::Result<EngineSummary, String>) {
@@ -581,9 +710,18 @@ impl Driver {
     }
 
     fn update_tooltip(&self) {
-        let engine = self.engine.as_deref().unwrap_or("loading model…");
+        let engine = if self.first_run.speech_pending {
+            "no speech model yet"
+        } else {
+            self.engine.as_deref().unwrap_or("loading model…")
+        };
+        let download = self
+            .download
+            .as_ref()
+            .map(|d| format!(" · {}", d.short()))
+            .unwrap_or_default();
         self.ui
-            .set_tooltip(format!("hush · {engine} · {}", self.normalizer));
+            .set_tooltip(format!("hush · {engine} · {}{download}", self.normalizer));
     }
 
     fn feed(&mut self, ev: Event) {
@@ -636,6 +774,9 @@ impl Driver {
             Effect::StartRecording(id) => {
                 self.level.reset();
                 self.last_level = Instant::now();
+                if let Some(v) = self.pending_vad.take() {
+                    self.vad = v;
+                }
                 match self.recorder.start() {
                     Ok(()) => {
                         self.recording = Some(id);
@@ -832,8 +973,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
     let _instance = match ui_thread::acquire_single_instance(INSTANCE_MUTEX) {
         Ok(g) => g,
         Err(UiError::AlreadyRunning) => {
-            eprintln!("hush is already running in this session (see the tray).");
-            return Ok(std::process::ExitCode::FAILURE);
+            anyhow::bail!("hush is already running in this session (see the tray).")
         }
         Err(e) => return Err(e).context("single-instance check"),
     };
@@ -845,25 +985,39 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         )
     })?;
     let (model, model_dir) = engines::resolve_model(&config.engine)?;
+    let needed = provision::missing(&config)?;
+    let speech_pending = needed.iter().any(|n| n.role == Role::Speech);
+    let llm_pending = needed.iter().any(|n| n.role == Role::Language);
     tracing::info!(
         config = %paths.config_file.display(),
         hotkey = %config.hotkey,
         model = %model.id,
         gpu = ?config.engine.gpu,
         device = ?config.engine.device,
+        missing = ?needed.iter().map(|n| n.model.id.as_str()).collect::<Vec<_>>(),
         remote_session = hush_platform_windows::focus::is_remote_session(),
         elevated = hush_platform_windows::focus::self_elevated(),
         "starting"
     );
+    sync_start_with_windows(config.start_with_windows);
 
     let (ui, tray_rx) = UiHandle::start(UiOptions {
         tray: true,
         ..Default::default()
     })?;
-    ui.set_tooltip("hush · loading model…");
-    ui.set_overlay(OverlayState::Status {
-        message: "Loading speech model…".into(),
-    });
+    ui.set_start_with_windows(config.start_with_windows);
+    if speech_pending {
+        ui.set_tooltip("hush · downloading the speech model");
+        ui.set_background(OverlayState::Progress {
+            message: "Preparing the speech model download…".into(),
+            fraction: 0.0,
+        });
+    } else {
+        ui.set_tooltip("hush · loading model…");
+        ui.set_overlay(OverlayState::Status {
+            message: "Loading speech model…".into(),
+        });
+    }
 
     let (tx, rx) = mpsc::channel::<Msg>();
     {
@@ -895,17 +1049,36 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
     );
 
     let engine_choice = config.engine.clone();
-    let status = tx.clone();
+    let (speech_arrived, speech_gate) = mpsc::channel::<()>();
     let load: EngineLoader = Box::new(move || {
-        if !model.is_present(&model_dir) {
-            let _ = status.send(Msg::Status("Downloading speech model…".into()));
-            hush_stt::models::ensure_downloaded(model, &model_dir)?;
+        if speech_pending {
+            speech_gate
+                .recv()
+                .map_err(|_| anyhow::anyhow!("the speech model download stopped"))?;
         }
         engines::load_engine(&engine_choice, &model.load_path(&model_dir))
     });
     let vocabulary = Vocabulary::from_config(&config, &paths.config_file);
     let workers = Workers::spawn(&config, vocabulary, &ui, &focus, load, &tx)?;
-    spawn_normalizer_upgrade(&config, workers.norm.clone(), tx.clone());
+    if !llm_pending {
+        spawn_normalizer_upgrade(&config, workers.norm.clone(), tx.clone());
+    }
+    let mut first_run = FirstRun {
+        speech_pending,
+        retry: None,
+    };
+    if !needed.is_empty() {
+        let (retry_tx, retry_rx) = mpsc::channel();
+        first_run.retry = Some(retry_tx);
+        spawn_downloader(
+            needed,
+            retry_rx,
+            speech_arrived,
+            &config,
+            workers.norm.clone(),
+            tx.clone(),
+        )?;
+    }
 
     let hook = match HotkeyHook::install(hotkey, hk_tx) {
         Ok(h) => h,
@@ -928,6 +1101,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         rx,
         observer: None,
         app_override: None,
+        first_run,
     });
     drop(tx);
     std::thread::Builder::new()
@@ -937,6 +1111,61 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         .join()
         .map_err(|_| anyhow::anyhow!("driver thread panicked"))?;
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The config is the truth; the Run key follows it, and is rewritten when hush.exe has
+/// moved since it was written.
+fn sync_start_with_windows(want: bool) {
+    let synced = std::env::current_exe()
+        .context("locating hush.exe")
+        .and_then(|exe| startup::STARTUP.sync(want, &exe));
+    match synced {
+        Ok(startup::Change::None) => {}
+        Ok(change) => tracing::info!(?change, "start with Windows: Run key updated"),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "start with Windows: Run key not updated")
+        }
+    }
+}
+
+/// Each engine comes up as its model lands: speech through the loader waiting on
+/// `speech_arrived`, Silero as a swapped-in detector, the language model as the usual
+/// upgrade.
+fn spawn_downloader(
+    needed: Vec<Needed>,
+    retry: Receiver<()>,
+    speech_arrived: Sender<()>,
+    config: &Config,
+    norm: Sender<NormCmd>,
+    tx: Sender<Msg>,
+) -> Result<()> {
+    let config = config.clone();
+    std::thread::Builder::new()
+        .name("hush-download".into())
+        .spawn(move || {
+            let report_tx = tx.clone();
+            let mut fetch = provision::download;
+            provision::run(
+                needed,
+                &mut fetch,
+                &mut |ev| {
+                    let _ = report_tx.send(Msg::Download(ev));
+                },
+                &mut |role| match role {
+                    Role::Speech => {
+                        let _ = speech_arrived.send(());
+                    }
+                    Role::Vad => {
+                        let (vad, label) = engines::load_vad();
+                        let _ = tx.send(Msg::VadReady(vad, label));
+                    }
+                    Role::Language => spawn_normalizer_upgrade(&config, norm.clone(), tx.clone()),
+                },
+                &retry,
+            );
+        })
+        .map(|_| ())
+        .context("starting the model downloader")
 }
 
 pub fn forward<T: Send + 'static>(

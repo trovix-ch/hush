@@ -52,6 +52,15 @@ pub enum OverlayState {
     Status {
         message: String,
     },
+    /// A status with a bar; `fraction` is in 0..=1.
+    Progress {
+        message: String,
+        fraction: f32,
+    },
+    /// An error that does not hide by itself.
+    Alert {
+        message: String,
+    },
 }
 
 impl OverlayState {
@@ -65,8 +74,18 @@ impl OverlayState {
             OverlayState::Done { message } => message.clone().unwrap_or_else(|| "Done".into()),
             OverlayState::Error { message }
             | OverlayState::Notice { message }
-            | OverlayState::Status { message } => message.clone(),
+            | OverlayState::Status { message }
+            | OverlayState::Progress { message, .. }
+            | OverlayState::Alert { message } => message.clone(),
         }
+    }
+
+    /// Their messages carry a figure or a reason that the dictation-sized pill would cut.
+    fn is_wide(&self) -> bool {
+        matches!(
+            self,
+            OverlayState::Progress { .. } | OverlayState::Alert { .. }
+        )
     }
 
     pub fn tray_indicator(&self) -> TrayIndicator {
@@ -75,11 +94,12 @@ impl OverlayState {
             OverlayState::Transcribing | OverlayState::Normalizing | OverlayState::Inserting => {
                 TrayIndicator::Busy
             }
-            OverlayState::Error { .. } => TrayIndicator::Error,
+            OverlayState::Error { .. } | OverlayState::Alert { .. } => TrayIndicator::Error,
             OverlayState::Hidden
             | OverlayState::Done { .. }
             | OverlayState::Notice { .. }
-            | OverlayState::Status { .. } => TrayIndicator::Idle,
+            | OverlayState::Status { .. }
+            | OverlayState::Progress { .. } => TrayIndicator::Idle,
         }
     }
 
@@ -99,9 +119,11 @@ impl OverlayState {
             OverlayState::Hidden => [0, 0, 0],
             OverlayState::Listening { .. } => [0xF0, 0x4A, 0x4A],
             OverlayState::Transcribing => [0xF2, 0xB1, 0x3C],
-            OverlayState::Normalizing | OverlayState::Inserting => [0x5B, 0x9C, 0xF5],
+            OverlayState::Normalizing | OverlayState::Inserting | OverlayState::Progress { .. } => {
+                [0x5B, 0x9C, 0xF5]
+            }
             OverlayState::Done { .. } => [0x4C, 0xC2, 0x6E],
-            OverlayState::Error { .. } => [0xF0, 0x4A, 0x4A],
+            OverlayState::Error { .. } | OverlayState::Alert { .. } => [0xF0, 0x4A, 0x4A],
             OverlayState::Notice { .. } => [0xF2, 0xB1, 0x3C],
             OverlayState::Status { .. } => [0x9A, 0x9A, 0xA0],
         }
@@ -123,6 +145,8 @@ impl From<hush_core::notify::OverlayState> for OverlayState {
                     .then(|| "Done · rules only".to_string()),
             },
             C::Error { message } => OverlayState::Error { message },
+            C::Progress { message, fraction } => OverlayState::Progress { message, fraction },
+            C::Alert { message } => OverlayState::Alert { message },
         }
     }
 }
@@ -146,6 +170,9 @@ impl Default for OverlayConfig {
 }
 
 const BASE_W: i32 = 260;
+/// Fits "Downloading voice detection model 100 % · 2382 of 2382 MB" in Segoe UI Semibold
+/// at 14 px; 400 cut "Downloading language model 100 % · 2381 of" (seen 2026-09-24).
+const WIDE_W: i32 = 500;
 const BASE_H: i32 = 40;
 
 /// Must be created and driven on one thread with a message loop.
@@ -154,7 +181,8 @@ pub struct Overlay {
     timer_hwnd: HWND,
     config: OverlayConfig,
     scale: f32,
-    width: i32,
+    narrow: i32,
+    wide: i32,
     height: i32,
     font: HFONT,
     state: OverlayState,
@@ -172,6 +200,7 @@ impl Overlay {
         let dpi = unsafe { GetDpiForSystem() }.max(96);
         let scale = dpi as f32 / 96.0;
         let width = (BASE_W as f32 * scale).round() as i32;
+        let wide_width = (WIDE_W as f32 * scale).round() as i32;
         let height = (BASE_H as f32 * scale).round() as i32;
         // SAFETY: a 'static window procedure and a hidden popup owned by this thread.
         let hwnd = unsafe {
@@ -228,7 +257,8 @@ impl Overlay {
             timer_hwnd: timer_hwnd.unwrap_or(hwnd),
             config,
             scale,
-            width,
+            narrow: width,
+            wide: wide_width,
             height,
             font,
             state: OverlayState::Hidden,
@@ -242,6 +272,14 @@ impl Overlay {
 
     pub fn state(&self) -> &OverlayState {
         &self.state
+    }
+
+    fn width(&self) -> i32 {
+        if self.state.is_wide() {
+            self.wide
+        } else {
+            self.narrow
+        }
     }
 
     pub fn set(&mut self, state: OverlayState) {
@@ -326,13 +364,13 @@ impl Overlay {
         }
         let margin = (self.config.bottom_margin as f32 * self.scale).round() as i32;
         POINT {
-            x: work.left + (work.right - work.left - self.width) / 2,
+            x: work.left + (work.right - work.left - self.width()) / 2,
             y: work.bottom - margin - self.height,
         }
     }
 
     fn paint(&self) -> windows::core::Result<()> {
-        let (w, h) = (self.width, self.height);
+        let (w, h) = (self.width(), self.height);
         let text_left = (40.0 * self.scale) as i32;
         let text_right = if matches!(self.state, OverlayState::Listening { .. }) {
             w - (100.0 * self.scale) as i32
@@ -346,7 +384,7 @@ impl Overlay {
 
     /// Per-pixel coverage (0..=255).
     fn text_mask(&self, text: &str, left: i32, right: i32) -> windows::core::Result<Vec<u8>> {
-        let (w, h) = (self.width, self.height);
+        let (w, h) = (self.width(), self.height);
         let surface = DibSurface::new(w, h)?;
         let mut units: Vec<u16> = text.encode_utf16().collect();
         // SAFETY: our own memory DC and font; the rect and text outlive the calls.
@@ -376,11 +414,11 @@ impl Overlay {
     }
 
     fn blit(&self, pixels: &[u32]) -> windows::core::Result<()> {
-        let surface = DibSurface::new(self.width, self.height)?;
+        let surface = DibSurface::new(self.width(), self.height)?;
         surface.pixels_mut().copy_from_slice(pixels);
         let dst = self.position();
         let size = SIZE {
-            cx: self.width,
+            cx: self.width(),
             cy: self.height,
         };
         let src = POINT { x: 0, y: 0 };
@@ -518,6 +556,13 @@ pub(crate) fn compose(
     let bar_x0 = wf - 88.0 * scale;
     let bar_x1 = wf - 16.0 * scale;
     let bar_h = 8.0 * scale;
+    let progress = match state {
+        OverlayState::Progress { fraction, .. } => Some(fraction.clamp(0.0, 1.0)),
+        _ => None,
+    };
+    // A thin rule under the text, inside the rounded ends.
+    let (track_x0, track_x1) = (r, wf - r);
+    let (track_y0, track_y1) = (hf - 8.0 * scale, hf - 5.0 * scale);
     for y in 0..h {
         for x in 0..w {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -546,6 +591,20 @@ pub(crate) fn compose(
                 let filled = bar_x0 + (bar_x1 - bar_x0) * level;
                 let c = if fx <= filled {
                     [0x5C, 0xE0, 0x80]
+                } else {
+                    [0x50, 0x50, 0x5A]
+                };
+                blend(c, 1.0);
+            }
+            if let Some(p) = progress
+                && fx >= track_x0
+                && fx <= track_x1
+                && fy >= track_y0
+                && fy <= track_y1
+            {
+                let filled = track_x0 + (track_x1 - track_x0) * p;
+                let c = if fx <= filled {
+                    [0x5B, 0x9C, 0xF5]
                 } else {
                     [0x50, 0x50, 0x5A]
                 };
@@ -611,6 +670,33 @@ mod tests {
     }
 
     #[test]
+    fn progress_bar_fills_proportionally() {
+        let (w, h) = (400, 40);
+        let blank = vec![0; w * h];
+        let at = |fraction| {
+            let px = compose(
+                &OverlayState::Progress {
+                    message: String::new(),
+                    fraction,
+                },
+                w,
+                h,
+                1.0,
+                &blank,
+            );
+            px.iter()
+                .filter(|&&p| {
+                    let (_, r, _, b) = channels(p);
+                    b > r + 60
+                })
+                .count()
+        };
+        let dot = at(0.0);
+        assert!(at(0.9) > (at(0.1) - dot) * 3 + dot);
+        assert!(at(1.0) > at(0.9));
+    }
+
+    #[test]
     fn tray_indicator_follows_the_overlay_state() {
         use TrayIndicator::*;
         let msg = || "m".to_string();
@@ -624,6 +710,14 @@ mod tests {
             (OverlayState::Error { message: msg() }, Error),
             (OverlayState::Notice { message: msg() }, Idle),
             (OverlayState::Status { message: msg() }, Idle),
+            (
+                OverlayState::Progress {
+                    message: msg(),
+                    fraction: 0.4,
+                },
+                Idle,
+            ),
+            (OverlayState::Alert { message: msg() }, Error),
         ] {
             assert_eq!(state.tray_indicator(), want, "{state:?}");
             assert_eq!(state.is_dictating(), matches!(want, Listening | Busy));

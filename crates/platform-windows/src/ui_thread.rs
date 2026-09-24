@@ -123,8 +123,11 @@ pub fn open_path(path: &Path) -> std::io::Result<()> {
 
 enum UiCommand {
     Overlay(OverlayState),
+    Background(OverlayState),
     Paused(bool),
     Tooltip(String),
+    RetryEnabled(bool),
+    StartWithWindows(bool),
     About,
     Shutdown,
 }
@@ -207,6 +210,21 @@ impl UiHandle {
         self.post(UiCommand::About);
     }
 
+    /// What the overlay shows instead of hiding; `Hidden` clears it.
+    pub fn set_background(&self, state: OverlayState) {
+        self.post(UiCommand::Background(state));
+    }
+
+    /// Enables the tray's "Retry download" entry.
+    pub fn set_retry_enabled(&self, enabled: bool) {
+        self.post(UiCommand::RetryEnabled(enabled));
+    }
+
+    /// The tray's "Start with Windows" check mark.
+    pub fn set_start_with_windows(&self, on: bool) {
+        self.post(UiCommand::StartWithWindows(on));
+    }
+
     pub fn clipboard(&self) -> &WinClipboard {
         &self.inner.clipboard
     }
@@ -251,6 +269,11 @@ impl hush_core::notify::Notifier for WinNotifier {
             message: message.to_string(),
         });
     }
+
+    fn set_background(&mut self, state: Option<hush_core::notify::OverlayState>) {
+        self.ui
+            .set_background(state.map_or(OverlayState::Hidden, Into::into));
+    }
 }
 
 pub const ADMIN_WINDOW_MESSAGE: &str = "Admin window: dictation unavailable here";
@@ -267,6 +290,8 @@ struct UiState {
     /// What the driver last asked for; the admin warning is laid over it, never stored
     /// in its place, so the request comes back when focus leaves the admin window.
     requested: OverlayState,
+    /// Stands in for `Hidden`.
+    background: OverlayState,
     admin: AdminWatch,
 }
 
@@ -279,12 +304,25 @@ struct AdminWatch {
 
 impl UiState {
     fn show(&mut self, requested: OverlayState) {
+        let requested = match requested {
+            OverlayState::Hidden => self.background.clone(),
+            other => other,
+        };
         let dictating = requested.is_dictating();
         self.requested = requested;
         // Dictation can only have started in a window the hook sees, so until it ends
         // there is nothing to warn about.
         self.set_admin_polling(!dictating);
         self.render();
+    }
+
+    /// Replaces what is shown only when the old background (or nothing) was.
+    fn set_background(&mut self, background: OverlayState) {
+        let showing = self.requested == self.background;
+        self.background = background;
+        if showing {
+            self.show(OverlayState::Hidden);
+        }
     }
 
     fn admin_warning(&self) -> bool {
@@ -410,6 +448,7 @@ fn ui_thread(
         tooltip: "hush".into(),
         paused: false,
         requested: OverlayState::Hidden,
+        background: OverlayState::Hidden,
         admin: AdminWatch::default(),
     };
     state.set_admin_polling(true);
@@ -497,6 +536,7 @@ fn drain_commands(hwnd: HWND) {
         while let Ok(cmd) = state.rx.try_recv() {
             match cmd {
                 UiCommand::Overlay(s) => state.show(s),
+                UiCommand::Background(s) => state.set_background(s),
                 UiCommand::Paused(p) => {
                     state.paused = p;
                     if let Some(t) = state.tray.as_ref() {
@@ -507,6 +547,16 @@ fn drain_commands(hwnd: HWND) {
                 UiCommand::Tooltip(s) => {
                     state.tooltip = s;
                     state.apply_tooltip();
+                }
+                UiCommand::RetryEnabled(on) => {
+                    if let Some(t) = state.tray.as_ref() {
+                        t.set_retry_enabled(on);
+                    }
+                }
+                UiCommand::StartWithWindows(on) => {
+                    if let Some(t) = state.tray.as_ref() {
+                        t.set_start_with_windows(on);
+                    }
                 }
                 UiCommand::About => crate::tray::show_about(),
                 UiCommand::Shutdown => {
@@ -566,6 +616,7 @@ mod tests {
             requested: OverlayState::Status {
                 message: "Loading".into(),
             },
+            background: OverlayState::Hidden,
             admin: AdminWatch {
                 polling: true,
                 last_foreground: Some(1),
@@ -584,6 +635,38 @@ mod tests {
     }
 
     #[test]
+    fn the_background_stands_in_for_hidden_and_never_interrupts() {
+        let (_tx, rx) = mpsc::channel();
+        let mut s = UiState {
+            rx,
+            hwnd: HWND::default(),
+            overlay: None,
+            tray: None,
+            tooltip: String::new(),
+            paused: false,
+            requested: OverlayState::Hidden,
+            background: OverlayState::Hidden,
+            admin: AdminWatch::default(),
+        };
+        let progress = |f: f32| OverlayState::Progress {
+            message: format!("{f}"),
+            fraction: f,
+        };
+        s.set_background(progress(0.1));
+        assert_eq!(s.requested, progress(0.1));
+        s.set_background(progress(0.2));
+        assert_eq!(s.requested, progress(0.2));
+        s.show(OverlayState::Listening { level: 0.0 });
+        s.set_background(progress(0.3));
+        assert_eq!(s.requested, OverlayState::Listening { level: 0.0 });
+        s.show(OverlayState::Done { message: None });
+        s.show(OverlayState::Hidden);
+        assert_eq!(s.requested, progress(0.3), "the hide timer brings it back");
+        s.set_background(OverlayState::Hidden);
+        assert_eq!(s.requested, OverlayState::Hidden);
+    }
+
+    #[test]
     fn ui_thread_starts_drives_overlay_and_shuts_down() {
         let (ui, _tray) = UiHandle::start(UiOptions {
             tray: false,
@@ -595,7 +678,16 @@ mod tests {
         ui.set_overlay(OverlayState::Status {
             message: "Loading".into(),
         });
+        ui.set_overlay(OverlayState::Progress {
+            message: "Downloading".into(),
+            fraction: 0.42,
+        });
+        ui.set_overlay(OverlayState::Alert {
+            message: "Download failed".into(),
+        });
         ui.set_tooltip("hush · test");
+        ui.set_retry_enabled(true);
+        ui.set_start_with_windows(true);
         ui.set_paused(true);
         let seq = ui.clipboard().sequence_number();
         assert!(seq > 0);

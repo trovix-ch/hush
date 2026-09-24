@@ -3,7 +3,7 @@
 
 use std::sync::mpsc::Sender;
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW,
@@ -18,6 +18,10 @@ pub enum TrayEvent {
     PasteLast,
     CopyLast,
     OpenConfig,
+    /// The menu entry is enabled only while the app says there is something to retry.
+    RetryDownload,
+    /// The check mark shows what the app last set, not the click.
+    ToggleStartWithWindows,
     About,
     Quit,
 }
@@ -34,6 +38,8 @@ const ID_PAUSE: &str = "hush.pause";
 const ID_PASTE_LAST: &str = "hush.paste_last";
 const ID_COPY_LAST: &str = "hush.copy_last";
 const ID_OPEN_CONFIG: &str = "hush.open_config";
+const ID_RETRY_DOWNLOAD: &str = "hush.retry_download";
+const ID_START_WITH_WINDOWS: &str = "hush.start_with_windows";
 const ID_ABOUT: &str = "hush.about";
 const ID_QUIT: &str = "hush.quit";
 
@@ -43,6 +49,8 @@ fn event_for(id: &str) -> Option<TrayEvent> {
         ID_PASTE_LAST => TrayEvent::PasteLast,
         ID_COPY_LAST => TrayEvent::CopyLast,
         ID_OPEN_CONFIG => TrayEvent::OpenConfig,
+        ID_RETRY_DOWNLOAD => TrayEvent::RetryDownload,
+        ID_START_WITH_WINDOWS => TrayEvent::ToggleStartWithWindows,
         ID_ABOUT => TrayEvent::About,
         ID_QUIT => TrayEvent::Quit,
         _ => return None,
@@ -80,6 +88,8 @@ impl TrayIndicator {
 pub struct Tray {
     icon: TrayIcon,
     pause: MenuItem,
+    retry: MenuItem,
+    start_with_windows: CheckMenuItem,
     indicator: TrayIndicator,
 }
 
@@ -89,7 +99,15 @@ impl Tray {
         let pause = MenuItem::with_id(ID_PAUSE, "Pause", true, None);
         let paste = MenuItem::with_id(ID_PASTE_LAST, "Paste last transcript", true, None);
         let copy = MenuItem::with_id(ID_COPY_LAST, "Copy last transcript", true, None);
+        let retry = MenuItem::with_id(ID_RETRY_DOWNLOAD, "Retry download", false, None);
         let config = MenuItem::with_id(ID_OPEN_CONFIG, "Open config", true, None);
+        let start_with_windows = CheckMenuItem::with_id(
+            ID_START_WITH_WINDOWS,
+            "Start with Windows",
+            true,
+            false,
+            None,
+        );
         let about = MenuItem::with_id(ID_ABOUT, "About", true, None);
         let quit = MenuItem::with_id(ID_QUIT, "Quit", true, None);
         menu.append_items(&[
@@ -97,8 +115,10 @@ impl Tray {
             &PredefinedMenuItem::separator(),
             &paste,
             &copy,
+            &retry,
             &PredefinedMenuItem::separator(),
             &config,
+            &start_with_windows,
             &about,
             &PredefinedMenuItem::separator(),
             &quit,
@@ -118,12 +138,22 @@ impl Tray {
         Ok(Self {
             icon,
             pause,
+            retry,
+            start_with_windows,
             indicator: TrayIndicator::Idle,
         })
     }
 
     pub fn set_paused(&self, paused: bool) {
         self.pause.set_text(if paused { "Resume" } else { "Pause" });
+    }
+
+    pub fn set_retry_enabled(&self, enabled: bool) {
+        self.retry.set_enabled(enabled);
+    }
+
+    pub fn set_start_with_windows(&self, checked: bool) {
+        self.start_with_windows.set_checked(checked);
     }
 
     /// Replaces the icon only on a change: the level meter repeats the same state
@@ -221,6 +251,8 @@ mod tests {
             ID_PASTE_LAST,
             ID_COPY_LAST,
             ID_OPEN_CONFIG,
+            ID_RETRY_DOWNLOAD,
+            ID_START_WITH_WINDOWS,
             ID_ABOUT,
             ID_QUIT,
         ] {

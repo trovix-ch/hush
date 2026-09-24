@@ -43,7 +43,7 @@ pub fn vad_model() -> Result<(&'static ModelManifest, PathBuf)> {
 pub fn load_vad() -> (Box<dyn Vad>, String) {
     let silero = vad_model().and_then(|(model, dir)| {
         if !model.is_present(&dir) {
-            bail!("{} is not downloaded; `hush doctor` fetches it", model.id);
+            bail!("{} is not downloaded yet", model.id);
         }
         let started = Instant::now();
         let vad = SileroVad::load(&model.load_path(&dir), SileroConfig::default())?;

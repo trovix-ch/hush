@@ -15,6 +15,7 @@ use windows::Win32::System::StationsAndDesktops::{
 
 use crate::engines;
 use crate::setup::{self, Paths};
+use crate::startup;
 use crate::workers::Vocabulary;
 
 fn row(label: &str, value: impl std::fmt::Display) {
@@ -57,6 +58,19 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
         },
     );
     row("logs", paths.logs_dir.display());
+    row(
+        "models",
+        match hush_stt::models::default_models_root() {
+            Ok(root) if std::env::var_os(hush_stt::models::MODELS_DIR_ENV).is_some() => format!(
+                "{} (from {})",
+                root.display(),
+                hush_stt::models::MODELS_DIR_ENV
+            ),
+            Ok(root) => root.display().to_string(),
+            Err(e) => format!("UNUSABLE: {e}"),
+        },
+    );
+    row("startup", start_with_windows(&config));
     row(
         "session",
         format!(
@@ -325,6 +339,32 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
     } else {
         println!("the speech engine cannot load; dictation will not work");
         Ok(ExitCode::FAILURE)
+    }
+}
+
+fn start_with_windows(config: &Config) -> String {
+    let want = config.start_with_windows;
+    let exe = std::env::current_exe().ok();
+    match startup::STARTUP.read() {
+        Err(e) => format!("start_with_windows = {want}; Run key unreadable: {e:#}"),
+        Ok(None) if !want => "off".into(),
+        Ok(None) => "start_with_windows = true, but the Run key is missing; the app adds it \
+                     on its next start"
+            .into(),
+        Ok(Some(cmd)) => {
+            let current = exe.as_deref().map(startup::command_for);
+            let here = current.is_some_and(|c| c.eq_ignore_ascii_case(&cmd));
+            match (want, here) {
+                (true, true) => format!("on ({cmd})"),
+                (true, false) => format!(
+                    "on, but the Run key starts {cmd}; the app points it here on its next start"
+                ),
+                (false, _) => format!(
+                    "start_with_windows = false, but the Run key starts {cmd}; the app \
+                     removes it on its next start"
+                ),
+            }
+        }
     }
 }
 

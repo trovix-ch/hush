@@ -71,10 +71,12 @@ contradicts, the code is right and the prose gets fixed or deleted in the same c
 
 ## The ways to hurt yourself
 
-1. **Doing work in the keyboard hook callback.** Windows removes a low-level hook that
-   exceeds its timeout and never tells you. The callback compares, sends on a channel,
-   returns. No locks, no allocation, no logging, no key-state queries. The watchdog
-   exists because this still happens under load.
+1. **Doing work in the keyboard hook callback.** Past its timeout Windows gives up on
+   the callback: measured here, it passes the key through and never runs the callback
+   for that event, so the hotkey leaks to the target app and a release can be lost;
+   the documentation says it may also remove the hook silently. The callback compares,
+   sends on a channel, returns. No locks, no allocation, no logging, no key-state
+   queries. The watchdog exists for the removal case and must never fire on mere lag.
 2. **Trusting a clipboard render as proof of insertion, or restoring on a timer.**
    Windows renders a delayed format for the first reader and hands later readers the
    copy silently; readers that race each trigger a render and each render bumps the

@@ -28,6 +28,8 @@ vocabulary = []
 # vocabulary_file = "vocabulary.txt"
 # Style for apps no rule below matches: formal | casual | code | none
 default_style = "casual"
+# Start hush when you sign in. The tray's "Start with Windows" writes this line.
+start_with_windows = false
 
 [engine]
 # Model id from the download manifest.
@@ -252,6 +254,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vocabulary_file: Option<PathBuf>,
     pub default_style: Style,
+    pub start_with_windows: bool,
     pub engine: EngineChoice,
     pub normalizer: NormalizerChoice,
     pub pipeline: PipelineSettings,
@@ -275,6 +278,7 @@ impl Default for Config {
             vocabulary: Vec::new(),
             vocabulary_file: None,
             default_style: Style::Casual,
+            start_with_windows: false,
             engine: EngineChoice::default(),
             normalizer: NormalizerChoice::default(),
             pipeline: PipelineSettings::default(),
@@ -388,6 +392,48 @@ impl Config {
 }
 
 const WILDCARD: &str = "*";
+
+/// `text` with the top-level `key` set to `value`. Rewriting the file through `to_toml`
+/// would drop every comment the default config carries, so the one line is replaced in
+/// place, or added before the first table.
+pub fn with_top_level_bool(text: &str, key: &str, value: bool) -> String {
+    let line = format!("{key} = {value}");
+    let is_key = |l: &str| {
+        l.trim_start()
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+    let mut out = String::with_capacity(text.len() + line.len() + 1);
+    let mut done = false;
+    let mut in_table = false;
+    for l in text.split_inclusive('\n') {
+        let body = l.trim_end_matches(['\r', '\n']);
+        let ending = &l[body.len()..];
+        if !in_table && body.trim_start().starts_with('[') {
+            in_table = true;
+            if !done {
+                out.push_str(&line);
+                out.push_str(if ending.is_empty() { "\n" } else { ending });
+                done = true;
+            }
+        }
+        if !in_table && !done && is_key(body) {
+            out.push_str(&line);
+            out.push_str(ending);
+            done = true;
+            continue;
+        }
+        out.push_str(l);
+    }
+    if !done {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
 
 /// Terminals and editors, where a capital letter or an added period breaks a command.
 /// Terminals get the paste chord they accept without configuration: conhost and PuTTY
@@ -715,6 +761,45 @@ mod tests {
         ));
         assert!(both.deprecations()[0].contains("ignored"));
         assert_eq!(Config::default().normalizer.gpu_request(), None);
+    }
+
+    #[test]
+    fn start_with_windows_is_set_in_place_with_comments_kept() {
+        let on = with_top_level_bool(DEFAULT_CONFIG, "start_with_windows", true);
+        let c = Config::from_toml(&on).unwrap();
+        assert!(c.start_with_windows);
+        assert_eq!(
+            Config {
+                start_with_windows: false,
+                ..c.clone()
+            },
+            Config::default()
+        );
+        assert_eq!(on.lines().count(), DEFAULT_CONFIG.lines().count());
+        assert!(on.contains("# Start hush when you sign in."));
+        assert_eq!(
+            with_top_level_bool(&on, "start_with_windows", false),
+            DEFAULT_CONFIG
+        );
+        assert_eq!(Config::from_toml(&c.to_toml().unwrap()).unwrap(), c);
+
+        let crlf = "hotkey = \"CapsLock\"\r\n# start_with_windows = false\r\n[engine]\r\ngpu = \"cpu-only\"\r\n";
+        let added = with_top_level_bool(crlf, "start_with_windows", true);
+        assert_eq!(
+            added,
+            "hotkey = \"CapsLock\"\r\n# start_with_windows = false\r\nstart_with_windows = true\r\n[engine]\r\ngpu = \"cpu-only\"\r\n"
+        );
+        let c = Config::from_toml(&added).unwrap();
+        assert!(c.start_with_windows);
+        assert_eq!(c.engine.gpu, GpuPolicy::CpuOnly);
+        assert_eq!(
+            with_top_level_bool("hotkey = \"F9\"", "start_with_windows", true),
+            "hotkey = \"F9\"\nstart_with_windows = true\n"
+        );
+        assert_eq!(
+            with_top_level_bool("", "start_with_windows", true),
+            "start_with_windows = true\n"
+        );
     }
 
     #[test]

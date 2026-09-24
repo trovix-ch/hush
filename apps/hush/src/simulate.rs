@@ -304,6 +304,7 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         rx,
         observer: Some(obs_tx),
         app_override,
+        first_run: Default::default(),
     });
     let driver = std::thread::Builder::new()
         .name("hush-driver".into())
@@ -338,12 +339,12 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         while obs_rx.try_recv().is_ok() {}
         let down = Instant::now();
         tx.send(Msg::Hotkey(HotkeyEvent::Down { at: down }))
-            .context("driver is gone")?;
+            .map_err(|_| anyhow::anyhow!("driver is gone"))?;
         // The key is held while the clip plays, at least a second so the pipeline sees a
         // hold rather than a tap.
         std::thread::sleep(clip.max(Duration::from_secs(1)));
         tx.send(Msg::Hotkey(HotkeyEvent::Up { at: Instant::now() }))
-            .context("driver is gone")?;
+            .map_err(|_| anyhow::anyhow!("driver is gone"))?;
         let deadline = Instant::now() + RUN_TIMEOUT;
         loop {
             let o = match obs_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {

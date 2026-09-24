@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The development machine's SDK; a different one can change the generated shaders.
+  VULKAN_SDK_VERSION: 1.4.357.0
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # llama.cpp's Vulkan backend compiles its shaders with glslc, which only the full
+      # SDK carries; the build-from-source SDK actions ship headers and the loader only.
+      - name: Cache the Vulkan SDK
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+
+      - name: Install the Vulkan SDK
+        if: steps.vulkan-cache.outputs.cache-hit != 'true'
+        run: |
+          $v = $env:VULKAN_SDK_VERSION
+          $installer = Join-Path $env:RUNNER_TEMP 'vulkan-sdk.exe'
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$v/windows/vulkan-sdk.exe" -OutFile $installer
+          $p = Start-Process -Wait -PassThru -FilePath $installer -ArgumentList @(
+            '--root', "C:\VulkanSDK\$v", '--accept-licenses', '--default-answer',
+            '--confirm-command', 'install')
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($p.ExitCode)" }
+
+      - name: Put the Vulkan SDK on the path
+        run: |
+          $sdk = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { throw "no glslc in $sdk" }
+          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          "$sdk\Bin" >> $env:GITHUB_PATH
+
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+
+      # cl.exe and dumpbin on the path for the Ninja generator and the release check.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # hush-platform-windows is left out: its tests drive the real clipboard, keyboard
+      # hook and overlay windows, which need an interactive desktop, and its pure tests
+      # share one test binary with them.
+      - name: Test
+        run: cargo test --workspace --exclude hush-platform-windows -- --test-threads=1
+
+      - name: Release build
+        run: cargo build --release -p hush -p hush-stt-worker
