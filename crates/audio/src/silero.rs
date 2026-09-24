@@ -223,11 +223,11 @@ impl Vad for SileroVad {
             self.buf = chunk;
             self.buf.clear();
         }
-        let mut chunks = rest.chunks_exact(CHUNK);
-        for c in &mut chunks {
+        let (chunks, remainder) = rest.as_chunks::<CHUNK>();
+        for c in chunks {
             self.classify(c, &mut out);
         }
-        self.buf.extend_from_slice(chunks.remainder());
+        self.buf.extend_from_slice(remainder);
         out
     }
 
@@ -352,7 +352,9 @@ mod tests {
         let load = t.elapsed();
         let pcm = fixture("tts-30s-dictation.wav");
         let mut costs: Vec<Duration> = pcm
-            .chunks_exact(CHUNK)
+            .as_chunks::<CHUNK>()
+            .0
+            .iter()
             .map(|c| {
                 let t = Instant::now();
                 vad.probability(c).unwrap();

@@ -84,10 +84,10 @@ impl ClipboardSnapshot {
 
     pub fn text(&self) -> Option<String> {
         let f = self.formats.iter().find(|f| f.format == CF_UNICODETEXT)?;
-        let units: Vec<u16> = f
-            .bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        let (pairs, _) = f.bytes.as_chunks::<2>();
+        let units: Vec<u16> = pairs
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .take_while(|&u| u != 0)
             .collect();
         Some(String::from_utf16_lossy(&units))

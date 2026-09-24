@@ -266,7 +266,7 @@ mod tests {
         let px = icon_rgba(TrayIndicator::Listening);
         assert_eq!(px.len(), 32 * 32 * 4);
         assert_eq!(px[3], 0);
-        let opaque = px.chunks_exact(4).filter(|p| p[3] > 200).count();
+        let opaque = px.as_chunks::<4>().0.iter().filter(|p| p[3] > 200).count();
         assert!((80..600).contains(&opaque), "{opaque}");
         assert!(Icon::from_rgba(px, 32, 32).is_ok());
     }

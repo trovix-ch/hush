@@ -126,9 +126,10 @@ mod tests {
             let samples = (w.len() - 44) / 2;
             let ms = samples as u32 * 1000 / RATE;
             assert!((60..=max_ms).contains(&ms), "{ms} ms");
-            let peak = w[44..]
-                .chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs())
+            let (pairs, _) = w[44..].as_chunks::<2>();
+            let peak = pairs
+                .iter()
+                .map(|c| i16::from_le_bytes(*c).unsigned_abs())
                 .max()
                 .unwrap();
             assert!(peak < i16::MAX as u16 / 4, "peak {peak}");
