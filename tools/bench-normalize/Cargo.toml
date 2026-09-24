@@ -1,0 +1,20 @@
+[package]
+name = "bench-normalize"
+description = "Run transcripts through each normalizer and print timings and validation results"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+wl-core = { path = "../../crates/core" }
+wl-normalize = { path = "../../crates/normalize" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

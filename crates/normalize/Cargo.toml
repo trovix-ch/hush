@@ -1,0 +1,20 @@
+[package]
+name = "wl-normalize"
+description = "Transcript normalization: rule pass, LLM backends, validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wl-core = { path = "../core" }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strsim = "0.11"
+# No TLS: the backend is the user's own local server, and nothing leaves the machine.
+ureq = { version = "3", default-features = false, features = ["json"] }
+
+[lints]
+workspace = true

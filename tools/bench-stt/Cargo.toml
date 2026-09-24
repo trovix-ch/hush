@@ -1,0 +1,25 @@
+[package]
+name = "bench-stt"
+description = "Run a WAV through each speech engine and print timings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+ort-engine = ["wl-stt/ort-engine"]
+
+[dependencies]
+wl-core = { path = "../../crates/core" }
+wl-stt = { path = "../../crates/stt" }
+anyhow = "1"
+hound = "3.5"
+# Pinned: v4 and v5 both shipped in 2026 with incompatible APIs.
+rubato = "=5.0.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,40 @@
+[package]
+name = "wl-stt"
+description = "Speech-to-text engine implementations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+# Parakeet through ONNX Runtime (DirectML on Windows). Off by default so a default build
+# ships no ONNX Runtime; ggml/Vulkan measured about twice as fast on the target GPU.
+ort-engine = ["dep:parakeet-rs", "dep:ort"]
+
+[dependencies]
+wl-core = { path = "../core" }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+sha2 = "0.10"
+ureq = "3"
+# Pinned exactly: 0.x bindings over a native library, no semver promise between patches.
+transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
+# Pinned exactly: both are pre-1.0 / release-candidate wrappers around ONNX Runtime and
+# change API between patch releases. They must agree on the `ort` version.
+parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["cpu", "ort-defaults", "api-28"] }
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["std", "api-28"] }
+
+[target.'cfg(windows)'.dependencies]
+parakeet-rs = { version = "=0.3.8", optional = true, default-features = false, features = ["directml"] }
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = ["directml"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

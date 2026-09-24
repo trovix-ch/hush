@@ -1,0 +1,94 @@
+{
+  "models": [
+    {
+      "id": "parakeet-tdt-0.6b-v3-f16-gguf",
+      "engine": "transcribe-cpp",
+      "description": "NVIDIA Parakeet TDT 0.6B v3, GGUF for transcribe.cpp, F16 weights",
+      "license": "CC-BY-4.0",
+      "attribution": "Parakeet TDT 0.6B v3 by NVIDIA (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), licensed CC-BY-4.0. GGUF conversion by handy-computer (https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf).",
+      "files": [
+        {
+          "name": "parakeet-tdt-0.6b-v3-F16.gguf",
+          "url": "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/90f082450fcbacdb54e5900c44ef697c9ea59622/parakeet-tdt-0.6b-v3-F16.gguf",
+          "size": 1255869856,
+          "sha256": "d9ec7e2c39da7b4fec3e01e71e82c7f7bbe97741e08c0c054091bf3d520a41d3"
+        }
+      ]
+    },
+    {
+      "id": "whisper-large-v3-turbo-f16-gguf",
+      "engine": "transcribe-cpp",
+      "description": "OpenAI Whisper large-v3-turbo, GGUF for transcribe.cpp, F16 weights",
+      "license": "MIT",
+      "attribution": "Whisper large-v3-turbo by OpenAI (https://huggingface.co/openai/whisper-large-v3-turbo), licensed MIT. GGUF conversion by handy-computer (https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf).",
+      "files": [
+        {
+          "name": "whisper-large-v3-turbo-F16.gguf",
+          "url": "https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf/resolve/ceea6c8a94a21ab85be244d311e874a39344dbf5/whisper-large-v3-turbo-F16.gguf",
+          "size": 1625935520,
+          "sha256": "e1d0144e9afc9f479d9e51fc92c7dea9dc36059655eeb3819f16ad2de779046a"
+        }
+      ]
+    },
+    {
+      "id": "parakeet-tdt-0.6b-v3",
+      "engine": "parakeet-tdt",
+      "description": "NVIDIA Parakeet TDT 0.6B v3, ONNX export, fp32 weights",
+      "license": "CC-BY-4.0",
+      "attribution": "Parakeet TDT 0.6B v3 by NVIDIA (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), licensed CC-BY-4.0. ONNX export by istupakov (https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx).",
+      "files": [
+        {
+          "name": "encoder-model.onnx",
+          "url": "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/encoder-model.onnx",
+          "size": 41770866,
+          "sha256": "98a74b21b4cc0017c1e7030319a4a96f4a9506e50f0708f3a516d02a77c96bb1"
+        },
+        {
+          "name": "encoder-model.onnx.data",
+          "url": "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/encoder-model.onnx.data",
+          "size": 2435420160,
+          "sha256": "9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36"
+        },
+        {
+          "name": "decoder_joint-model.onnx",
+          "url": "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/decoder_joint-model.onnx",
+          "size": 72520893,
+          "sha256": "e978ddf6688527182c10fde2eb4b83068421648985ef23f7a86be732be8706c1"
+        },
+        {
+          "name": "vocab.txt",
+          "url": "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/vocab.txt",
+          "size": 93939,
+          "sha256": "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"
+        }
+      ]
+    },
+    {
+      "id": "parakeet-tdt-0.6b-v3-int8",
+      "engine": "parakeet-tdt",
+      "description": "NVIDIA Parakeet TDT 0.6B v3, ONNX export, int8 dynamically quantised weights",
+      "license": "CC-BY-4.0",
+      "attribution": "Parakeet TDT 0.6B v3 by NVIDIA (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), licensed CC-BY-4.0. ONNX export and int8 quantisation by istupakov (https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx).",
+      "files": [
+        {
+          "name": "encoder-model.int8.onnx",
+          "url": "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/encoder-model.int8.onnx",
+          "size": 652183999,
+          "sha256": "6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09"
+        },
+        {
+          "name": "decoder_joint-model.int8.onnx",
+          "url": "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/decoder_joint-model.int8.onnx",
+          "size": 18202004,
+          "sha256": "eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70"
+        },
+        {
+          "name": "vocab.txt",
+          "url": "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/vocab.txt",
+          "size": 93939,
+          "sha256": "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"
+        }
+      ]
+    }
+  ]
+}
