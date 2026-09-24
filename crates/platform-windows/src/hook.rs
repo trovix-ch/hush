@@ -293,6 +293,12 @@ struct Shared {
     escape_armed: AtomicBool,
     stall_ms: AtomicU32,
     stop: AtomicBool,
+    /// The watchdog posted a reinstall the hook thread has not run yet. A hook thread
+    /// stuck in a callback runs nothing, so a stall longer than the rate limit would
+    /// otherwise queue a second reinstall behind the first.
+    reinstall_pending: AtomicBool,
+    /// Reinstalls the hook thread has completed.
+    reinstalls_done: AtomicU32,
 }
 
 const WM_HOOK_REINSTALL: u32 = WM_APP + 1;
@@ -549,6 +555,10 @@ fn hook_thread(
                     let _ = tx.try_send(HotkeyEvent::Up { at });
                 }
                 let _ = tx.try_send(HotkeyEvent::HookReinstalled { at, reason });
+                shared.reinstalls_done.fetch_add(1, Ordering::AcqRel);
+                if reason != ReinstallReason::Requested {
+                    shared.reinstall_pending.store(false, Ordering::Release);
+                }
                 tracing::warn!(?reason, was_held, "keyboard hook reinstalled");
             }
             _ => {
@@ -606,6 +616,23 @@ fn sample_keys(buf: &mut [bool; 256]) {
     }
 }
 
+/// Counted from when a new hook went in, not from the post: key changes from the dead
+/// period surface just after it and say nothing about the new hook.
+struct RateLimit {
+    last: Option<Instant>,
+    seen_done: u32,
+}
+
+impl RateLimit {
+    fn note_done(&mut self, shared: &Shared) {
+        let done = shared.reinstalls_done.load(Ordering::Acquire);
+        if done != self.seen_done {
+            self.seen_done = done;
+            self.last = Some(Instant::now());
+        }
+    }
+}
+
 fn watchdog_thread(
     shared: Arc<Shared>,
     hook_tid: u32,
@@ -622,15 +649,28 @@ fn watchdog_thread(
     // After a reinstall the hotkey may still be physically down; it counts again only
     // once it has been seen released.
     let mut key_check_armed = true;
-    let mut last_reinstall: Option<Instant> = None;
+    let mut limit = RateLimit {
+        last: None,
+        seen_done: shared.reinstalls_done.load(Ordering::Acquire),
+    };
 
-    let reinstall = |reason: ReinstallReason, last: &mut Option<Instant>| {
-        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+    let reinstall = |reason: ReinstallReason, limit: &mut RateLimit| {
+        // Pending is cleared after the count moves, so a clear here means the count is
+        // current too.
+        if shared.reinstall_pending.load(Ordering::Acquire) {
             return;
         }
-        *last = Some(Instant::now());
+        limit.note_done(&shared);
+        if limit
+            .last
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        limit.last = Some(Instant::now());
+        shared.reinstall_pending.store(true, Ordering::Release);
         // SAFETY: posting a plain integer message to the hook thread.
-        let _ = unsafe {
+        let posted = unsafe {
             PostThreadMessageW(
                 hook_tid,
                 WM_HOOK_REINSTALL,
@@ -638,6 +678,9 @@ fn watchdog_thread(
                 LPARAM(0),
             )
         };
+        if posted.is_err() {
+            shared.reinstall_pending.store(false, Ordering::Release);
+        }
     };
 
     loop {
@@ -648,6 +691,7 @@ fn watchdog_thread(
         if shared.stop.load(Ordering::Acquire) {
             return;
         }
+        limit.note_done(&shared);
         let hb_before = shared.heartbeat.load(Ordering::Relaxed);
         sample_keys(&mut cur_keys);
         let blind = crate::focus::foreground_is_elevated_over_us();
@@ -668,7 +712,7 @@ fn watchdog_thread(
                 std::thread::sleep(Duration::from_millis(5));
             }
             if !answered && shared.held.load(Ordering::Acquire) {
-                reinstall(ReinstallReason::ProbeUnanswered, &mut last_reinstall);
+                reinstall(ReinstallReason::ProbeUnanswered, &mut limit);
             }
         }
 
@@ -685,7 +729,7 @@ fn watchdog_thread(
                 if unswallowed_ticks >= 2 {
                     key_check_armed = false;
                     unswallowed_ticks = 0;
-                    reinstall(ReinstallReason::KeyNotSwallowed, &mut last_reinstall);
+                    reinstall(ReinstallReason::KeyNotSwallowed, &mut limit);
                 }
             }
         }
@@ -698,7 +742,7 @@ fn watchdog_thread(
             .enumerate()
             .any(|(vk, (a, b))| a != b && vk as u8 != VK_MASK as u8);
         if changed && !blind && hb_before == hb_hist[0] {
-            reinstall(ReinstallReason::HeartbeatStopped, &mut last_reinstall);
+            reinstall(ReinstallReason::HeartbeatStopped, &mut limit);
         }
         hb_hist = [hb_hist[1], hb_before];
         std::mem::swap(&mut prev_keys, &mut cur_keys);
@@ -721,6 +765,8 @@ impl HotkeyHook {
             escape_armed: AtomicBool::new(false),
             stall_ms: AtomicU32::new(0),
             stop: AtomicBool::new(false),
+            reinstall_pending: AtomicBool::new(false),
+            reinstalls_done: AtomicU32::new(0),
         });
         let (ready_tx, ready_rx) = mpsc::channel();
         let hook_shared = shared.clone();
@@ -910,6 +956,8 @@ mod tests {
             escape_armed: AtomicBool::new(false),
             stall_ms: AtomicU32::new(0),
             stop: AtomicBool::new(false),
+            reinstall_pending: AtomicBool::new(false),
+            reinstalls_done: AtomicU32::new(0),
         };
         let (tx, rx) = mpsc::sync_channel(8);
         let esc = KBDLLHOOKSTRUCT {
@@ -962,14 +1010,13 @@ mod tests {
     /// A locked or disconnected session refuses every injection, so live tests report
     /// SKIPPED there instead of failing.
     pub(crate) fn input_desktop_available() -> bool {
-        let n = super::send_inputs(&mask_inputs(true));
-        if n == 0 {
-            eprintln!(
-                "SKIPPED live input test: SendInput refused ({}); session disconnected or locked?",
-                windows::core::Error::from_thread()
-            );
+        match try_inject(&mask_inputs(true)) {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!("SKIPPED: {why}");
+                false
+            }
         }
-        n == 1
     }
 
     fn live_hook(key: &str) -> (HookHandle, mpsc::Receiver<HotkeyEvent>) {
@@ -984,17 +1031,27 @@ mod tests {
         rx.recv_timeout(Duration::from_millis(1000)).ok()
     }
 
-    /// Asserts, so a refused injection fails loudly instead of looking like a hook that
-    /// saw nothing.
-    fn send_inputs(inputs: &[INPUT]) -> u32 {
+    /// A refusal is reported, never mistaken for a hook that saw nothing: the test prints
+    /// SKIPPED and returns, since a desktop that locks mid-test refuses all injection.
+    fn try_inject(inputs: &[INPUT]) -> Result<(), String> {
         let n = super::send_inputs(inputs);
-        assert_eq!(
-            n as usize,
-            inputs.len(),
-            "SendInput refused: {}",
-            windows::core::Error::from_thread()
-        );
-        n
+        if n as usize == inputs.len() {
+            return Ok(());
+        }
+        let err = windows::core::Error::from_thread();
+        assert_eq!(n, 0, "SendInput inserted {n} of {}: {err}", inputs.len());
+        Err(format!(
+            "SendInput refused ({err}); session locked or disconnected?"
+        ))
+    }
+
+    macro_rules! inject {
+        ($inputs:expr) => {
+            if let Err(why) = try_inject($inputs) {
+                eprintln!("SKIPPED: {why}");
+                return;
+            }
+        };
     }
 
     #[test]
@@ -1004,20 +1061,20 @@ mod tests {
             return;
         }
         let (h, rx) = live_hook("F13");
-        send_inputs(&[key_event(0x7C, false)]);
+        inject!(&[key_event(0x7C, false)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
         assert!(h.is_held());
-        send_inputs(&[key_event(0x7C, false), key_event(0x7C, false)]);
-        send_inputs(&[key_event(VK_ESCAPE, false), key_event(VK_ESCAPE, true)]);
+        inject!(&[key_event(0x7C, false), key_event(0x7C, false)]);
+        inject!(&[key_event(VK_ESCAPE, false), key_event(VK_ESCAPE, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Cancel { .. })));
-        send_inputs(&[key_event(0x7C, true)]);
+        inject!(&[key_event(0x7C, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
         assert!(!h.is_held());
         let mut own = key_event(0x7C, false);
         own.Anonymous.ki.dwExtraInfo = INJECTED_TAG;
         let mut own_up = key_event(0x7C, true);
         own_up.Anonymous.ki.dwExtraInfo = INJECTED_TAG;
-        send_inputs(&[own, own_up]);
+        inject!(&[own, own_up]);
         let stray = rx.recv_timeout(Duration::from_millis(300)).ok();
         assert_eq!(stray, None, "own-tagged events produced {stray:?}");
     }
@@ -1029,18 +1086,18 @@ mod tests {
             return;
         }
         let (h, rx) = live_hook("Shift+F14");
-        send_inputs(&[key_event(0x7D, false), key_event(0x7D, true)]);
+        inject!(&[key_event(0x7D, false), key_event(0x7D, true)]);
         assert_eq!(rx.recv_timeout(Duration::from_millis(300)).ok(), None);
-        send_inputs(&[key_event(VK_LSHIFT, false), key_event(0x7D, false)]);
+        inject!(&[key_event(VK_LSHIFT, false), key_event(0x7D, false)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
-        send_inputs(&[key_event(VK_LSHIFT, true), key_event(0x7D, true)]);
+        inject!(&[key_event(VK_LSHIFT, true), key_event(0x7D, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
         h.update(
             &HotkeyConfig::parse("F15")
                 .unwrap()
                 .accept_injected_for_tests(),
         );
-        send_inputs(&[key_event(0x7E, false), key_event(0x7E, true)]);
+        inject!(&[key_event(0x7E, false), key_event(0x7E, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
     }
@@ -1052,16 +1109,16 @@ mod tests {
             return;
         }
         let (_h, rx) = live_hook("F16");
-        send_inputs(&[key_event(0x7F, false)]);
+        inject!(&[key_event(0x7F, false)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
         std::thread::sleep(Duration::from_millis(50));
         let swallowed_visible = key_down_async(0x7F);
-        send_inputs(&[key_event(0x7F, true)]);
+        inject!(&[key_event(0x7F, true)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
-        send_inputs(&[key_event(0x80, false)]);
+        inject!(&[key_event(0x80, false)]);
         std::thread::sleep(Duration::from_millis(50));
         let passed_visible = key_down_async(0x80);
-        send_inputs(&[key_event(0x80, true)]);
+        inject!(&[key_event(0x80, true)]);
         assert!(!swallowed_visible, "swallowed F16 visible in async state");
         assert!(passed_visible, "passed F17 not visible in async state");
     }
@@ -1073,30 +1130,39 @@ mod tests {
             return;
         }
         let (h, rx) = live_hook("F18");
-        send_inputs(&[key_event(0x81, false)]);
+        inject!(&[key_event(0x81, false)]);
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
+        // Longer than LowLevelHooksTimeout and than the watchdog's rate limit.
         h.debug_stall_next_callback(1500);
         let t0 = Instant::now();
-        send_inputs(&[key_event(0x82, false), key_event(0x82, true)]);
+        inject!(&[key_event(0x82, false), key_event(0x82, true)]);
+        // Waits on the reinstall event itself; the bound only catches a watchdog that
+        // never acts.
         let mut got_up = false;
-        let mut reinstalled = None;
-        while t0.elapsed() < Duration::from_secs(6) && reinstalled.is_none() {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+        let reason = loop {
+            let left = Duration::from_secs(10).saturating_sub(t0.elapsed());
+            match rx.recv_timeout(left) {
                 Ok(HotkeyEvent::Up { .. }) => got_up = true,
-                Ok(HotkeyEvent::HookReinstalled { reason, .. }) => reinstalled = Some(reason),
-                _ => {}
+                Ok(HotkeyEvent::HookReinstalled { reason, .. }) => break reason,
+                Ok(_) => {}
+                Err(_) => panic!("watchdog never reinstalled within 10 s"),
+            }
+        };
+        eprintln!("watchdog: {reason:?} after {:?}", t0.elapsed());
+        assert!(got_up, "no synthetic Up for the held key");
+        inject!(&[key_event(0x81, true)]);
+        inject!(&[key_event(0x81, false), key_event(0x81, true)]);
+        let mut events = Vec::new();
+        while let Some(ev) = next(&rx) {
+            let down = matches!(ev, HotkeyEvent::Down { .. });
+            events.push(ev);
+            if down {
+                break;
             }
         }
-        send_inputs(&[key_event(0x81, true)]);
-        eprintln!("watchdog: {reinstalled:?} after {:?}", t0.elapsed());
-        assert!(reinstalled.is_some(), "watchdog never reinstalled");
-        assert!(got_up, "no synthetic Up for the held key");
-        while rx.try_recv().is_ok() {}
-        send_inputs(&[key_event(0x81, false), key_event(0x81, true)]);
-        let after = next(&rx);
         assert!(
-            matches!(after, Some(HotkeyEvent::Down { .. })),
-            "after reinstall: {after:?}"
+            matches!(events.as_slice(), [HotkeyEvent::Down { .. }]),
+            "after the reinstall, expected only the new hook's Down: {events:?}"
         );
     }
 }

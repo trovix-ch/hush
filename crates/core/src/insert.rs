@@ -150,8 +150,9 @@ impl Reader {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderWait {
-    /// Windows asks the owner to render exactly once per write, so there is never a
-    /// second read to wait for.
+    /// Windows renders a delayed write for the first reader and hands later readers the
+    /// stored copy, so there is no later read to wait for. Readers that race the first
+    /// one can each trigger a render; those repeats are not new writes.
     Read(Reader),
     TimedOut,
     /// A foreign write replaced ours.

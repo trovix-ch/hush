@@ -364,14 +364,47 @@ mod tests {
         assert_eq!(process_elevated(SYSTEM_PID), None);
     }
 
+    /// Asked of Terminal Services, which follows a switch between console and RDP; the
+    /// SESSIONNAME variable is inherited from whichever session started the shell.
+    fn wts_is_remote_session() -> windows::core::Result<bool> {
+        use windows::Win32::System::RemoteDesktop::{
+            WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSFreeMemory, WTSIsRemoteSession,
+            WTSQuerySessionInformationW,
+        };
+        let mut buf = windows::core::PWSTR::null();
+        let mut len = 0u32;
+        // SAFETY: both out-parameters are valid; the buffer is freed below.
+        unsafe {
+            WTSQuerySessionInformationW(
+                Some(WTS_CURRENT_SERVER_HANDLE),
+                WTS_CURRENT_SESSION,
+                WTSIsRemoteSession,
+                &mut buf,
+                &mut len,
+            )
+        }?;
+        // SAFETY: on success the buffer holds `len` bytes; WTSIsRemoteSession is one BOOLEAN.
+        let remote = len >= 1 && !buf.is_null() && unsafe { *buf.0.cast::<u8>() } != 0;
+        // SAFETY: allocated by WTSQuerySessionInformationW and freed exactly once.
+        unsafe { WTSFreeMemory(buf.0.cast()) };
+        Ok(remote)
+    }
+
     #[test]
-    fn remote_session_flag_matches_session_name() {
-        let session = std::env::var("SESSIONNAME").unwrap_or_default();
-        if session.starts_with("RDP-") {
-            assert!(is_remote_session());
-        } else if session.eq_ignore_ascii_case("console") {
-            assert!(!is_remote_session());
-        }
+    fn remote_session_flag_matches_terminal_services() {
+        let expected = match wts_is_remote_session() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SKIPPED: WTSQuerySessionInformationW(WTSIsRemoteSession) failed: {e}");
+                return;
+            }
+        };
+        assert_eq!(
+            is_remote_session(),
+            expected,
+            "SESSIONNAME={:?}",
+            std::env::var("SESSIONNAME")
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The owner gets a thread of its own because a reader blocks inside `GetClipboardData`
 //! until we answer `WM_RENDERFORMAT`, and snapshotting a foreign clipboard can block for
-//! seconds while that app renders. Windows asks for a render once per write and serves
-//! later readers the cached copy silently, so a render identifies only the first reader.
+//! seconds while that app renders. Windows asks for a render once per write (again for
+//! each reader that raced the first) and serves later readers the cached copy silently, so a render
+//! identifies only the first reader.
 
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -21,9 +22,10 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE,
-    KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY, WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS,
-    WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
+    KillTimer, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE,
+    PM_QS_SENDMESSAGE, PeekMessageW, PostMessageW, PostQuitMessage, QS_SENDMESSAGE, RegisterClassW,
+    SetTimer, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DESTROY,
+    WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -146,7 +148,25 @@ struct RenderLog {
 struct Shared {
     log: Mutex<RenderLog>,
     cv: Condvar,
+    /// The sequence number our last delayed write returned.
+    written_sequence: AtomicU32,
+    /// The same, advanced by our own repeat renders of that write. Answering a second
+    /// request replaces the data, which advances the number although nobody else wrote.
     our_sequence: AtomicU32,
+}
+
+impl Shared {
+    /// The clipboard's sequence number, with advances made only by our own renders folded
+    /// back into the number of the write they rendered.
+    fn effective_sequence(&self) -> u32 {
+        // SAFETY: plain FFI query, callable from any thread.
+        let now = unsafe { GetClipboardSequenceNumber() };
+        if now == self.our_sequence.load(Ordering::Acquire) {
+            self.written_sequence.load(Ordering::Acquire)
+        } else {
+            now
+        }
+    }
 }
 
 enum Command {
@@ -228,6 +248,7 @@ impl WinClipboard {
         let shared = Arc::new(Shared {
             log: Mutex::new(RenderLog::default()),
             cv: Condvar::new(),
+            written_sequence: AtomicU32::new(0),
             our_sequence: AtomicU32::new(0),
         });
         let (tx, rx) = mpsc::channel();
@@ -310,15 +331,16 @@ impl WinClipboard {
         }
     }
 
+    /// Our own renders do not advance it: until someone else writes, it stays what our
+    /// last write returned.
     pub fn sequence_number(&self) -> u32 {
-        // SAFETY: plain FFI query, callable from any thread.
-        unsafe { GetClipboardSequenceNumber() }
+        self.inner.shared.effective_sequence()
     }
 
     /// Also ends early when a foreign write replaces ours.
     pub fn wait_for_render_or_change(&self, timeout: Duration) -> Result<RenderEvent, Waited> {
         let deadline = Instant::now() + timeout;
-        let ours = self.inner.shared.our_sequence.load(Ordering::Acquire);
+        let ours = self.inner.shared.written_sequence.load(Ordering::Acquire);
         loop {
             let now = Instant::now();
             let slice = (deadline.saturating_duration_since(now)).min(Duration::from_millis(5));
@@ -364,7 +386,8 @@ impl WinClipboard {
         self.wait_for_render(Duration::ZERO)
     }
 
-    /// Windows sends one render per write; more means something emptied and re-read.
+    /// Windows asks once per write, plus once for each reader that raced the first; a
+    /// reader after the first render is served the cached copy and adds none.
     pub fn render_count(&self) -> u32 {
         self.inner
             .shared
@@ -427,6 +450,8 @@ fn clip_err(e: ClipboardError) -> InsertError {
 thread_local! {
     static PENDING: RefCell<Option<Arc<Vec<u16>>>> = const { RefCell::new(None) };
     static GENERATION: Cell<u64> = const { Cell::new(0) };
+    /// The generation whose text is on the clipboard; 0 (never a write) when none is.
+    static RENDERED: Cell<u64> = const { Cell::new(0) };
     static SHARED: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
 }
 
@@ -447,13 +472,14 @@ fn owner_thread(
     let mut msg = MSG::default();
     let mut quitting = false;
     let mut scheduled: Option<Scheduled> = None;
-    let run_scheduled = |s: Scheduled| match restore_now(hwnd, &s.snapshot, Some(s.if_sequence)) {
-        Ok(RestoreOutcome::Restored) => {}
-        Ok(RestoreOutcome::SkippedChanged) => {
-            tracing::debug!("clipboard changed since our write; previous contents not restored")
-        }
-        Err(e) => tracing::warn!(error = %e, "clipboard restore failed"),
-    };
+    let run_scheduled =
+        |s: Scheduled| match restore_now(hwnd, &shared, &s.snapshot, Some(s.if_sequence)) {
+            Ok(RestoreOutcome::Restored) => {}
+            Ok(RestoreOutcome::SkippedChanged) => {
+                tracing::debug!("clipboard changed since our write; previous contents not restored")
+            }
+            Err(e) => tracing::warn!(error = %e, "clipboard restore failed"),
+        };
     loop {
         // SAFETY: standard message loop on the thread that owns `hwnd`.
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
@@ -478,8 +504,7 @@ fn owner_thread(
         while !quitting && let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Command::Snapshot { cap, reply } => {
-                    // SAFETY: plain FFI query.
-                    let now = unsafe { GetClipboardSequenceNumber() };
+                    let now = shared.effective_sequence();
                     let taken = scheduled.take().filter(|s| s.if_sequence == now);
                     if taken.is_some() {
                         // SAFETY: our own window and timer id.
@@ -521,7 +546,8 @@ fn owner_thread(
                     expected_sequence,
                     reply,
                 } => {
-                    let _ = reply.try_send(restore_now(hwnd, &snapshot, expected_sequence));
+                    let _ =
+                        reply.try_send(restore_now(hwnd, &shared, &snapshot, expected_sequence));
                 }
                 Command::WriteDelayed { text, reply } => {
                     let _ = reply.try_send(write_delayed_now(hwnd, &shared, &text));
@@ -583,8 +609,11 @@ unsafe extern "system" fn owner_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             // Retried: a reader holding the clipboard at this moment would otherwise make
             // Windows drop the unrendered text with our window.
             if let Ok(_open) = open_clipboard(hwnd) {
+                // Text already rendered is on the clipboard and outlives our window;
+                // rendering it again would only advance the sequence number.
+                let rendered = RENDERED.with(Cell::get) == GENERATION.with(Cell::get);
                 // SAFETY: plain FFI query while we hold the clipboard.
-                if unsafe { GetClipboardOwner() }.ok() == Some(hwnd) {
+                if !rendered && unsafe { GetClipboardOwner() }.ok() == Some(hwnd) {
                     render(CF_UNICODETEXT);
                 }
             }
@@ -615,9 +644,23 @@ fn render(format: u32) {
     if format != CF_UNICODETEXT {
         return;
     }
+    let generation = GENERATION.with(Cell::get);
+    // A repeat request (readers raced for the first) must still be answered: measured, the
+    // racing reader gets nothing otherwise. The answer replaces the data and advances the
+    // sequence number, so that advance is recorded as ours.
     if let Some(h) = hglobal_from(&utf16_bytes(&text)) {
         // SAFETY: WM_RENDERFORMAT permits this without our own open; success hands over `h`.
-        if unsafe { SetClipboardData(format, Some(HANDLE(h.0))) }.is_err() {
+        if unsafe { SetClipboardData(format, Some(HANDLE(h.0))) }.is_ok() {
+            RENDERED.with(|r| r.set(generation));
+            SHARED.with(|s| {
+                if let Some(shared) = s.borrow().as_ref() {
+                    // SAFETY: plain FFI query; the reader still holds the clipboard, so no
+                    // foreign write can land between our write and this read.
+                    let now = unsafe { GetClipboardSequenceNumber() };
+                    shared.our_sequence.store(now, Ordering::Release);
+                }
+            });
+        } else {
             // SAFETY: the system did not take ownership, so we free it.
             let _ = unsafe { GlobalFree(Some(h)) };
         }
@@ -630,7 +673,6 @@ fn render(format: u32) {
         _ => (None, None),
     };
     let reader_exe = reader_pid.and_then(exe_name_of_pid);
-    let generation = GENERATION.with(Cell::get);
     SHARED.with(|s| {
         if let Some(shared) = s.borrow().as_ref() {
             let mut log = shared.log.lock().unwrap_or_else(|e| e.into_inner());
@@ -685,7 +727,15 @@ fn open_clipboard(hwnd: HWND) -> Result<ClipboardGuard, ClipboardError> {
         if Instant::now() >= deadline {
             return Err(ClipboardError::Busy);
         }
-        std::thread::sleep(Duration::from_millis(5));
+        // Not a plain sleep: the holder may be a reader blocked until we answer its
+        // WM_RENDERFORMAT, which only arrives while this thread takes sent messages.
+        // Posted messages stay queued, so no command runs re-entrantly.
+        let mut msg = MSG::default();
+        // SAFETY: `msg` is a valid out-parameter; only sent messages are dispatched.
+        unsafe {
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+            MsgWaitForMultipleObjectsEx(None, 5, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE);
+        }
     }
 }
 
@@ -819,14 +869,14 @@ fn mark_excluded() {
 
 fn restore_now(
     hwnd: HWND,
+    shared: &Shared,
     snapshot: &ClipboardSnapshot,
     expected_sequence: Option<u32>,
 ) -> Result<RestoreOutcome, ClipboardError> {
     let _open = open_clipboard(hwnd)?;
     // Checked while we hold the clipboard, so a user's copy cannot land between the check
-    // and the restore. A render does not advance the number; a foreign write does.
-    // SAFETY: plain FFI query.
-    let now = unsafe { GetClipboardSequenceNumber() };
+    // and the restore.
+    let now = shared.effective_sequence();
     if expected_sequence.is_some_and(|s| s != now) {
         return Ok(RestoreOutcome::SkippedChanged);
     }
@@ -881,6 +931,7 @@ fn write_delayed_now(
     // SAFETY: plain FFI queries.
     let (sequence, owner) = unsafe { (GetClipboardSequenceNumber(), GetClipboardOwner()) };
     let written_at = Instant::now();
+    shared.written_sequence.store(sequence, Ordering::Release);
     shared.our_sequence.store(sequence, Ordering::Release);
     if owner.ok() != Some(hwnd) {
         tracing::debug!("clipboard owner changed right after our write");
@@ -909,16 +960,52 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    /// Held by every test that touches the real clipboard, whatever the thread count.
     static SERIAL: StdMutex<()> = StdMutex::new(());
 
-    fn read_text_as_other_reader() -> Option<String> {
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Another process holding the clipboard past the retry bound is the environment, not
+    /// a defect, so the test reports SKIPPED and returns.
+    macro_rules! live {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(ClipboardError::Busy) => {
+                    eprintln!(
+                        "SKIPPED: clipboard held by another process at `{}`",
+                        stringify!($e)
+                    );
+                    return;
+                }
+                Err(e) => panic!("{}: {e}", stringify!($e)),
+            }
+        };
+    }
+
+    /// Puts the clipboard back however the test ends, through an owner of its own so it
+    /// still works after the test's owner has shut down.
+    struct RestoreOnDrop(ClipboardSnapshot);
+
+    impl Drop for RestoreOnDrop {
+        fn drop(&mut self) {
+            match WinClipboard::start().map(|cb| cb.restore(&self.0, None)) {
+                Ok(Ok(_)) => {}
+                other => eprintln!("clipboard not restored after the test: {other:?}"),
+            }
+        }
+    }
+
+    fn read_text_as_other_reader() -> Result<Option<String>, ClipboardError> {
         let t = std::thread::spawn(|| {
             let deadline = Instant::now() + Duration::from_secs(2);
             // SAFETY: test-only reader on its own thread; opens with a NULL window.
             unsafe {
                 while OpenClipboard(None).is_err() {
                     if Instant::now() > deadline {
-                        return None;
+                        return Err(ClipboardError::Busy);
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -936,10 +1023,22 @@ mod tests {
                     Some(out)
                 });
                 let _ = CloseClipboard();
-                r
+                Ok(r)
             }
         });
-        t.join().ok().flatten()
+        t.join().expect("reader thread")
+    }
+
+    /// Polls until `want` is on the clipboard or `within` has passed; returns the last read.
+    fn wait_for_text(want: &str, within: Duration) -> Result<Option<String>, ClipboardError> {
+        let deadline = Instant::now() + within;
+        loop {
+            let got = read_text_as_other_reader()?;
+            if got.as_deref() == Some(want) || Instant::now() >= deadline {
+                return Ok(got);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -954,135 +1053,216 @@ mod tests {
 
     #[test]
     fn delayed_write_renders_once_and_restore_round_trips() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        const TEXT: &str = "hello ✓ 😀";
+        let _g = serial();
         let cb = WinClipboard::start().expect("owner");
-        let before = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
+        let before = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
+        let _restore = RestoreOnDrop(before.clone());
 
-        let receipt = cb.write_delayed("hello ✓ 😀").expect("write");
+        let receipt = live!(cb.write_delayed(TEXT));
         assert!(cb.we_own());
         assert_eq!(cb.sequence_number(), receipt.sequence);
-        let got = read_text_as_other_reader();
-        assert_eq!(got.as_deref(), Some("hello ✓ 😀"));
+        assert_eq!(live!(read_text_as_other_reader()).as_deref(), Some(TEXT));
         let ev = cb
             .wait_for_render(Duration::from_secs(2))
             .expect("render event");
         assert_eq!(ev.generation, receipt.generation);
         assert_eq!(ev.format, CF_UNICODETEXT);
+        // Not exactly 1: a clipboard monitor racing our reader makes Windows ask twice.
+        let renders = cb.render_count();
+        assert!(renders >= 1);
+        // The conditional restore below relies on our renders leaving the number alone.
         assert_eq!(cb.sequence_number(), receipt.sequence);
-        assert_eq!(cb.render_count(), 1);
-        assert_eq!(read_text_as_other_reader().as_deref(), Some("hello ✓ 😀"));
-        assert_eq!(cb.render_count(), 1);
+        assert_eq!(live!(read_text_as_other_reader()).as_deref(), Some(TEXT));
+        assert_eq!(
+            cb.render_count(),
+            renders,
+            "a reader after the first render must get the cached copy"
+        );
+        assert_eq!(cb.sequence_number(), receipt.sequence);
 
-        let outcome = cb
-            .restore(&before, Some(receipt.sequence))
-            .expect("restore");
+        let outcome = live!(cb.restore(&before, Some(receipt.sequence)));
         assert_eq!(outcome, RestoreOutcome::Restored);
-        let after = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot after");
+        assert!(
+            cb.sequence_number() > receipt.sequence,
+            "restore wrote nothing"
+        );
+        let after = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
         assert_eq!(after.text(), before.text());
+    }
+
+    /// What Windows does when readers race for a fresh write: a second WM_RENDERFORMAT for
+    /// text already rendered. Answering it replaces the data and advances the raw number.
+    #[test]
+    fn a_repeat_render_is_not_mistaken_for_a_foreign_write() {
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let _g = serial();
+        let cb = WinClipboard::start().expect("owner");
+        let before = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
+        let _restore = RestoreOnDrop(before.clone());
+        let receipt = live!(cb.write_delayed("asked twice"));
+        assert_eq!(
+            live!(read_text_as_other_reader()).as_deref(),
+            Some("asked twice")
+        );
+        let hwnd = cb.inner.hwnd;
+        let asked = std::thread::spawn(move || {
+            // SAFETY: test-only reader thread; the owner answers WM_RENDERFORMAT while we
+            // hold the clipboard open, as it would for a real racing reader.
+            unsafe {
+                if OpenClipboard(None).is_err() {
+                    return false;
+                }
+                SendMessageW(
+                    hwnd_from(hwnd),
+                    WM_RENDERFORMAT,
+                    Some(WPARAM(CF_UNICODETEXT as usize)),
+                    None,
+                );
+                let _ = CloseClipboard();
+                true
+            }
+        })
+        .join()
+        .expect("reader");
+        if !asked {
+            eprintln!("SKIPPED: clipboard held by another process");
+            return;
+        }
+        // SAFETY: plain FFI query.
+        let raw = unsafe { GetClipboardSequenceNumber() };
+        assert_ne!(raw, receipt.sequence, "the repeat render replaced nothing");
+        assert_eq!(cb.sequence_number(), receipt.sequence);
+        assert!(cb.wait_for_render_or_change(Duration::ZERO).is_ok());
+        assert_eq!(
+            live!(read_text_as_other_reader()).as_deref(),
+            Some("asked twice")
+        );
+        assert_eq!(
+            live!(cb.restore(&before, Some(receipt.sequence))),
+            RestoreOutcome::Restored
+        );
+        assert_eq!(
+            live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP)).text(),
+            before.text()
+        );
     }
 
     #[test]
     fn restore_is_skipped_after_a_foreign_write() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = serial();
         let cb = WinClipboard::start().expect("owner");
-        let before = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
-        let receipt = cb.write_delayed("ours").expect("write");
-        let seq = cb.write_text("the user copied this").expect("write");
+        let before = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
+        let _restore = RestoreOnDrop(before.clone());
+        let receipt = live!(cb.write_delayed("ours"));
+        let seq = live!(cb.write_text("the user copied this"));
         assert_ne!(seq, receipt.sequence);
         assert_eq!(
-            cb.restore(&before, Some(receipt.sequence)).unwrap(),
+            live!(cb.restore(&before, Some(receipt.sequence))),
             RestoreOutcome::SkippedChanged
         );
+        assert_eq!(cb.sequence_number(), seq, "a refused restore wrote");
         assert_eq!(
-            read_text_as_other_reader().as_deref(),
+            live!(read_text_as_other_reader()).as_deref(),
             Some("the user copied this")
         );
-        cb.restore(&before, None).unwrap();
     }
 
     #[test]
     fn snapshot_copies_text() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = serial();
         let cb = WinClipboard::start().expect("owner");
-        let before = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
-        cb.write_text("snap me").unwrap();
-        let s = cb.snapshot(DEFAULT_SNAPSHOT_CAP).unwrap();
+        let _restore = RestoreOnDrop(live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP)));
+        live!(cb.write_text("snap me"));
+        let s = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
         assert_eq!(s.text().as_deref(), Some("snap me"));
-        let tiny = cb.snapshot(4).unwrap();
+        let tiny = live!(cb.snapshot(4));
         assert!(tiny.truncated);
-        cb.restore(&before, None).unwrap();
     }
 
     #[test]
     fn scheduled_restore_fires_later_and_a_new_snapshot_takes_it_over() {
-        use hush_core::insert::ClipboardPort;
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let mut cb = WinClipboard::start().expect("owner");
-        let original = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
-        cb.write_text("user text").unwrap();
+        // Long enough that the reads and writes between scheduling and firing finish first
+        // even when another reader holds the clipboard for a while.
+        const DELAY: Duration = Duration::from_millis(1000);
+        let _g = serial();
+        let cb = WinClipboard::start().expect("owner");
+        let _restore = RestoreOnDrop(live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP)));
+        live!(cb.write_text("user text"));
 
-        let snap1 = ClipboardPort::snapshot(&mut cb).unwrap();
-        let seq1 = ClipboardPort::write_delayed(&mut cb, "dictation one").unwrap();
-        ClipboardPort::restore(&mut cb, snap1, Duration::from_millis(300), seq1);
-        let snap2 = ClipboardPort::snapshot(&mut cb).unwrap();
-        assert_eq!(snap2.text().as_deref(), Some("user text"));
-        let seq2 = ClipboardPort::write_delayed(&mut cb, "dictation two").unwrap();
-        ClipboardPort::restore(&mut cb, snap2, Duration::from_millis(100), seq2);
+        let snap1 = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
+        let seq1 = live!(cb.write_delayed("dictation one")).sequence;
+        cb.restore_later(snap1, DELAY, seq1);
+        let snap2 = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
         assert_eq!(
-            read_text_as_other_reader().as_deref(),
+            snap2.text().as_deref(),
+            Some("user text"),
+            "a snapshot taken while a restore is pending must take that restore over"
+        );
+        let seq2 = live!(cb.write_delayed("dictation two")).sequence;
+        let scheduled_at = Instant::now();
+        cb.restore_later(snap2, DELAY, seq2);
+        assert_eq!(
+            live!(read_text_as_other_reader()).as_deref(),
             Some("dictation two")
         );
-        std::thread::sleep(Duration::from_millis(500));
-        let now = cb.sequence_number();
+        assert!(
+            scheduled_at.elapsed() < DELAY,
+            "too slow to observe the delay"
+        );
+        let got = live!(wait_for_text("user text", DELAY * 3));
         assert_eq!(
-            read_text_as_other_reader().as_deref(),
+            got.as_deref(),
             Some("user text"),
-            "seq at write {seq2}, now {now}, owner is us: {}",
+            "seq at write {seq2}, now {}, owner is us: {}",
+            cb.sequence_number(),
             cb.we_own()
         );
 
-        let snap3 = ClipboardPort::snapshot(&mut cb).unwrap();
-        let seq3 = ClipboardPort::write_delayed(&mut cb, "dictation three").unwrap();
-        ClipboardPort::restore(&mut cb, snap3, Duration::from_millis(100), seq3);
-        cb.write_text("copied meanwhile").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        let snap3 = live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP));
+        assert_eq!(snap3.text().as_deref(), Some("user text"));
+        let seq3 = live!(cb.write_delayed("dictation three")).sequence;
+        let scheduled_at = Instant::now();
+        cb.restore_later(snap3, DELAY, seq3);
+        let meanwhile = live!(cb.write_text("copied meanwhile"));
+        std::thread::sleep(
+            (scheduled_at + DELAY + Duration::from_millis(300))
+                .saturating_duration_since(Instant::now()),
+        );
         assert_eq!(
-            read_text_as_other_reader().as_deref(),
+            live!(read_text_as_other_reader()).as_deref(),
             Some("copied meanwhile")
         );
-        cb.restore(&original, None).unwrap();
+        assert_eq!(cb.sequence_number(), meanwhile, "a refused restore wrote");
     }
 
     #[test]
     fn render_wait_reports_a_foreign_write_as_changed() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = serial();
         let cb = WinClipboard::start().expect("owner");
-        let before = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
-        cb.write_delayed("x").unwrap();
+        let _restore = RestoreOnDrop(live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP)));
+        live!(cb.write_delayed("x"));
         let other = WinClipboard::start().expect("second owner");
-        other.write_text("foreign").unwrap();
+        live!(other.write_text("foreign"));
         // Once the foreign write has landed nothing can render ours any more, so this check
-        // is final. Under RDP, rdpclip has usually rendered before it, and a render
-        // legitimately outranks the change.
+        // is final. A clipboard monitor (rdpclip under RDP) has often rendered before it,
+        // and a render legitimately outranks the change.
         if cb.first_render().is_none() {
             let r = cb.wait_for_render_or_change(Duration::from_millis(500));
             assert!(matches!(r, Err(Waited::Changed)), "{r:?}");
         }
-        cb.restore(&before, None).unwrap();
     }
 
     #[test]
     fn shutdown_renders_pending_text() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = serial();
         let cb = WinClipboard::start().expect("owner");
-        let before = cb.snapshot(DEFAULT_SNAPSHOT_CAP).expect("snapshot");
-        cb.write_delayed("survives shutdown").unwrap();
+        let _restore = RestoreOnDrop(live!(cb.snapshot(DEFAULT_SNAPSHOT_CAP)));
+        live!(cb.write_delayed("survives shutdown"));
         cb.shutdown();
         assert_eq!(
-            read_text_as_other_reader().as_deref(),
+            live!(read_text_as_other_reader()).as_deref(),
             Some("survives shutdown")
         );
-        let cb2 = WinClipboard::start().expect("owner");
-        cb2.restore(&before, None).unwrap();
     }
 }
