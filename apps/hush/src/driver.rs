@@ -27,7 +27,7 @@ use hush_platform_windows::ui_thread::{
     self, INSTANCE_MUTEX, UiError, UiHandle, UiOptions, WinNotifier,
 };
 
-use crate::engines::{self, EngineSummary};
+use crate::engines::{self, EngineSummary, NormalizerReady};
 use crate::setup::{self, Paths};
 use crate::workers::{
     self, EngineLoader, InsertCmd, NormCmd, NormJob, SttJob, Timers, Vocabulary, outcome_label,
@@ -62,8 +62,9 @@ pub enum Msg {
     Tray(TrayEvent),
     Event(Event),
     EngineReady(std::result::Result<EngineSummary, String>),
-    /// `Err` means the app stays rules-only.
-    NormalizerReady(std::result::Result<String, String>),
+    /// `Ok(None)` is rules-only by configuration; `Err` is rules-only because the LLM
+    /// could not be had.
+    NormalizerReady(std::result::Result<Option<NormalizerReady>, String>),
     PasteLastDone(std::result::Result<InsertOutcome, InsertError>),
     /// Shown until replaced, unlike a toast.
     Status(String),
@@ -146,22 +147,20 @@ impl Workers {
 
 /// The app is rules-only until (and unless) this reports ready.
 pub fn spawn_normalizer_upgrade(config: &Config, norm: Sender<NormCmd>, tx: Sender<Msg>) {
-    let Some(http) = engines::http_config(&config.normalizer) else {
-        let _ = tx.send(Msg::NormalizerReady(Err(
-            "rules only (normalizer.kind = \"rules\")".into(),
-        )));
-        return;
-    };
+    let config = config.clone();
     let spawned = std::thread::Builder::new()
         .name("hush-normalizer-warm".into())
         .spawn(move || {
-            let label = format!("{} via {}", http.model, http.base_url);
-            let msg = match engines::build_http_normalizer(http) {
-                Ok((n, warm)) => {
+            let mut status = |s: &str| {
+                let _ = tx.send(Msg::Status(s.into()));
+            };
+            let msg = match engines::build_normalizer(&config, &mut status) {
+                Ok(Some((n, ready))) => {
                     let _ = norm.send(NormCmd::Upgrade(n));
-                    Ok(format!("{label} (warm-up {} ms)", warm.as_millis()))
+                    Ok(Some(ready))
                 }
-                Err(e) => Err(format!("{e:#}; continuing rules-only")),
+                Ok(None) => Ok(None),
+                Err(e) => Err(format!("{e:#}")),
             };
             let _ = tx.send(Msg::NormalizerReady(msg));
         });
@@ -311,15 +310,37 @@ impl Driver {
             }
             Msg::EngineReady(r) => self.on_engine_ready(r),
             Msg::NormalizerReady(r) => {
-                match r {
-                    Ok(desc) => {
-                        tracing::info!(normalizer = %desc, "LLM normalizer ready");
+                let notice = match r {
+                    Ok(Some(ready)) => {
+                        tracing::info!(normalizer = %ready.label, "LLM normalizer ready");
                         self.normalizer = "LLM".into();
+                        match ready.cpu_fallback {
+                            // A GPU product never silently becomes a CPU product.
+                            Some(why) => {
+                                tracing::warn!(reason = %why, "language model runs on the CPU");
+                                Some("GPU unavailable; language model runs on the CPU")
+                            }
+                            None => Some("Language model ready"),
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::info!("normalizer: rules only (normalizer.kind = \"rules\")");
+                        self.normalizer = "rules".into();
+                        None
                     }
                     Err(why) => {
-                        tracing::info!(reason = %why, "normalizer: rules only");
+                        tracing::warn!(reason = %why, "language model unavailable; rules only");
                         self.normalizer = "rules".into();
+                        Some("Language model unavailable; cleanup is rules-only")
                     }
+                };
+                if let Some(message) = notice
+                    && !self.pipeline.is_active()
+                    && !self.paused
+                {
+                    self.ui.set_overlay(OverlayState::Notice {
+                        message: message.into(),
+                    });
                 }
                 self.update_tooltip();
             }

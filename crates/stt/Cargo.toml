@@ -11,6 +11,11 @@ build = "build.rs"
 default = []
 # Off by default: no ONNX Runtime in default builds; ggml/Vulkan measured about 2x faster.
 ort-engine = ["dep:parakeet-rs", "dep:ort"]
+# transcribe.cpp and its ggml as DLLs next to the exe. Needed when llama.cpp is linked
+# into the same binary: both vendor a static ggml (0.20 and 0.24), and two static copies
+# collide at link time (LNK2005). Only transcribe can move out, because its Rust side
+# calls no ggml function directly and llama-cpp-2's does.
+transcribe-shared = ["transcribe-cpp/shared"]
 
 [dependencies]
 hush-core ={ path = "../core" }

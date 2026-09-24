@@ -2,26 +2,42 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use hush_core::normalize::{AppContext, NormalizeRequest, Normalizer, Style};
-use hush_normalize::openai_http::{Attempt, HttpConfig, OpenAiHttpNormalizer};
+use hush_core::normalize::{AppContext, NormalizeError, NormalizeRequest, Normalizer, Style};
+use hush_normalize::llm::Attempt;
+use hush_normalize::openai_http::{HttpConfig, OpenAiHttpNormalizer};
 use hush_normalize::{rules, should_use_llm};
 use serde::Deserialize;
 
-const USAGE: &str = "usage: bench-normalize [--base-url URL] [--model NAME]... [--runs N] \
-[--fixtures PATH] [--timeout-ms MS] [--case SUBSTRING] [--rules-only]
+const USAGE: &str = "usage: bench-normalize [--normalizer http|llama-cpp] [--base-url URL] \
+[--model NAME]... [--gguf PATH] [--pci BUS | --device N] [--runs N] [--fixtures PATH] \
+[--timeout-ms MS] [--case SUBSTRING] [--rules-only]
 
-  --base-url   OpenAI-style base URL (default http://localhost:11434/v1)
-  --model      model name; repeat or comma-separate for several (default
+  --normalizer http (default) or llama-cpp, the embedded one
+  --base-url   http: OpenAI-style base URL (default http://localhost:11434/v1)
+  --model      http: model name; repeat or comma-separate for several (default
                qwen3:4b-instruct-2507-q4_K_M)
+  --gguf       llama-cpp: model file (default: the one `hush doctor` downloads)
+  --pci        llama-cpp: Vulkan device whose PCI bus id contains this
+  --device     llama-cpp: Vulkan device index, as `hush doctor` lists them (default 0)
   --runs       LLM runs per case, for latency percentiles (default 3)
   --fixtures   fixtures TOML (default: the one shipped with this tool)
   --timeout-ms per-request timeout (default 5000)
   --case       only run cases whose name contains this
   --rules-only skip the LLM";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Http,
+    LlamaCpp,
+}
+
 struct Args {
+    kind: Kind,
     base_url: String,
     models: Vec<String>,
+    gguf: Option<PathBuf>,
+    pci: Option<String>,
+    device: Option<usize>,
     runs: usize,
     fixtures: PathBuf,
     timeout: Duration,
@@ -31,8 +47,12 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
+        kind: Kind::Http,
         base_url: "http://localhost:11434/v1".into(),
         models: Vec::new(),
+        gguf: None,
+        pci: None,
+        device: None,
         runs: 3,
         fixtures: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/transcripts.toml"),
         timeout: Duration::from_secs(5),
@@ -46,6 +66,16 @@ fn parse_args() -> Result<Args> {
                 .with_context(|| format!("{flag} needs a value\n{USAGE}"))
         };
         match flag.as_str() {
+            "--normalizer" => {
+                a.kind = match value()?.as_str() {
+                    "http" => Kind::Http,
+                    "llama-cpp" => Kind::LlamaCpp,
+                    other => bail!("--normalizer takes http or llama-cpp, got {other}"),
+                }
+            }
+            "--gguf" => a.gguf = Some(value()?.into()),
+            "--pci" => a.pci = Some(value()?),
+            "--device" => a.device = Some(value()?.parse().context("--device")?),
             "--base-url" => a.base_url = value()?,
             "--model" => a.models.extend(
                 value()?
@@ -166,6 +196,8 @@ struct Summary {
     expected_final: usize,
     unstable: usize,
     latencies: Vec<Duration>,
+    /// Prompt tokens, prefill time, output tokens, decode time; per run.
+    splits: Vec<(usize, Duration, usize, Duration)>,
     warm_error: Option<String>,
 }
 
@@ -199,12 +231,111 @@ fn main() -> Result<()> {
     let rules_summary = run_rules(&cases);
     let mut summaries = Vec::new();
     if !args.rules_only {
-        for model in &args.models {
-            summaries.push(run_model(&args, model, &cases));
+        match args.kind {
+            Kind::Http => {
+                for model in &args.models {
+                    let mut cfg = HttpConfig::new(&args.base_url, model);
+                    cfg.timeout = args.timeout;
+                    let mut llm = Llm::Http(OpenAiHttpNormalizer::new(cfg));
+                    summaries.push(run_model(&args, model, &mut llm, &cases));
+                }
+            }
+            Kind::LlamaCpp => {
+                let (label, mut llm) = load_llama(&args)?;
+                summaries.push(run_model(&args, &label, &mut llm, &cases));
+            }
         }
     }
     print_summary(&rules_summary, &summaries);
     Ok(())
+}
+
+enum Llm {
+    Http(OpenAiHttpNormalizer),
+    #[cfg(feature = "llama-cpp")]
+    Llama(Box<hush_normalize::LlamaCppNormalizer>),
+}
+
+impl Llm {
+    fn warm(&mut self) -> Result<(), NormalizeError> {
+        match self {
+            Self::Http(n) => n.warm(),
+            #[cfg(feature = "llama-cpp")]
+            Self::Llama(n) => n.warm(),
+        }
+    }
+
+    fn attempt(&mut self, req: &NormalizeRequest<'_>) -> Result<Attempt, NormalizeError> {
+        match self {
+            Self::Http(n) => n.attempt(req),
+            #[cfg(feature = "llama-cpp")]
+            Self::Llama(n) => n.attempt(req),
+        }
+    }
+
+    /// Prefill and decode of the last request, where the backend can split them.
+    fn split(&self) -> Option<(usize, Duration, usize, Duration)> {
+        match self {
+            Self::Http(_) => None,
+            #[cfg(feature = "llama-cpp")]
+            Self::Llama(n) => n
+                .last_run()
+                .map(|s| (s.prefill_tokens, s.prefill, s.output_tokens, s.decode)),
+        }
+    }
+}
+
+/// Where `hush doctor` puts the default language model.
+#[cfg(feature = "llama-cpp")]
+fn default_gguf() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|l| {
+        PathBuf::from(l)
+            .join("hush/models/qwen3-4b-instruct-2507-q4_k_m/Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
+    })
+}
+
+#[cfg(feature = "llama-cpp")]
+fn load_llama(args: &Args) -> Result<(String, Llm)> {
+    use hush_normalize::llama_cpp::{self, DeviceChoice, LlamaCppConfig, LlamaCppNormalizer};
+
+    let path = args
+        .gguf
+        .clone()
+        .or_else(default_gguf)
+        .context("no --gguf and no LOCALAPPDATA")?;
+    let device = match (&args.pci, args.device) {
+        (Some(p), _) => DeviceChoice::Pci(p.clone()),
+        (None, Some(i)) => DeviceChoice::VulkanIndex(i),
+        (None, None) => DeviceChoice::FirstGpu,
+    };
+    for d in llama_cpp::vulkan_devices()? {
+        println!("vulkan {}: {} [{}]", d.vulkan_index, d.description, d.pci);
+    }
+    let started = Instant::now();
+    let n = LlamaCppNormalizer::load(LlamaCppConfig {
+        model_id: path
+            .file_name()
+            .map_or_else(|| "model".into(), |f| f.to_string_lossy().into_owned()),
+        model_path: path,
+        device,
+        gpu: hush_core::config::GpuPolicy::RequireGpu,
+        timeout: args.timeout,
+    })?;
+    let b = n.backend();
+    println!(
+        "llama-cpp: {:?} on {}, {}/{} layers offloaded, load {} ms\n",
+        b.backend,
+        b.device.as_deref().unwrap_or("CPU"),
+        b.layers_offloaded,
+        b.layers_total,
+        ms(started.elapsed())
+    );
+    Ok((n.id().to_string(), Llm::Llama(Box::new(n))))
+}
+
+#[cfg(not(feature = "llama-cpp"))]
+fn load_llama(_: &Args) -> Result<(String, Llm)> {
+    bail!("built without the `llama-cpp` feature")
 }
 
 fn run_rules(cases: &[&Case]) -> Summary {
@@ -244,11 +375,8 @@ fn run_rules(cases: &[&Case]) -> Summary {
     s
 }
 
-fn run_model(args: &Args, model: &str, cases: &[&Case]) -> Summary {
+fn run_model(args: &Args, model: &str, n: &mut Llm, cases: &[&Case]) -> Summary {
     println!("## {model}\n");
-    let mut cfg = HttpConfig::new(&args.base_url, model);
-    cfg.timeout = args.timeout;
-    let mut n = OpenAiHttpNormalizer::new(cfg);
     let mut s = Summary {
         model: model.into(),
         ..Default::default()
@@ -267,7 +395,12 @@ fn run_model(args: &Args, model: &str, cases: &[&Case]) -> Summary {
         let mut errors = Vec::new();
         for _ in 0..args.runs {
             match c.with_request(|r| n.attempt(r)) {
-                Ok(a) => attempts.push(a),
+                Ok(a) => {
+                    attempts.push(a);
+                    if let Some(split) = n.split() {
+                        s.splits.push(split);
+                    }
+                }
                 Err(e) => errors.push(e.to_string()),
             }
         }
@@ -407,6 +540,24 @@ fn print_summary(rules: &Summary, models: &[Summary]) {
             s.unstable,
             ms(percentile(&l, 0.5)),
             ms(percentile(&l, 0.95)),
+        );
+    }
+    for s in models.iter().filter(|s| !s.splits.is_empty()) {
+        let n = s.splits.len() as f64;
+        let sum = |f: fn(&(usize, Duration, usize, Duration)) -> f64| {
+            s.splits.iter().map(f).sum::<f64>() / n
+        };
+        let decode_ms = sum(|x| x.3.as_secs_f64() * 1e3);
+        let out_tok = sum(|x| x.2 as f64);
+        println!(
+            "\n{}: mean per request, prefill {:.1} tokens in {:.1} ms (to the first token), \
+             decode {:.1} tokens in {:.1} ms ({:.0} tokens/s)",
+            s.model,
+            sum(|x| x.0 as f64),
+            sum(|x| x.1.as_secs_f64() * 1e3),
+            out_tok,
+            decode_ms,
+            out_tok / (decode_ms / 1e3).max(1e-9)
         );
     }
 }

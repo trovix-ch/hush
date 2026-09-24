@@ -69,10 +69,9 @@ short target directory, or a junction.
 
 - The rule pass, the user-message format and validation come from the real crate:
   `hush-normalize` is a path dependency, called as `bench-normalize` calls it. The system
-  prompt is **copied verbatim** into `src/prompt.rs`, as the gate required, and at startup
-  the binary asserts that it is byte-identical to `hush_normalize::prompt::system_prompt`.
-  Keep the two in sync until the embedded backend lives in the crate and reuses the
-  constant.
+  prompt was **copied verbatim** into the spike for the measurements, and the binary
+  asserted byte equality with the crate at startup. Since the embedded backend moved into
+  the crate (milestone 3), the spike imports the prompt and the grammar from it.
 - The chat is rendered with the model's own template through
   `LlamaModel::apply_chat_template`, which is llama.cpp's built-in template matcher (the
   chatml family for Qwen, granite for Granite). It is split at the user message.
@@ -88,7 +87,7 @@ short target directory, or a junction.
   template mentions `<think>` only when it re-renders earlier assistant turns. No output
   contained `<think>`: this was checked on each case's first run in every mode, and the
   repeat runs never differed from the first. The Granite template has no `<think>`.
-- Grammar: `src/grammar.rs` builds a GBNF that is the complement of a trie of forbidden
+- Grammar: the spike's grammar module (now the crate's) builds a GBNF that is the complement of a trie of forbidden
   leading prefixes: `Here`, `Sure`, `Certainly` (both cases), `"`, a backtick, `“`, `„`,
   `«`, and any leading whitespace. A word is exempt when the source itself starts with it,
   so a dictated "Sure, ..." still works. Applying the grammar to the whole 151k-token

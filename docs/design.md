@@ -191,6 +191,16 @@ validated one case fewer: the bundled model is pinned by hash and the fixtures r
 on that exact file. The very first Vulkan run on a fresh driver cache took 21 s, so
 start-up warms the LLM the same way it warms the speech engine.
 
+*Amended 2026-09-24 (milestone 3):* the embedded backend is the default normalizer. The
+bundled GGUF is Ollama's exact file, fetched from the Ollama registry by its sha256: none
+of the 256 Hugging Face GGUF repositories for the model that were checked carries it.
+On the current prompt it validates 28 of 30 fixtures, and so does the HTTP path; both
+gave 29 before the per-app `<app>` wording changed the prompt (§7). llama.cpp and
+transcribe.cpp each vendor a static ggml (0.24 and 0.20), whose symbols collide at link
+time, so the default build links transcribe.cpp as a DLL. The process therefore holds two
+ggml copies and two Vulkan instances: D13's single GPU runtime is not met until both
+build against one ggml.
+
 Two caveats the review panel made explicit:
 - The HTTP path proves prompt *correctness*, not latency and not grammar safety. It
   cannot snapshot the prefix state and most servers offer no grammar constraint, so an
@@ -729,14 +739,50 @@ Ollama), 2026-09-24:
 Per request with the prefix cached: 46 prompt tokens in 29 ms, 10 output tokens in
 89 ms (about 115 tokens/s), so generation is 80 % of the cost.
 
-Pending: latency under GPU contention with the speech engine on the same card.
+### Embedded normalizer in the app, 2026-09-24
+Method: release build, the manifest's Qwen3-4B file (Ollama's, sha256 `85e4a5b7…`),
+Vulkan, RDP session. `bench-normalize --normalizer llama-cpp --pci 05:00 --runs 3` and,
+for the same prompt revision, `bench-normalize --runs 3` against Ollama 0.34 on the other
+card; latency is the call from rule-pass text to verdict.
+
+| normalizer | validated | forbidden text raw / inserted | matches expected | p50 ms | p95 ms |
+|---|---|---|---|---|---|
+| llama-cpp, embedded | 28/30 | 0 / 0 | 25/28 | 105 | 174 |
+| Ollama over HTTP | 28/30 | 0 / 0 | 24/28 | 101 | 166 |
+
+Both reject the same two code-style cases ("dash m" to "-m", "dash dash workspace" to
+"-- workspace"), which the app never sends to the LLM. Embedded, a request prefills 56
+tokens in 30 ms and decodes 10 in 83 ms (119 tokens/s). Three of 30 outputs differ
+between the backends by a word or a comma.
+
+`hush simulate tools/bench-stt/fixtures/tts-10s-fillers.wav --runs 10`, into Notepad,
+speech on Vulkan device 1 (PCI 05:00), p50 / p95 ms from key release:
+
+| language model on | speech | cleanup | paste | total |
+|---|---|---|---|---|
+| the same card as speech | 238 / 267 | 243 / 246 | 1.4 / 1.6 | 480 / 513 |
+| the other card (PCI 01:00, Ollama idle on it) | 226 / 294 | 244 / 336 | 1.4 / 1.7 | 480 / 564 |
+| rules only (5 runs) | 274 / 314 | 0.1 | 1.5 | 276 / 315 |
+
+Sharing the card costs nothing measurable here, because the pipeline never runs speech
+and the LLM at the same time; overlapping utterances were not measured. A first 5-run
+pass had the split configuration slower (cleanup 395 against 280 ms p50) and did not
+reproduce, so single runs of this benchmark are noise. Speech takes about 230–280 ms in
+every configuration including rules-only, against 75 ms back to back in `bench-stt`
+(measured again today). The rules-only row shows it is not the LLM; the 11 s between
+runs is the suspect, as in the unexplained alternation under "Whole pipeline" above
+(unverified). The Ninja-built and the Visual-Studio-built speech libraries measured the
+same in `bench-stt` (72–79 ms medians, interleaved). Cleanup is 240 ms rather
+than 105 because this utterance produces about 25 tokens.
 
 ## 8. Build requirements on the development machine *(perishable, 2026-09-24)*
 
 Present: Rust 1.97 stable MSVC, Visual Studio 2022 Community with MSVC 14.44, CMake 4.4
 and LLVM 23 (both installed today), Vulkan SDK (installing today, for the D13 spike),
 Ollama 0.34, two RTX 5060 Ti 16 GB, Ryzen 9 9900X, 93 GB RAM. Absent: CUDA toolkit
-(not needed under D2/D5), Node.js (not needed).
+(not needed under D2/D5), Node.js (not needed). Since the embedded LLM (milestone 3):
+Ninja 1.13 (`uv tool install ninja`) and LLVM's libclang are required, and the machine
+also has an AMD integrated GPU that Vulkan lists first, as device 0.
 
 The design was reviewed by an outside three-model panel on 2026-09-24
 (`docs/research/2026-09-24-design-review-panel.md`); D4, D5, D7, D8, D10 and D12 were

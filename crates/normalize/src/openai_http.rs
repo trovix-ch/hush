@@ -2,15 +2,12 @@
 
 use std::time::{Duration, Instant};
 
-use hush_core::normalize::{
-    NormalizeError, NormalizeOutput, NormalizeRequest, Normalizer, Provenance, Rejection, Scores,
-    Style,
-};
+use hush_core::normalize::{NormalizeError, NormalizeOutput, NormalizeRequest, Normalizer};
 use serde::{Deserialize, Serialize};
 
+use crate::llm::{self, Attempt};
 use crate::prompt::{self, ChatMessage};
 use crate::rules::RuleNormalizer;
-use crate::validate;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Loading a 4B model from disk takes several seconds; only `warm` gets this long.
@@ -72,15 +69,6 @@ impl HttpConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Attempt {
-    /// What the LLM was given, and what is inserted if it is rejected.
-    pub rule_text: String,
-    pub candidate: String,
-    pub verdict: Result<Scores, Rejection>,
-    pub llm_elapsed: Duration,
-}
-
 pub struct OpenAiHttpNormalizer {
     cfg: HttpConfig,
     id: String,
@@ -118,28 +106,16 @@ impl OpenAiHttpNormalizer {
         if req.cancel.is_cancelled() {
             return Err(NormalizeError::Cancelled);
         }
-        let candidate = strip_think(&reply.content).trim().to_string();
-        let verdict = if reply.truncated {
-            Err(Rejection::Truncated)
-        } else {
-            let mut vcfg = validate::Config::new(req.language, req.vocabulary);
-            vcfg.verbatim = matches!(req.app.style, Style::Code | Style::None);
-            validate::validate_with(&rule_text, &candidate, &vcfg)
-        };
+        let attempt = llm::judge(req, rule_text, &reply.content, reply.truncated, llm_elapsed);
         tracing::debug!(
             model = %self.cfg.model,
             ms = llm_elapsed.as_millis() as u64,
             prompt_tokens = reply.prompt_tokens,
             cached_tokens = reply.cached_tokens,
-            ?verdict,
+            verdict = ?attempt.verdict,
             "llm normalize"
         );
-        Ok(Attempt {
-            rule_text,
-            candidate,
-            verdict,
-            llm_elapsed,
-        })
+        Ok(attempt)
     }
 
     fn chat(
@@ -216,45 +192,14 @@ impl Normalizer for OpenAiHttpNormalizer {
     fn normalize(&mut self, req: &NormalizeRequest<'_>) -> Result<NormalizeOutput, NormalizeError> {
         let start = Instant::now();
         let a = self.attempt(req)?;
-        let model = self.cfg.model.clone();
-        let (text, provenance) = match a.verdict {
-            Ok(scores) => (a.candidate, Provenance::Llm { model, scores }),
-            Err(rejection) => {
-                tracing::info!(
-                    check = rejection.check().as_str(),
-                    score = rejection.score(),
-                    threshold = rejection.threshold(),
-                    reason = %rejection,
-                    "llm output rejected; using rule pass"
-                );
-                (a.rule_text, Provenance::LlmRejected { model, rejection })
-            }
-        };
-        Ok(NormalizeOutput {
-            utterance: req.utterance,
-            text,
-            provenance,
-            elapsed: start.elapsed(),
-        })
+        Ok(llm::into_output(req, a, &self.cfg.model, start))
     }
 }
 
-/// A faithful cleanup is never longer than its input; the cap exists to stop a runaway
-/// repetition loop.
+/// A server does not expose its tokenizer, so the input's token count is estimated at 1.3
+/// per word.
 pub fn max_tokens(text: &str) -> u32 {
-    let est = (text.split_whitespace().count() as f64 * 1.3).ceil();
-    (est * 1.5).ceil() as u32 + 20
-}
-
-/// Qwen3 models may emit an empty `<think></think>` pair even with thinking off.
-fn strip_think(s: &str) -> &str {
-    let t = s.trim_start();
-    if let Some(rest) = t.strip_prefix("<think>")
-        && let Some(end) = rest.find("</think>")
-    {
-        return &rest[end + "</think>".len()..];
-    }
-    s
+    llm::token_cap((text.split_whitespace().count() as f64 * 1.3).ceil() as usize)
 }
 
 /// Every request timeout is either the caller's deadline or the configured cap standing in
@@ -390,12 +335,6 @@ mod tests {
     fn token_budget_is_one_and_a_half_times_the_estimate_plus_slack() {
         assert_eq!(max_tokens("a b c d e f g h i j"), 40);
         assert_eq!(max_tokens(""), 20);
-    }
-
-    #[test]
-    fn empty_think_block_is_stripped() {
-        assert_eq!(strip_think("<think>\n\n</think>\n\nHello."), "\n\nHello.");
-        assert_eq!(strip_think("Hello <think>"), "Hello <think>");
     }
 
     #[test]

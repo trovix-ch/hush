@@ -6,11 +6,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["llama-cpp"]
+# The embedded LLM normalizer; without it cleanup is rules-only or over HTTP.
+llama-cpp = ["hush-normalize/llama-cpp", "hush-stt/transcribe-shared"]
+
 [dependencies]
 hush-core = { path = "../../crates/core" }
 hush-audio = { path = "../../crates/audio" }
 hush-stt = { path = "../../crates/stt" }
-hush-normalize = { path = "../../crates/normalize" }
+hush-normalize = { path = "../../crates/normalize", default-features = false }
 hush-platform-windows ={ path = "../../crates/platform-windows" }
 anyhow = "1"
 ctrlc = "3"

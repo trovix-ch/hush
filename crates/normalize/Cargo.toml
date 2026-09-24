@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["llama-cpp"]
+# The embedded LLM. Off leaves the rule pass and the HTTP backend, and no C++ build.
+llama-cpp = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:encoding_rs"]
+
 [dependencies]
 hush-core ={ path = "../core" }
 thiserror = "2"
@@ -15,6 +20,13 @@ serde_json = "1"
 strsim = "0.11"
 # No TLS: the backend is the user's own local server, and nothing leaves the machine.
 ureq = { version = "3", default-features = false, features = ["json"] }
+# Pinned exactly: the bindings track llama.cpp and break API between patches. `common` is
+# not needed (the chat template goes through llama.cpp's built-in matcher), but
+# llama-cpp-2 enables it on the sys crate regardless.
+llama-cpp-2 = { version = "=0.1.157", optional = true, default-features = false, features = ["vulkan", "openmp"] }
+# Only for the device's PCI bus id, which the safe device listing does not expose.
+llama-cpp-sys-2 = { version = "=0.1.157", optional = true, default-features = false }
+encoding_rs = { version = "0.8", optional = true }
 
 [lints]
 workspace = true

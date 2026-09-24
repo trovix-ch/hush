@@ -2,8 +2,6 @@
 //! contract, prefix-state caching, greedy decoding, a hard token cap and an optional
 //! anti-preamble grammar. Throwaway; the README is the record.
 
-mod grammar;
-mod prompt;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -12,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use hush_core::normalize::{AppContext, NormalizeRequest, Rejection, Style};
-use hush_normalize::{rules::RuleNormalizer, validate};
+use hush_normalize::{grammar, prompt, rules::RuleNormalizer, validate};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -126,11 +124,7 @@ fn prepare<'a>(c: &'a Case, model: &LlamaModel) -> Result<Prepared<'a>> {
     };
     let rule_text = RuleNormalizer.clean_request(&req);
     let system = prompt::system_prompt(req.language);
-    // The copied constant must be the crate's, byte for byte.
-    if system != hush_normalize::prompt::system_prompt(req.language) {
-        bail!("system prompt drifted from crates/normalize/src/prompt.rs");
-    }
-    let user = hush_normalize::prompt::user_message(&req, &rule_text);
+    let user = prompt::user_message(&req, &rule_text);
     let n_in = model.str_to_token(&rule_text, AddBos::Never)?.len();
     Ok(Prepared {
         case: c,

@@ -287,7 +287,10 @@ dependencies = [
 name = "hush-normalize"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "hush-core",
+ "llama-cpp-2",
+ "llama-cpp-sys-2",
  "serde",
  "serde_json",
  "strsim",

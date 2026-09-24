@@ -20,10 +20,11 @@ usage: hush [--config <path>]                 run the dictation app (tray + hotk
        hush [--config <path>] doctor          check devices, model, engine, normalizer
        hush [--config <path>] simulate <wav> [--target notepad|foreground] [--runs N]
                                    [--app <exe>] [--style formal|casual|code|none]
-                                   [--vocab <word,...>]
+                                   [--vocab <word,...>] [--normalizer rules|llama-cpp|http]
                                                        run one dictation from a WAV, end to end;
                                                        --app/--style normalize as if for that
-                                                       app, --vocab adds dictionary entries
+                                                       app, --vocab adds dictionary entries,
+                                                       --normalizer overrides the config's kind
 
 The default config is %APPDATA%\\hush\\config.toml, created on first run.
 Logs go to stderr and %LOCALAPPDATA%\\hush\\logs\\. RUST_LOG overrides the level.";

@@ -2,7 +2,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::Result;
+use hush_core::config::{Config, NormalizerChoice};
+use hush_core::normalize::{AppContext, NormalizeRequest, Provenance, Style};
 use hush_core::stt::{DecodeOptions, SAMPLE_RATE};
+use hush_core::{CancelToken, UtteranceId};
 use hush_platform_windows::focus;
 use hush_platform_windows::hook::HotkeyConfig;
 use hush_platform_windows::ui_thread::{self, INSTANCE_MUTEX, UiError};
@@ -225,8 +228,14 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
         }
     };
 
+    if let NormalizerChoice::LlamaCpp { model, .. } = &config.normalizer {
+        check_llm(&config, model);
+    }
     match engines::http_config(&config.normalizer) {
-        None => row("normalizer", "rules only (normalizer.kind = \"rules\")"),
+        None if config.normalizer == NormalizerChoice::Rules => {
+            row("normalizer", "rules only (normalizer.kind = \"rules\")")
+        }
+        None => {}
         Some(http) => match engines::probe_http(&http) {
             Ok(p) => {
                 row(
@@ -304,6 +313,94 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
         Ok(ExitCode::FAILURE)
     }
 }
+
+/// Downloads the language model like the speech model, then loads, warms and tries it.
+fn check_llm(config: &Config, model_id: &str) {
+    let (model, dir) = match engines::llm_model(model_id) {
+        Ok(m) => m,
+        Err(e) => {
+            row("llm model", format!("UNUSABLE: {e:#}"));
+            return;
+        }
+    };
+    if model.is_present(&dir) {
+        row(
+            "llm model",
+            format!("{} present in {}", model.id, dir.display()),
+        );
+    } else {
+        row(
+            "llm model",
+            format!(
+                "{} missing; downloading {:.2} GiB to {} (progress on stderr)",
+                model.id,
+                model.total_size() as f64 / (1u64 << 30) as f64,
+                dir.display()
+            ),
+        );
+        if let Err(e) = hush_stt::models::ensure_downloaded(model, &dir) {
+            row(
+                "",
+                format!("DOWNLOAD FAILED: {e}; the app will run rules-only"),
+            );
+            return;
+        }
+        row("", "downloaded and verified");
+    }
+    row(
+        "",
+        format!("license {}: {}", model.license, model.attribution),
+    );
+    let (mut n, ready) = match engines::build_normalizer(config, &mut |_| {}) {
+        Ok(Some(built)) => built,
+        Ok(None) => return,
+        Err(e) => {
+            row(
+                "normalizer",
+                format!("FAILED: {e:#}; the app will run rules-only"),
+            );
+            return;
+        }
+    };
+    row("normalizer", &ready.label);
+    if let Some(why) = &ready.cpu_fallback {
+        row(
+            "",
+            format!("GPU FALLBACK: the language model runs on the CPU because {why}"),
+        );
+    }
+    let app = AppContext {
+        style: Style::Formal,
+        ..AppContext::default()
+    };
+    let req = NormalizeRequest {
+        transcript: DOCTOR_SAMPLE,
+        language: Some("en"),
+        vocabulary: &[],
+        app: &app,
+        previous: None,
+        utterance: UtteranceId::default(),
+        cancel: CancelToken::new(),
+    };
+    match n.normalize(&req) {
+        Ok(o) => row(
+            "",
+            format!(
+                "{DOCTOR_SAMPLE:?} -> {:?} in {:.0} ms ({})",
+                o.text,
+                o.elapsed.as_secs_f64() * 1e3,
+                match &o.provenance {
+                    Provenance::Llm { .. } => "validated".to_string(),
+                    other => format!("{other:?}"),
+                }
+            ),
+        ),
+        Err(e) => row("", format!("test cleanup failed: {e}")),
+    }
+}
+
+/// A question, so a model that answers instead of cleaning shows here.
+const DOCTOR_SAMPLE: &str = "um so what time does the uh store close tomorrow";
 
 fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }

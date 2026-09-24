@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use hush_audio::silero::{SileroConfig, SileroVad};
 use hush_audio::vad::{EnergyVad, Vad};
-use hush_core::config::{EngineChoice, GpuPolicy, NormalizerChoice};
+use hush_core::config::{Config, EngineChoice, GpuPolicy, NormalizerChoice};
 use hush_core::normalize::Normalizer;
 use hush_core::stt::{Backend, SttEngine};
 use hush_normalize::openai_http::Dialect;
@@ -144,9 +144,141 @@ pub fn describe_vulkan_devices(selected: Option<usize>) -> Vec<String> {
         .collect()
 }
 
+pub fn llm_model(id: &str) -> Result<(&'static ModelManifest, PathBuf)> {
+    let model = models::find(id)?;
+    if model.engine != LLM_FAMILY {
+        bail!(
+            "model `{}` is a {} model; normalizer.model needs a {LLM_FAMILY} model such as `{}`",
+            model.id,
+            model.engine,
+            models::DEFAULT_LLM_ID
+        );
+    }
+    let dir = models::default_model_dir(&model.id)?;
+    Ok((model, dir))
+}
+
+const LLM_FAMILY: &str = "llama-cpp";
+
+/// What the LLM stage turned out to be once loaded.
+#[derive(Debug, Clone)]
+pub struct NormalizerReady {
+    pub label: String,
+    /// Why a `prefer-gpu` language model runs on the CPU.
+    pub cpu_fallback: Option<String>,
+}
+
+/// Blocks for seconds, or minutes while a model downloads; `status` hears what it is
+/// waiting for. `Ok(None)` means the config asks for rules only; `Err` explains why the
+/// app stays rules-only.
+pub fn build_normalizer(
+    config: &Config,
+    status: &mut dyn FnMut(&str),
+) -> Result<Option<(Box<dyn Normalizer>, NormalizerReady)>> {
+    match &config.normalizer {
+        NormalizerChoice::Rules => Ok(None),
+        NormalizerChoice::Http { .. } => {
+            let Some(http) = http_config(&config.normalizer) else {
+                return Ok(None);
+            };
+            let label = format!("{} via {}", http.model, http.base_url);
+            status("Connecting to the language model…");
+            let (n, warm) = build_http_normalizer(http)?;
+            Ok(Some((
+                n,
+                NormalizerReady {
+                    label: format!("{label} (warm-up {} ms)", warm.as_millis()),
+                    cpu_fallback: None,
+                },
+            )))
+        }
+        NormalizerChoice::LlamaCpp {
+            model,
+            gpu_device,
+            timeout_ms,
+        } => build_llama(
+            model,
+            gpu_device.or(config.engine.gpu_device),
+            config.engine.gpu,
+            Duration::from_millis(*timeout_ms),
+            status,
+        )
+        .map(Some),
+    }
+}
+
+#[cfg(feature = "llama-cpp")]
+fn build_llama(
+    model_id: &str,
+    gpu_device: Option<usize>,
+    gpu: GpuPolicy,
+    timeout: Duration,
+    status: &mut dyn FnMut(&str),
+) -> Result<(Box<dyn Normalizer>, NormalizerReady)> {
+    use hush_normalize::llama_cpp::{DeviceChoice, LlamaCppConfig, LlamaCppNormalizer};
+
+    let (model, dir) = llm_model(model_id)?;
+    if !model.is_present(&dir) {
+        status("Downloading language model…");
+        models::ensure_downloaded(model, &dir)?;
+    }
+    status("Loading language model…");
+    // Both runtimes enumerate Vulkan devices, but the PCI bus id is what cannot drift
+    // between their two ggml versions.
+    let device = match gpu_device {
+        None => DeviceChoice::FirstGpu,
+        Some(i) => transcribe_cpp::vulkan_devices()
+            .into_iter()
+            .find(|d| d.index == i)
+            .and_then(|d| d.device_id)
+            .map_or(DeviceChoice::VulkanIndex(i), DeviceChoice::Pci),
+    };
+    let started = Instant::now();
+    let mut n = LlamaCppNormalizer::load(LlamaCppConfig {
+        model_path: model.load_path(&dir),
+        model_id: model.id.clone(),
+        device,
+        gpu,
+        timeout,
+    })
+    .context("loading the language model")?;
+    let load = started.elapsed();
+    let started = Instant::now();
+    n.warm().context("language model warm-up")?;
+    let b = n.backend().clone();
+    let label = format!(
+        "{} on {:?} ({}), {}/{} layers offloaded, load {} ms, warm-up {} ms",
+        model.id,
+        b.backend,
+        b.device.as_deref().unwrap_or("CPU"),
+        b.layers_offloaded,
+        b.layers_total,
+        load.as_millis(),
+        started.elapsed().as_millis()
+    );
+    Ok((
+        Box::new(NormalizerChain::new(vec![Box::new(n)])),
+        NormalizerReady {
+            label,
+            cpu_fallback: b.fallback,
+        },
+    ))
+}
+
+#[cfg(not(feature = "llama-cpp"))]
+fn build_llama(
+    _: &str,
+    _: Option<usize>,
+    _: GpuPolicy,
+    _: Duration,
+    _: &mut dyn FnMut(&str),
+) -> Result<(Box<dyn Normalizer>, NormalizerReady)> {
+    bail!("this build has no embedded language model (built without the `llama-cpp` feature)")
+}
+
 pub fn http_config(choice: &NormalizerChoice) -> Option<HttpConfig> {
     match choice {
-        NormalizerChoice::Rules => None,
+        NormalizerChoice::Rules | NormalizerChoice::LlamaCpp { .. } => None,
         NormalizerChoice::Http {
             base_url,
             model,
@@ -273,6 +405,36 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_model(&choice).is_err());
+    }
+
+    #[test]
+    fn default_normalizer_names_a_language_model() {
+        let NormalizerChoice::LlamaCpp { model, .. } = Config::default().normalizer else {
+            panic!("the default normalizer is not the embedded one");
+        };
+        let (m, dir) = llm_model(&model).unwrap();
+        assert_eq!(m.id, models::DEFAULT_LLM_ID);
+        assert!(dir.ends_with(m.id.as_str()));
+        assert!(llm_model(models::DEFAULT_MODEL_ID).is_err());
+        assert!(
+            resolve_model(&EngineChoice {
+                model: model.clone(),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rules_config_builds_no_normalizer() {
+        let config = Config {
+            normalizer: NormalizerChoice::Rules,
+            ..Config::default()
+        };
+        let mut heard = Vec::new();
+        let built = build_normalizer(&config, &mut |s| heard.push(s.to_string())).unwrap();
+        assert!(built.is_none());
+        assert!(heard.is_empty());
     }
 
     #[test]

@@ -1,4 +1,6 @@
-//! GBNF that forbids the output from starting with a preamble word or a quote.
+//! GBNF that forbids the output from starting with a preamble word or a quote. It blocks
+//! the literal words only; a model determined to preface routes around it, so validation
+//! still runs after it.
 //!
 //! GBNF has no negative lookahead, so the grammar is the complement of a trie of the
 //! forbidden prefixes: at each trie node the next char is either one that leaves every
@@ -10,9 +12,20 @@ use std::collections::BTreeMap;
 /// Leading words and characters the grammar forbids unless the source itself starts
 /// with them (a dictated "Sure, let's meet" must stay possible).
 pub const FORBIDDEN: &[&str] = &[
-    "Here", "here", "Sure", "sure", "Certainly", "certainly", "\"", "`", "\u{201c}", "\u{201e}",
+    "Here",
+    "here",
+    "Sure",
+    "sure",
+    "Certainly",
+    "certainly",
+    "\"",
+    "`",
+    "\u{201c}",
+    "\u{201e}",
     "\u{ab}",
 ];
+
+pub const ROOT: &str = "root";
 
 pub fn forbidden_for(source: &str) -> Vec<&'static str> {
     let src = source.trim_start().to_lowercase();
@@ -21,6 +34,11 @@ pub fn forbidden_for(source: &str) -> Vec<&'static str> {
         .copied()
         .filter(|w| !src.starts_with(&w.to_lowercase()))
         .collect()
+}
+
+/// The grammar for a request whose rule-pass text is `source`.
+pub fn for_source(source: &str) -> String {
+    anti_preamble(&forbidden_for(source))
 }
 
 pub fn anti_preamble(forbidden: &[&str]) -> String {
@@ -70,7 +88,7 @@ pub fn anti_preamble(forbidden: &[&str]) -> String {
         }
         let body = alts.join(" | ");
         if i == 0 {
-            out.push_str(&format!("root ::= {body}\n"));
+            out.push_str(&format!("{ROOT} ::= {body}\n"));
         } else {
             // The output may also end inside a prefix ("He").
             out.push_str(&format!("n{i} ::= ( {body} )?\n"));
@@ -97,15 +115,31 @@ mod tests {
 
     #[test]
     fn source_prefix_is_exempt() {
-        let f = forbidden_for("sure let's meet");
+        let f = forbidden_for("  Sure let's meet");
         assert!(!f.contains(&"Sure") && !f.contains(&"sure"));
         assert!(f.contains(&"Here"));
+        assert_eq!(forbidden_for("hello").len(), FORBIDDEN.len());
     }
 
     #[test]
     fn grammar_has_a_rule_per_live_trie_node() {
         let g = anti_preamble(&["Hi", "\""]);
-        assert!(g.starts_with("root ::= [^\\x22\\x48\\x20\\x09\\x0A\\x0D] rest | \"\\x48\" n"));
-        assert!(g.contains("rest ::="));
+        assert_eq!(
+            g,
+            "root ::= [^\\x22\\x48\\x20\\x09\\x0A\\x0D] rest | \"\\x48\" n1\n\
+             n1 ::= ( [^\\x69] rest )?\n\
+             rest ::= [^\\x00]*\n"
+        );
+    }
+
+    #[test]
+    fn shared_prefixes_share_trie_nodes_and_non_ascii_is_escaped() {
+        let g = anti_preamble(&["Here", "He", "\u{201c}"]);
+        // "He" ends a word, so the node after "e" has no rule and "Here" is unreachable.
+        assert!(!g.contains("\\x72"), "{g}");
+        assert!(g.contains("\\u201C"), "{g}");
+        let full = for_source("hello world");
+        assert!(full.starts_with("root ::= [^"));
+        assert!(full.ends_with("rest ::= [^\\x00]*\n"));
     }
 }

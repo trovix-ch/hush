@@ -38,9 +38,15 @@ gpu = "prefer-gpu"
 # gpu_device = 1
 
 [normalizer]
-# rules | http
-kind = "rules"
-# LLM cleanup through a local OpenAI-compatible server, e.g. Ollama:
+# llama-cpp | http | rules. Dictation is rules-only until the language model has loaded,
+# and falls back to the rules whenever the model fails or its output is rejected.
+kind = "llama-cpp"
+# Model id from the download manifest; `hush doctor` downloads it.
+model = "qwen3-4b-instruct-2507-q4_k_m"
+# Vulkan device index, as `hush doctor` lists them. Unset uses engine.gpu_device.
+# gpu_device = 0
+timeout_ms = 5000
+# LLM cleanup through a local OpenAI-compatible server instead, e.g. Ollama:
 # kind = "http"
 # base_url = "http://127.0.0.1:11434/v1"
 # model = "qwen3:4b-instruct-2507-q4_K_M"
@@ -118,21 +124,44 @@ impl Default for EngineChoice {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum NormalizerChoice {
-    #[default]
     Rules,
+    /// llama.cpp inside the process. A build without it runs rules-only and says so.
+    LlamaCpp {
+        #[serde(default = "default_llm_model")]
+        model: String,
+        /// Vulkan device index; unset means the speech engine's device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpu_device: Option<usize>,
+        #[serde(default = "default_llm_timeout_ms")]
+        timeout_ms: u64,
+    },
     /// A local OpenAI-compatible server.
     Http {
         base_url: String,
         model: String,
-        #[serde(default = "default_http_timeout_ms")]
+        #[serde(default = "default_llm_timeout_ms")]
         timeout_ms: u64,
     },
 }
 
-fn default_http_timeout_ms() -> u64 {
+impl Default for NormalizerChoice {
+    fn default() -> Self {
+        Self::LlamaCpp {
+            model: default_llm_model(),
+            gpu_device: None,
+            timeout_ms: default_llm_timeout_ms(),
+        }
+    }
+}
+
+fn default_llm_model() -> String {
+    "qwen3-4b-instruct-2507-q4_k_m".into()
+}
+
+fn default_llm_timeout_ms() -> u64 {
     5000
 }
 
@@ -500,6 +529,39 @@ mod tests {
         assert_eq!(
             c.app_policies().lookup(Some("slack.exe")).style,
             Style::Formal
+        );
+    }
+
+    #[test]
+    fn embedded_llm_is_the_default_and_round_trips() {
+        assert_eq!(
+            Config::default().normalizer,
+            NormalizerChoice::LlamaCpp {
+                model: "qwen3-4b-instruct-2507-q4_k_m".into(),
+                gpu_device: None,
+                timeout_ms: 5000,
+            }
+        );
+        let c = Config::from_toml("[normalizer]\nkind = \"llama-cpp\"\n").unwrap();
+        assert_eq!(c.normalizer, NormalizerChoice::default());
+        let c = Config {
+            normalizer: NormalizerChoice::LlamaCpp {
+                model: "other-model".into(),
+                gpu_device: Some(1),
+                timeout_ms: 800,
+            },
+            ..Config::default()
+        };
+        let text = c.to_toml().unwrap();
+        assert!(text.contains("kind = \"llama-cpp\""), "{text}");
+        assert_eq!(Config::from_toml(&text).unwrap(), c);
+        let rules = Config {
+            normalizer: NormalizerChoice::Rules,
+            ..Config::default()
+        };
+        assert_eq!(Config::from_toml(&rules.to_toml().unwrap()).unwrap(), rules);
+        assert!(
+            Config::from_toml("[normalizer]\nkind = \"llama-cpp\"\nbase_url = \"x\"\n").is_err()
         );
     }
 

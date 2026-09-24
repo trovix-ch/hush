@@ -91,6 +91,21 @@
       ]
     },
     {
+      "id": "qwen3-4b-instruct-2507-q4_k_m",
+      "engine": "llama-cpp",
+      "description": "Qwen3-4B-Instruct-2507, Q4_K_M GGUF, the exact file Ollama serves as qwen3:4b-instruct-2507-q4_K_M",
+      "license": "Apache-2.0",
+      "attribution": "Qwen3-4B-Instruct-2507 by the Qwen team, Alibaba Cloud (https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507), licensed Apache-2.0. Q4_K_M quantisation as published in the Ollama library (qwen3:4b-instruct-2507-q4_K_M).",
+      "files": [
+        {
+          "name": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+          "url": "https://registry.ollama.ai/v2/library/qwen3/blobs/sha256:85e4a5b7b8ef0e48af0e8658f5aaab9c2324c76c1641493f4d1e25fce54b18b9",
+          "size": 2497280480,
+          "sha256": "85e4a5b7b8ef0e48af0e8658f5aaab9c2324c76c1641493f4d1e25fce54b18b9"
+        }
+      ]
+    },
+    {
       "id": "silero-vad-v6.2",
       "engine": "silero-vad",
       "description": "Silero VAD v6.2, ONNX graph run on tract",

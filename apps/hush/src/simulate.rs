@@ -7,6 +7,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use hush_core::config::NormalizerChoice;
 use hush_core::normalize::{Provenance, Style};
 use hush_core::pipeline::Stage;
 use hush_core::stt::SAMPLE_RATE;
@@ -38,6 +39,25 @@ pub struct Args {
     app: Option<String>,
     style: Option<Style>,
     vocab: Vec<String>,
+    normalizer: Option<NormalizerChoice>,
+}
+
+/// Keeps the config's settings when it already names that kind.
+fn parse_normalizer(s: Option<&String>) -> Result<NormalizerChoice> {
+    Ok(match s.map(String::as_str) {
+        Some("rules") => NormalizerChoice::Rules,
+        Some("llama-cpp") => NormalizerChoice::default(),
+        Some("http") => NormalizerChoice::Http {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "qwen3:4b-instruct-2507-q4_K_M".into(),
+            timeout_ms: 5000,
+        },
+        other => bail!("--normalizer takes rules, llama-cpp or http, got {other:?}"),
+    })
+}
+
+fn same_kind(a: &NormalizerChoice, b: &NormalizerChoice) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
 fn parse_style(s: Option<&String>) -> Result<Style> {
@@ -59,8 +79,10 @@ impl Args {
         let mut app = None;
         let mut style = None;
         let mut vocab = Vec::new();
+        let mut normalizer = None;
         while let Some(a) = it.next() {
             match a.as_str() {
+                "--normalizer" => normalizer = Some(parse_normalizer(it.next())?),
                 "--app" => {
                     app = Some(
                         it.next()
@@ -107,6 +129,7 @@ impl Args {
             app,
             style,
             vocab,
+            normalizer,
         })
     }
 }
@@ -163,6 +186,11 @@ fn print_percentiles(label: &str, mut values: Vec<f64>) {
 pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
     let (mut config, _) = setup::load_config(&paths.config_file)?;
     config.vocabulary.extend(args.vocab.iter().cloned());
+    if let Some(n) = args.normalizer
+        && !same_kind(&n, &config.normalizer)
+    {
+        config.normalizer = n;
+    }
     let _log = setup::init_logging(&paths.logs_dir, "warn,hush_stt::models=info")?;
     let pcm = wav::read_16k_mono(&args.wav)?;
     let clip = Duration::from_secs_f64(pcm.len() as f64 / f64::from(SAMPLE_RATE));
@@ -198,23 +226,23 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
             .map(|f| format!(", GPU FALLBACK: {f}"))
             .unwrap_or_default()
     );
-    let upgrade = match engines::http_config(&config.normalizer) {
-        None => {
+    let upgrade = match engines::build_normalizer(&config, &mut |s| println!("normalizer  {s}")) {
+        Ok(None) => {
             println!("normalizer  rules only");
             None
         }
-        Some(http) => {
-            let label = format!("{} via {}", http.model, http.base_url);
-            match engines::build_http_normalizer(http) {
-                Ok((n, warm)) => {
-                    println!("normalizer  {label}, warm-up {} ms", warm.as_millis());
-                    Some(n)
-                }
-                Err(e) => {
-                    println!("normalizer  rules only: {e:#}");
-                    None
-                }
+        Ok(Some((n, ready))) => {
+            println!("normalizer  {}", ready.label);
+            if let Some(why) = ready.cpu_fallback {
+                println!(
+                    "            GPU FALLBACK: the language model runs on the CPU because {why}"
+                );
             }
+            Some(n)
+        }
+        Err(e) => {
+            println!("normalizer  rules only: {e:#}");
+            None
         }
     };
 
@@ -423,6 +451,30 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         reports
             .iter()
             .filter_map(|r| ms(r.released, r.transcript.as_ref().map(|t| t.0)))
+            .collect(),
+    );
+    print_percentiles(
+        "transcript->normalized",
+        reports
+            .iter()
+            .filter_map(|r| {
+                ms(
+                    r.transcript.as_ref().map(|t| t.0),
+                    r.normalized.as_ref().map(|n| n.0),
+                )
+            })
+            .collect(),
+    );
+    print_percentiles(
+        "normalized->inserted",
+        reports
+            .iter()
+            .filter_map(|r| {
+                ms(
+                    r.normalized.as_ref().map(|n| n.0),
+                    r.inserted.as_ref().map(|x| x.0),
+                )
+            })
             .collect(),
     );
     print_percentiles(

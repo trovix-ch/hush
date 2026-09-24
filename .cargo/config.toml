@@ -1,0 +1,7 @@
+# The Visual Studio generator races the llama.cpp Vulkan shader-generator steps
+# (configure, build and install of one ExternalProject run concurrently, MSB8066). An
+# existing CMAKE_GENERATOR in the environment wins.
+[env]
+CMAKE_GENERATOR = "Ninja"
+# llama-cpp-sys-2 passes every CMAKE_* variable to CMake as a define.
+CMAKE_PROJECT_INCLUDE = { value = ".cargo/short-external-projects.cmake", relative = true }

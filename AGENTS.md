@@ -113,8 +113,16 @@ A change is not done until each of these that it touches is handled:
 
 *(2026-09-24: names paths and versions; re-check when it stops working.)*
 
-The build needs MSVC, CMake and the Vulkan SDK; libclang and CUDA are not needed. The
-maintainer's shell is PowerShell; a shell opened before the SDK install needs:
+The build needs MSVC, CMake, Ninja, the Vulkan SDK and libclang (LLVM; the llama.cpp
+bindings run bindgen, and clang-sys finds `C:\Program Files\LLVM\bin\libclang.dll` without
+`LIBCLANG_PATH`). CUDA is not needed. Ninja must be on PATH (`uv tool install ninja` or
+`winget install Ninja-build.Ninja`): `.cargo/config.toml` makes it the CMake generator,
+because the Visual Studio generator races the llama.cpp shader-generator build, and
+shortens llama.cpp's nested build paths, which otherwise pass MAX_PATH from a checkout a
+few characters deeper than `C:\Github\whisper-local`. Enabling Windows long paths does
+not help: MSVC failed with C1083 with `LongPathsEnabled` = 1. A cold
+`cargo build --release -p hush` took 336 s on the development machine. The maintainer's
+shell is PowerShell; a shell opened before the SDK install needs:
 
 ```powershell
 $env:VULKAN_SDK = 'C:\VulkanSDK\1.4.357.0'
@@ -125,14 +133,22 @@ cargo build --release -p hush
 In Git Bash the same two are `export VULKAN_SDK='C:\VulkanSDK\1.4.357.0'` and
 `export PATH="/c/VulkanSDK/1.4.357.0/Bin:/c/Program Files/CMake/bin:$PATH"`.
 
+`cargo build --release -p hush --no-default-features` leaves the embedded LLM out (no
+libclang needed); cleanup is then rules-only or over HTTP. The default build puts
+`transcribe.dll` and four `ggml*.dll` next to `hush.exe`, and the exe needs them: speech
+and llama.cpp each vendor their own ggml, so speech is linked as a DLL to keep the two
+apart.
+
 - `hush doctor` reports devices, model, engine backend and the normalizer.
 - `hush simulate <wav> [--runs N]` runs one dictation from a WAV into Notepad
   and prints per-stage timings. Fixtures are under `tools/bench-stt/fixtures/`.
 - `bench-stt` and `bench-normalize` measure engines and normalizers in isolation.
 - Config: `%APPDATA%\hush\config.toml`. Models: `%LOCALAPPDATA%\hush\models`.
   Logs: `%LOCALAPPDATA%\hush\logs`.
-- With two GPUs, pin `engine.gpu_device` to the card not running the LLM; sharing one
-  card tripled speech latency in measurement.
+- With two GPUs, pin `engine.gpu_device` to the card not running Ollama or another
+  busy LLM; sharing one card with a busy LLM tripled speech latency in measurement. The
+  embedded LLM follows `engine.gpu_device` unless `normalizer.gpu_device` is set; sharing
+  the card with it cost nothing measurable (design §7).
 
 Gates before a change is done:
 

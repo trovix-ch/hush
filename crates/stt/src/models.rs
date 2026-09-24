@@ -99,6 +99,9 @@ impl ModelManifest {
 
 pub const DEFAULT_MODEL_ID: &str = "parakeet-tdt-0.6b-v3-f16-gguf";
 pub const VAD_MODEL_ID: &str = "silero-vad-v6.2";
+/// Ollama's file, not another Q4_K_M of the same weights: unsloth's build validated one
+/// fixture fewer (28 of 30, measured 2026-09-24), so the weights are part of the contract.
+pub const DEFAULT_LLM_ID: &str = "qwen3-4b-instruct-2507-q4_k_m";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -372,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn every_url_is_pinned_to_a_revision() {
+    fn every_url_is_pinned_to_a_revision_or_a_digest() {
         for m in manifest() {
             for f in &m.files {
                 assert!(
@@ -380,9 +383,32 @@ mod tests {
                     "{} floats on main",
                     f.url
                 );
-                assert!(f.url.ends_with(&format!("/{}", f.name)), "{}", f.url);
+                let by_digest = f
+                    .sha256
+                    .as_ref()
+                    .is_some_and(|h| f.url.ends_with(&format!("/sha256:{h}")));
+                assert!(
+                    by_digest || f.url.ends_with(&format!("/{}", f.name)),
+                    "{}",
+                    f.url
+                );
             }
         }
+    }
+
+    #[test]
+    fn default_llm_is_the_pinned_ollama_file() {
+        let m = find(DEFAULT_LLM_ID).unwrap();
+        assert_eq!(m.engine, "llama-cpp");
+        assert_eq!(m.license, "Apache-2.0");
+        let [f] = m.files.as_slice() else {
+            panic!("{:?}", m.files)
+        };
+        assert_eq!(f.size, 2_497_280_480);
+        assert_eq!(
+            f.sha256.as_deref(),
+            Some("85e4a5b7b8ef0e48af0e8658f5aaab9c2324c76c1641493f4d1e25fce54b18b9")
+        );
     }
 
     fn one_model(file: &str) -> String {
