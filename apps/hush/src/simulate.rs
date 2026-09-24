@@ -7,19 +7,20 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use hush_core::normalize::Provenance;
+use hush_core::normalize::{Provenance, Style};
 use hush_core::pipeline::Stage;
 use hush_core::stt::SAMPLE_RATE;
+use hush_normalize::style_allows_llm;
 use hush_platform_windows::focus::{self, WinFocus};
 use hush_platform_windows::hook::HotkeyEvent;
 use hush_platform_windows::ui_thread::{UiHandle, UiOptions};
 
-use crate::driver::{Driver, DriverParts, Msg, Observed, Workers};
+use crate::driver::{AppOverride, Driver, DriverParts, Msg, Observed, Workers};
 use crate::engines;
 use crate::notepad;
 use crate::setup::{self, Paths};
 use crate::wav::{self, WavRecorder};
-use crate::workers::{EngineLoader, NormCmd};
+use crate::workers::{EngineLoader, NormCmd, Vocabulary};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -33,6 +34,20 @@ pub struct Args {
     wav: PathBuf,
     target: Target,
     runs: usize,
+    /// Normalize as if the text went to this exe, whatever the real target is.
+    app: Option<String>,
+    style: Option<Style>,
+    vocab: Vec<String>,
+}
+
+fn parse_style(s: Option<&String>) -> Result<Style> {
+    Ok(match s.map(String::as_str) {
+        Some("formal") => Style::Formal,
+        Some("casual") => Style::Casual,
+        Some("code") => Style::Code,
+        Some("none") => Style::None,
+        other => bail!("--style takes formal, casual, code or none, got {other:?}"),
+    })
 }
 
 impl Args {
@@ -41,8 +56,28 @@ impl Args {
         let mut wav = None;
         let mut target = Target::Notepad;
         let mut runs = 1;
+        let mut app = None;
+        let mut style = None;
+        let mut vocab = Vec::new();
         while let Some(a) = it.next() {
             match a.as_str() {
+                "--app" => {
+                    app = Some(
+                        it.next()
+                            .context("--app needs an executable name")?
+                            .trim()
+                            .to_ascii_lowercase(),
+                    )
+                }
+                "--style" => style = Some(parse_style(it.next())?),
+                "--vocab" => vocab.extend(
+                    it.next()
+                        .context("--vocab needs comma-separated words")?
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_string),
+                ),
                 "--target" => {
                     target = match it.next().map(String::as_str) {
                         Some("notepad") => Target::Notepad,
@@ -69,6 +104,9 @@ impl Args {
             wav: wav.context("simulate needs a WAV file")?,
             target,
             runs,
+            app,
+            style,
+            vocab,
         })
     }
 }
@@ -123,7 +161,8 @@ fn print_percentiles(label: &str, mut values: Vec<f64>) {
 }
 
 pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
-    let (config, _) = setup::load_config(&paths.config_file)?;
+    let (mut config, _) = setup::load_config(&paths.config_file)?;
+    config.vocabulary.extend(args.vocab.iter().cloned());
     let _log = setup::init_logging(&paths.logs_dir, "warn,hush_stt::models=info")?;
     let pcm = wav::read_16k_mono(&args.wav)?;
     let clip = Duration::from_secs_f64(pcm.len() as f64 / f64::from(SAMPLE_RATE));
@@ -192,8 +231,35 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
     })?;
     let (tx, rx) = mpsc::channel::<Msg>();
     let focus = WinFocus::new();
+    let vocabulary = Vocabulary::from_config(&config, &paths.config_file);
+    println!(
+        "vocabulary  {} entries{}",
+        vocabulary.entries().len(),
+        vocabulary
+            .file()
+            .map(|f| format!(" (with {})", f.display()))
+            .unwrap_or_default()
+    );
+    let app_override = (args.app.is_some() || args.style.is_some()).then(|| AppOverride {
+        style: args
+            .style
+            .unwrap_or_else(|| config.app_policies().lookup(args.app.as_deref()).style),
+        exe: args.app.clone(),
+    });
+    if let Some(o) = &app_override {
+        println!(
+            "app         normalized as {}, style {:?}{}",
+            o.exe.as_deref().unwrap_or("the real target"),
+            o.style,
+            if style_allows_llm(o.style) {
+                ""
+            } else {
+                " (rules only)"
+            }
+        );
+    }
     let loader: EngineLoader = Box::new(move || Ok((engine, summary)));
-    let workers = Workers::spawn(&config, &ui, &focus, loader, &tx)?;
+    let workers = Workers::spawn(&config, vocabulary, &ui, &focus, loader, &tx)?;
     if let Some(n) = upgrade {
         let _ = workers.norm.send(NormCmd::Upgrade(n));
     }
@@ -209,6 +275,7 @@ pub fn run(paths: &Paths, args: Args) -> Result<ExitCode> {
         workers,
         rx,
         observer: Some(obs_tx),
+        app_override,
     });
     let driver = std::thread::Builder::new()
         .name("hush-driver".into())

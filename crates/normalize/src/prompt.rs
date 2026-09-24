@@ -88,13 +88,17 @@ pub fn system_prompt(language: Option<&str>) -> &'static str {
 
 pub fn style_description(style: Style) -> &'static str {
     match style {
-        Style::Formal => "formal writing: full sentences, correct punctuation and capitalisation",
+        Style::Formal => {
+            "formal: write full sentences, each starting with a capital letter and ending \
+             with a period, question mark or exclamation mark"
+        }
         Style::Casual => {
-            "casual chat: natural punctuation, keep contractions, no period at the very end"
+            "casual chat: natural punctuation inside the text, keep the speaker's \
+             contractions, no period at the very end"
         }
         Style::Code | Style::None => {
-            "code editor or terminal: keep the words verbatim; only remove fillers and apply \
-             self-corrections; add no punctuation and change no capitalisation"
+            "code editor or terminal: keep every word verbatim; only remove fillers and \
+             apply self-corrections; no punctuation changes, no capitalisation changes"
         }
     }
 }
@@ -113,8 +117,11 @@ pub fn user_message(req: &NormalizeRequest<'_>, transcript: &str) -> String {
     }
     let style = style_description(req.app.style);
     match req.app.exe.as_deref() {
-        Some(exe) => out.push_str(&format!("<app>{} ({style})</app>\n", neutralize(exe))),
-        None => out.push_str(&format!("<app>{style}</app>\n")),
+        Some(exe) => out.push_str(&format!(
+            "<app>Typed into {}. Style: {style}</app>\n",
+            neutralize(exe)
+        )),
+        None => out.push_str(&format!("<app>Style: {style}</app>\n")),
     }
     if let Some(prev) = req.previous.map(str::trim).filter(|p| !p.is_empty()) {
         out.push_str(&format!("<previous>{}</previous>\n", neutralize(prev)));
@@ -242,11 +249,42 @@ mod tests {
         assert_eq!(
             m,
             format!(
-                "<vocabulary>Kubernetes, gRPC</vocabulary>\n<app>slack.exe ({})</app>\n\
+                "<vocabulary>Kubernetes, gRPC</vocabulary>\n<app>Typed into slack.exe. Style: {}</app>\n\
                  <previous>Earlier.</previous>\n<transcript>cleaned</transcript>",
                 style_description(Style::Casual)
             )
         );
+    }
+
+    #[test]
+    fn app_block_names_the_app_and_spells_out_the_style() {
+        let cases = [
+            (Style::Formal, &["full sentences"][..]),
+            (
+                Style::Casual,
+                &["contractions", "no period at the very end"][..],
+            ),
+            (
+                Style::Code,
+                &[
+                    "verbatim",
+                    "no punctuation changes",
+                    "no capitalisation changes",
+                ][..],
+            ),
+        ];
+        for (style, needles) in cases {
+            let app = AppContext {
+                exe: Some("code.exe".into()),
+                style,
+                ..Default::default()
+            };
+            let m = user_message(&req("x", None, &[], &app, None), "x");
+            assert!(m.contains("<app>Typed into code.exe. Style: "), "{m}");
+            for n in needles {
+                assert!(m.contains(n), "{style:?}: {n}");
+            }
+        }
     }
 
     #[test]

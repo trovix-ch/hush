@@ -15,7 +15,7 @@ use hush_core::UtteranceId;
 use hush_core::cancel::CancelToken;
 use hush_core::config::{Config, GpuPolicy};
 use hush_core::insert::{InsertError, InsertOutcome, InsertPolicy};
-use hush_core::normalize::Provenance;
+use hush_core::normalize::{Provenance, Style};
 use hush_core::notify::{Notifier, OverlayState as CoreOverlay, Sound};
 use hush_core::pipeline::{Effect, Event, Failure, Pipeline, PipelineConfig, Stage};
 use hush_core::recorder::{Recorder, RecorderConfig};
@@ -30,10 +30,32 @@ use hush_platform_windows::ui_thread::{
 use crate::engines::{self, EngineSummary};
 use crate::setup::{self, Paths};
 use crate::workers::{
-    self, EngineLoader, InsertCmd, NormCmd, NormJob, SttJob, Timers, outcome_label,
+    self, EngineLoader, InsertCmd, NormCmd, NormJob, SttJob, Timers, Vocabulary, outcome_label,
 };
 
 const LEVEL_PERIOD: Duration = Duration::from_millis(50);
+
+/// Older text is more likely a different thought than the start of this one.
+const PREVIOUS_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// The pipeline has already required the same app and a delivered insertion; the age
+/// check is here because only the driver sees the clock when the insertion landed.
+fn recent_previous(
+    previous: Option<String>,
+    delivered_at: Option<Instant>,
+    now: Instant,
+) -> Option<String> {
+    previous.filter(|_| {
+        delivered_at.is_some_and(|at| now.saturating_duration_since(at) < PREVIOUS_MAX_AGE)
+    })
+}
+
+/// Normalize as if dictating into this app, whatever window really has focus.
+#[derive(Debug, Clone)]
+pub struct AppOverride {
+    pub exe: Option<String>,
+    pub style: Style,
+}
 
 pub enum Msg {
     Hotkey(HotkeyEvent),
@@ -96,13 +118,14 @@ impl Workers {
     /// `load` runs on the speech worker before its first job.
     pub fn spawn(
         config: &Config,
+        vocabulary: Vocabulary,
         ui: &UiHandle,
         focus: &WinFocus,
         load: EngineLoader,
         tx: &Sender<Msg>,
     ) -> Result<Self> {
         let (stt, stt_join) = workers::spawn_stt(load, tx.clone())?;
-        let (norm, j2) = workers::spawn_normalizer(config.vocabulary.clone(), tx.clone())?;
+        let (norm, j2) = workers::spawn_normalizer(vocabulary, tx.clone())?;
         let policy = InsertPolicy {
             apps: config.app_policies(),
             ..InsertPolicy::default()
@@ -175,6 +198,8 @@ pub struct Driver {
     observer: Option<Sender<Observed>>,
     last_level: Instant,
     level: LevelBallistics,
+    last_delivered: Option<Instant>,
+    app_override: Option<AppOverride>,
 }
 
 pub struct DriverParts {
@@ -188,6 +213,7 @@ pub struct DriverParts {
     pub workers: Workers,
     pub rx: Receiver<Msg>,
     pub observer: Option<Sender<Observed>>,
+    pub app_override: Option<AppOverride>,
 }
 
 impl Driver {
@@ -216,6 +242,8 @@ impl Driver {
             observer: p.observer,
             last_level: Instant::now(),
             level: LevelBallistics::default(),
+            last_delivered: None,
+            app_override: p.app_override,
         }
     }
 
@@ -267,6 +295,11 @@ impl Driver {
             Msg::Tray(t) => return self.on_tray(t),
             Msg::Event(ev) => {
                 self.observe_event(&ev);
+                if let Event::InsertDone(_, o) = &ev
+                    && o.delivered()
+                {
+                    self.last_delivered = Some(Instant::now());
+                }
                 if let Event::SegmentReady { id, transcript, .. } = &ev
                     && transcript.text.trim().is_empty()
                     // Escape removed the token; the user has moved on, so say nothing.
@@ -585,8 +618,13 @@ impl Driver {
             Effect::Normalize {
                 id,
                 transcript,
-                ctx,
+                mut ctx,
             } => {
+                ctx.previous = recent_previous(ctx.previous, self.last_delivered, Instant::now());
+                if let Some(o) = &self.app_override {
+                    ctx.app.exe.clone_from(&o.exe);
+                    ctx.app.style = o.style;
+                }
                 if !ctx.rules_only {
                     self.observe(Observed::Transcript {
                         text: transcript.clone(),
@@ -774,7 +812,8 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         }
         engines::load_engine(&engine_choice, &model.load_path(&model_dir))
     });
-    let workers = Workers::spawn(&config, &ui, &focus, load, &tx)?;
+    let vocabulary = Vocabulary::from_config(&config, &paths.config_file);
+    let workers = Workers::spawn(&config, vocabulary, &ui, &focus, load, &tx)?;
     spawn_normalizer_upgrade(&config, workers.norm.clone(), tx.clone());
 
     let hook = match HotkeyHook::install(hotkey, hk_tx) {
@@ -797,6 +836,7 @@ pub fn run_app(paths: &Paths) -> Result<std::process::ExitCode> {
         workers,
         rx,
         observer: None,
+        app_override: None,
     });
     drop(tx);
     std::thread::Builder::new()
@@ -825,4 +865,22 @@ pub fn forward<T: Send + 'static>(
         })
         .map(|_| ())
         .context("starting a forwarder thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_sentence_is_kept_only_within_the_age_limit() {
+        let now = Instant::now() + Duration::from_secs(600);
+        let prev = || Some("Hello there.".to_string());
+        let ago = |s: u64| Some(now - Duration::from_secs(s));
+        assert_eq!(recent_previous(prev(), ago(5), now), prev());
+        assert_eq!(recent_previous(prev(), ago(59), now), prev());
+        assert_eq!(recent_previous(prev(), ago(60), now), None);
+        assert_eq!(recent_previous(prev(), ago(300), now), None);
+        assert_eq!(recent_previous(prev(), None, now), None);
+        assert_eq!(recent_previous(None, ago(1), now), None);
+    }
 }

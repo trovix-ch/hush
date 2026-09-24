@@ -12,6 +12,7 @@ use windows::Win32::System::StationsAndDesktops::{
 
 use crate::engines;
 use crate::setup::{self, Paths};
+use crate::workers::Vocabulary;
 
 fn row(label: &str, value: impl std::fmt::Display) {
     println!("{label:<14}{value}");
@@ -249,6 +250,50 @@ pub fn run(paths: &Paths) -> Result<ExitCode> {
             Err(e) => row("normalizer", format!("{e:#}; the app will run rules-only")),
         },
     }
+
+    let vocabulary = Vocabulary::from_config(&config, &paths.config_file);
+    row(
+        "vocabulary",
+        format!(
+            "{} entries ({} inline{})",
+            vocabulary.entries().len(),
+            config.vocabulary.len(),
+            match (vocabulary.file(), vocabulary.file_error()) {
+                (None, _) => String::new(),
+                (Some(f), None) => format!(", plus {}", f.display()),
+                (Some(f), Some(e)) => format!(", {} UNREADABLE: {e}", f.display()),
+            }
+        ),
+    );
+
+    println!("\napp rules (first match on the exe name; built-in rows yield to yours)");
+    for r in config.effective_app_rules() {
+        println!(
+            "  {:<22}{:<8}{:<14}{:<12}{}",
+            r.exe,
+            format!("{:?}", r.policy.style).to_lowercase(),
+            format!("{:?}", r.policy.chord),
+            if r.policy.never_type {
+                "never-type"
+            } else {
+                ""
+            },
+            if r.builtin { "built-in" } else { "config" }
+        );
+    }
+    let d = config.default_app_policy();
+    println!(
+        "  {:<22}{:<8}{:<14}{:<12}{}",
+        "* (any other)",
+        format!("{:?}", d.style).to_lowercase(),
+        format!("{:?}", d.chord),
+        if d.never_type { "never-type" } else { "" },
+        if config.apps.iter().any(|r| r.exe.trim() == "*") {
+            "config"
+        } else {
+            "default_style"
+        }
+    );
 
     println!();
     if engine_ok {

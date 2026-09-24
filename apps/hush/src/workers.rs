@@ -3,13 +3,15 @@
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use hush_audio::vad::{EnergyVad, Vad, has_speech, trim_silence};
 use hush_core::UtteranceId;
 use hush_core::cancel::CancelToken;
+use hush_core::config::Config;
 use hush_core::context::FocusContext;
 use hush_core::insert::{InsertError, InsertOutcome, InsertPolicy, Inserter, StrategyChain};
 use hush_core::normalize::{NormalizeError, NormalizeRequest, Normalizer};
@@ -146,9 +148,102 @@ pub enum NormCmd {
     Upgrade(Box<dyn Normalizer>),
 }
 
+/// The inline list plus the file's entries, re-read when the file's mtime changes.
+pub struct Vocabulary {
+    inline: Vec<String>,
+    file: Option<PathBuf>,
+    stamp: Option<Result<SystemTime, String>>,
+    error: Option<String>,
+    merged: Vec<String>,
+}
+
+impl Vocabulary {
+    /// A relative `vocabulary_file` is taken relative to the config file.
+    pub fn from_config(config: &Config, config_file: &Path) -> Self {
+        let file = config.vocabulary_file.as_ref().map(|f| {
+            config_file
+                .parent()
+                .map_or_else(|| f.clone(), |dir| dir.join(f))
+        });
+        Self::new(config.vocabulary.clone(), file)
+    }
+
+    pub fn new(inline: Vec<String>, file: Option<PathBuf>) -> Self {
+        let merged = merge_vocabulary(&inline, &[]);
+        let mut v = Self {
+            inline,
+            file,
+            stamp: None,
+            error: None,
+            merged,
+        };
+        v.refresh();
+        v
+    }
+
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    /// The error reading the file, if the last attempt failed.
+    pub fn file_error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn entries(&self) -> &[String] {
+        &self.merged
+    }
+
+    pub fn refresh(&mut self) -> &[String] {
+        let Some(path) = &self.file else {
+            return &self.merged;
+        };
+        let stamp = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map_err(|e| e.to_string());
+        if self.stamp.as_ref() == Some(&stamp) {
+            return &self.merged;
+        }
+        let read = stamp
+            .clone()
+            .and_then(|_| std::fs::read_to_string(path).map_err(|e| e.to_string()));
+        let from_file = match &read {
+            Ok(text) => parse_vocabulary_file(text),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot read the vocabulary file");
+                Vec::new()
+            }
+        };
+        self.merged = merge_vocabulary(&self.inline, &from_file);
+        tracing::info!(path = %path.display(), from_file = from_file.len(), total = self.merged.len(), "vocabulary loaded");
+        self.error = read.err();
+        self.stamp = Some(stamp);
+        &self.merged
+    }
+}
+
+pub fn parse_vocabulary_file(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split_once('#').map_or(l, |(before, _)| before).trim())
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Inline entries first; an exact duplicate is kept once.
+pub fn merge_vocabulary(inline: &[String], from_file: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(inline.len() + from_file.len());
+    for e in inline.iter().chain(from_file).map(|e| e.trim()) {
+        if !e.is_empty() && !out.iter().any(|o| o == e) {
+            out.push(e.to_string());
+        }
+    }
+    out
+}
+
 /// Starts rules-only, so dictation works before (or without) the LLM.
 pub fn spawn_normalizer(
-    vocabulary: Vec<String>,
+    mut vocabulary: Vocabulary,
     out: Sender<Msg>,
 ) -> std::io::Result<(Sender<NormCmd>, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel::<NormCmd>();
@@ -175,7 +270,7 @@ pub fn spawn_normalizer(
             let req = NormalizeRequest {
                 transcript: &job.transcript,
                 language: job.ctx.language.as_deref(),
-                vocabulary: &vocabulary,
+                vocabulary: vocabulary.refresh(),
                 app: &job.ctx.app,
                 previous: job.ctx.previous.as_deref(),
                 utterance: id,
@@ -406,7 +501,7 @@ mod tests {
     #[test]
     fn rules_only_normalizer_answers_and_skips_cancelled_jobs() {
         let (out, rx) = mpsc::channel();
-        let (tx, join) = spawn_normalizer(vec![], out).unwrap();
+        let (tx, join) = spawn_normalizer(Vocabulary::new(vec![], None), out).unwrap();
         let ctx = NormalizeContext {
             app: Default::default(),
             language: Some("en".into()),
@@ -438,5 +533,53 @@ mod tests {
         }
         drop(tx);
         join.join().unwrap();
+    }
+
+    #[test]
+    fn vocabulary_file_parses_lines_and_comments() {
+        let text = "# names\nKubernetes\n  gRPC  # the RPC one\n\n#Ignored\nJane Doe\n";
+        assert_eq!(
+            parse_vocabulary_file(text),
+            vec!["Kubernetes", "gRPC", "Jane Doe"]
+        );
+    }
+
+    #[test]
+    fn vocabulary_merges_inline_first_without_duplicates() {
+        let inline = vec!["gRPC".to_string(), " ".to_string()];
+        let file = vec!["Kubernetes".to_string(), "gRPC".to_string()];
+        assert_eq!(merge_vocabulary(&inline, &file), vec!["gRPC", "Kubernetes"]);
+    }
+
+    #[test]
+    fn vocabulary_file_is_reread_when_its_mtime_changes() {
+        let dir = std::env::temp_dir().join(format!("hush-vocab-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("words.txt");
+        let write = |text: &str, secs: u64| {
+            std::fs::write(&path, text).unwrap();
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        write("Kubernetes\n", 1_000_000);
+
+        let config = Config {
+            vocabulary: vec!["gRPC".into()],
+            vocabulary_file: Some("words.txt".into()),
+            ..Config::default()
+        };
+        let mut v = Vocabulary::from_config(&config, &dir.join("config.toml"));
+        assert_eq!(v.file(), Some(path.as_path()));
+        assert_eq!(v.entries(), ["gRPC", "Kubernetes"]);
+
+        write("Kubernetes\nTailscale\n", 2_000_000);
+        assert_eq!(v.refresh(), ["gRPC", "Kubernetes", "Tailscale"]);
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(v.refresh(), ["gRPC"]);
+        assert!(v.file_error().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

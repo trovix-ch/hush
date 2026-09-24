@@ -46,7 +46,7 @@ impl Normalizer for NormalizerChain {
     fn normalize(&mut self, req: &NormalizeRequest<'_>) -> Result<NormalizeOutput, NormalizeError> {
         let start = Instant::now();
         let mut failed = None;
-        if req.app.style != Style::None && should_use_llm(req.transcript) {
+        if style_allows_llm(req.app.style) && should_use_llm(req.transcript) {
             for s in &mut self.stages {
                 match s.normalize(req) {
                     Ok(mut out) => {
@@ -73,6 +73,10 @@ impl Normalizer for NormalizerChain {
         out.elapsed = start.elapsed();
         Ok(out)
     }
+}
+
+pub fn style_allows_llm(style: Style) -> bool {
+    matches!(style, Style::Formal | Style::Casual)
 }
 
 pub fn should_use_llm(transcript: &str) -> bool {
@@ -218,13 +222,15 @@ mod tests {
     }
 
     #[test]
-    fn style_none_and_clean_text_skip_the_llm() {
+    fn code_and_none_styles_and_clean_text_skip_the_llm() {
         let a = Fake::new(Behaviour::Ok("A"));
         let mut chain = NormalizerChain::new(vec![Box::new(Stage(a.clone()))]);
-        assert_eq!(
-            run(&mut chain, MESSY, Style::None).provenance,
-            Provenance::Rules
-        );
+        let none = run(&mut chain, MESSY, Style::None);
+        assert_eq!(none.provenance, Provenance::Rules);
+        assert_eq!(none.text, "so I was thinking we could go");
+        let code = run(&mut chain, MESSY, Style::Code);
+        assert_eq!(code.provenance, Provenance::Rules);
+        assert_eq!(code.text, "so I was thinking we could go");
         assert_eq!(
             run(
                 &mut chain,

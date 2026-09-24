@@ -8,7 +8,7 @@ pub mod prompt;
 pub mod rules;
 pub mod validate;
 
-pub use chain::{NormalizerChain, should_use_llm};
+pub use chain::{NormalizerChain, should_use_llm, style_allows_llm};
 pub use openai_http::{HttpConfig, OpenAiHttpNormalizer};
 pub use rules::RuleNormalizer;
 pub use validate::{Rejection, validate};

@@ -16,7 +16,8 @@ pub enum Style {
     #[default]
     Casual,
     /// No smart punctuation, no capitalisation changes, no rewording: only fillers and
-    /// explicit corrections are touched.
+    /// explicit corrections are touched, by the rule pass alone. The LLM is skipped
+    /// because nothing it may do there is beyond the rules.
     Code,
     /// Rule pass only; the LLM is skipped.
     None,
