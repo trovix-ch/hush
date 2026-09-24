@@ -113,13 +113,17 @@ A change is not done until each of these that it touches is handled:
 
 *(2026-09-24: names paths and versions; re-check when it stops working.)*
 
-The build needs MSVC, CMake and the Vulkan SDK; libclang and CUDA are not needed:
+The build needs MSVC, CMake and the Vulkan SDK; libclang and CUDA are not needed. The
+maintainer's shell is PowerShell; a shell opened before the SDK install needs:
 
-```sh
-export VULKAN_SDK='C:\VulkanSDK\1.4.357.0'
-export PATH="/c/VulkanSDK/1.4.357.0/Bin:/c/Program Files/CMake/bin:$PATH"
+```powershell
+$env:VULKAN_SDK = 'C:\VulkanSDK\1.4.357.0'
+$env:PATH = "C:\VulkanSDK\1.4.357.0\Bin;C:\Program Files\CMake\bin;$env:PATH"
 cargo build --release -p whisper-local
 ```
+
+In Git Bash the same two are `export VULKAN_SDK='C:\VulkanSDK\1.4.357.0'` and
+`export PATH="/c/VulkanSDK/1.4.357.0/Bin:/c/Program Files/CMake/bin:$PATH"`.
 
 - `whisper-local doctor` reports devices, model, engine backend and the normalizer.
 - `whisper-local simulate <wav> [--runs N]` runs one dictation from a WAV into Notepad
