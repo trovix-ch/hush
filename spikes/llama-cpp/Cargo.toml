@@ -1,0 +1,32 @@
+[package]
+name = "spike-llama-cpp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone on purpose: this spike must not join or perturb the main workspace.
+[workspace]
+
+[features]
+default = []
+# Loads ggml backends as DLLs at runtime instead of linking them in.
+dynamic-backends = ["llama-cpp-2/dynamic-backends"]
+
+[dependencies]
+# Exact pin: the bindings mirror llama.cpp and do not follow semver between patches.
+# `common` is off: the chat template is applied through llama.cpp's built-in template
+# matcher, which is what `apply_chat_template` calls.
+llama-cpp-2 = { version = "=0.1.157", default-features = false, features = ["vulkan", "openmp"] }
+# Only for the device's PCI id, which the safe device listing does not expose.
+llama-cpp-sys-2 = "=0.1.157"
+encoding_rs = "0.8"
+# Rule pass, validation and user-message format come from the real crate so the numbers
+# are comparable with bench-normalize; the system prompt is copied (see src/prompt.rs).
+wl-core = { path = "../../crates/core" }
+wl-normalize = { path = "../../crates/normalize" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+anyhow = "1"
+
+[profile.release]
+debug = false
