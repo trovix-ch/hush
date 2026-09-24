@@ -6,6 +6,8 @@ mod cpal_backend;
 pub mod display;
 pub mod engine;
 pub mod resample;
+#[cfg(feature = "silero")]
+pub mod silero;
 pub mod vad;
 
 pub use cpal_backend::{CpalOpener, InputDeviceInfo, list_input_devices};
@@ -30,6 +32,9 @@ impl Recorder for CpalRecorder {
     }
     fn cancel(&mut self) {
         self.0.cancel()
+    }
+    fn take_chunks(&mut self) -> Vec<f32> {
+        self.0.take_chunks()
     }
     fn level(&self) -> f32 {
         self.0.level()

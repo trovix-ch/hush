@@ -1,21 +1,10 @@
-//! A neural detector is deliberately not in this crate: it must not pull a second native
-//! runtime into default builds.
+//! The energy detector is the default; the neural one needs no native runtime but is
+//! behind a feature until something uses it.
 
 use std::time::Duration;
 
+pub use wl_core::segment::VadEvent;
 use wl_core::stt::SAMPLE_RATE;
-
-/// Offsets count from the first sample pushed since the last reset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VadEvent {
-    SpeechStart {
-        at: Duration,
-    },
-    /// End of the last speech frame, before hangover.
-    SpeechEnd {
-        at: Duration,
-    },
-}
 
 pub trait Vad: Send {
     /// Returns boundaries that became certain during this call: events lag the audio by

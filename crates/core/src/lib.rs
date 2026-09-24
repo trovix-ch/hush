@@ -10,6 +10,7 @@ pub mod normalize;
 pub mod notify;
 pub mod pipeline;
 pub mod recorder;
+pub mod segment;
 pub mod stt;
 mod utterance;
 

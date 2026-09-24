@@ -67,6 +67,14 @@ pub trait Recorder: Send {
     /// The stream stays warm as after `stop()`.
     fn cancel(&mut self);
 
+    /// 16 kHz mono audio of the current recording that arrived since the last call; the
+    /// first call after `start()` begins with the pre-roll. Everything taken is a prefix of
+    /// what `stop()` returns, so a consumer that counts samples knows where the unseen
+    /// rest begins. Empty when not recording or when the recorder cannot stream.
+    fn take_chunks(&mut self) -> Vec<f32> {
+        Vec::new()
+    }
+
     /// `0.0..=1.0`; `0.0` when the stream is closed.
     fn level(&self) -> f32;
 

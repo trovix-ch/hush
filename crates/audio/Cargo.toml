@@ -15,6 +15,14 @@ audioadapter-buffers = "5.1"
 rtrb = "0.3"
 thiserror = "2"
 tracing = "0.1"
+# Pinned exactly: pre-1.0, and the Silero graph needs a replacement for its `If` parser
+# that leans on tract internals.
+tract-onnx = { version = "=0.23.8", optional = true }
+
+[features]
+default = []
+# Off by default until the driver uses it: about 90 more crates and assembled kernels.
+silero = ["dep:tract-onnx"]
 
 [dev-dependencies]
 hound = "3.5"

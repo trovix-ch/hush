@@ -12,10 +12,15 @@ use crate::insert::{AppPolicies, InsertError, InsertOutcome};
 use crate::normalize::{AppContext, NormalizeError, NormalizeOutput, Provenance};
 use crate::notify::{OverlayState, ProvenanceHint, Sound};
 use crate::recorder::{RecorderError, Recording};
+use crate::segment::{Segmenter, SegmenterConfig, Stitcher, VadEvent};
 use crate::stt::{SttError, Transcript};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PipelineConfig {
+    /// Transcribe speech segments that close while the key is held, so release leaves
+    /// only the tail. Takes effect only for a driver that sends `Event::Audio`.
+    pub pre_transcribe: bool,
+    pub segmenter: SegmenterConfig,
     pub hands_free_double_tap: bool,
     pub tap_max: Duration,
     /// Measured from the first tap's release to the second tap's key-down.
@@ -31,6 +36,8 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            pre_transcribe: true,
+            segmenter: SegmenterConfig::default(),
             hands_free_double_tap: true,
             tap_max: Duration::from_millis(250),
             tap_pair_window: Duration::from_millis(250),
@@ -122,7 +129,23 @@ pub enum Event {
     MaxDurationReached(UtteranceId),
     TapWindowElapsed(UtteranceId),
     Recorded(UtteranceId, Recording),
+    /// Audio of the recording `id`, contiguous from its first sample (pre-roll included),
+    /// with the detector's events for it. A driver that never sends this gets
+    /// whole-recording transcription, exactly as with `pre_transcribe` off.
+    Audio {
+        id: UtteranceId,
+        at: Instant,
+        pcm: Vec<f32>,
+        vad: Vec<VadEvent>,
+    },
+    /// Taken as the next unanswered segment when the utterance was segmented.
     TranscriptReady(UtteranceId, Transcript),
+    /// Index 0 of an utterance that was not segmented is its whole-recording result.
+    SegmentReady {
+        id: UtteranceId,
+        segment_index: u32,
+        transcript: Transcript,
+    },
     NormalizedReady(UtteranceId, NormalizeOutput),
     InsertDone(UtteranceId, InsertOutcome),
     Failed(UtteranceId, Failure),
@@ -150,6 +173,10 @@ pub enum Effect {
         timer: Timer,
         after: Duration,
     },
+    /// The n-th `Transcribe` of an utterance is its segment n, counting from 0: one per
+    /// closed segment while recording, then the tail, or a single whole recording.
+    /// Answer with `SegmentReady` in any order, or with `TranscriptReady` in emission
+    /// order.
     Transcribe {
         id: UtteranceId,
         pcm: Vec<f32>,
@@ -226,6 +253,37 @@ struct Inflight {
     hint: ProvenanceHint,
 }
 
+/// Segments are sent only for the oldest utterance still in the pipeline, so speech is
+/// still transcribed in utterance order and an earlier utterance's cancellation token is
+/// never retired early.
+#[derive(Debug)]
+struct Segmented {
+    id: UtteranceId,
+    segmenter: Segmenter,
+    held: VecDeque<Vec<f32>>,
+    results: Stitcher,
+    /// Until the press can no longer turn out to be a tap, whose audio is thrown away.
+    committed: bool,
+    recorded: bool,
+}
+
+impl Segmented {
+    fn new(id: UtteranceId, cfg: &SegmenterConfig, committed: bool) -> Self {
+        Self {
+            id,
+            segmenter: Segmenter::new(cfg),
+            held: VecDeque::new(),
+            results: Stitcher::default(),
+            committed,
+            recorded: false,
+        }
+    }
+
+    fn sent_any(&self) -> bool {
+        self.results.expected() > 0
+    }
+}
+
 pub struct Pipeline {
     cfg: PipelineConfig,
     next_id: UtteranceId,
@@ -233,6 +291,7 @@ pub struct Pipeline {
     awaiting_recorded: Vec<Waiting>,
     queue: VecDeque<Queued>,
     inflight: Option<Inflight>,
+    segs: Vec<Segmented>,
     history: History,
     shown: OverlayState,
 }
@@ -256,6 +315,7 @@ impl Pipeline {
             awaiting_recorded: Vec::new(),
             queue: VecDeque::new(),
             inflight: None,
+            segs: Vec::new(),
             shown: OverlayState::Idle,
         }
     }
@@ -305,7 +365,13 @@ impl Pipeline {
                 }
             }
             Event::Recorded(id, rec) => self.on_recorded(id, rec, &mut fx),
-            Event::TranscriptReady(id, t) => self.on_transcript(id, t, &mut fx),
+            Event::Audio { id, at, pcm, vad } => self.on_audio(id, at, &pcm, &vad, &mut fx),
+            Event::TranscriptReady(id, t) => self.on_segment(id, None, t, &mut fx),
+            Event::SegmentReady {
+                id,
+                segment_index,
+                transcript,
+            } => self.on_segment(id, Some(segment_index), transcript, &mut fx),
             Event::NormalizedReady(id, out) => self.on_normalized(id, out, &mut fx),
             Event::InsertDone(id, outcome) => self.on_insert_done(id, outcome, &mut fx),
             Event::Failed(id, failure) => self.on_failed(id, failure, &mut fx),
@@ -359,6 +425,10 @@ impl Pipeline {
                     fx.push(Effect::DiscardRecording(id));
                     fx.push(Effect::StartRecording(id));
                     self.capture = Capture::HandsFree { id, focus: first };
+                    if self.drop_segments(id, fx) {
+                        self.segs
+                            .push(Segmented::new(id, &self.cfg.segmenter, true));
+                    }
                 } else {
                     // The window closed but its timer has not fired yet.
                     self.resolve_lone_tap(fx);
@@ -421,7 +491,80 @@ impl Pipeline {
             down_at: at,
             focus,
         };
+        if self.cfg.pre_transcribe {
+            self.segs
+                .push(Segmented::new(id, &self.cfg.segmenter, false));
+        }
         self.notify(fx, OverlayState::Listening { level: 0.0 });
+    }
+
+    /// Returns whether there was anything to drop.
+    fn drop_segments(&mut self, id: UtteranceId, fx: &mut Vec<Effect>) -> bool {
+        let Some(pos) = self.segs.iter().position(|s| s.id == id) else {
+            return false;
+        };
+        if self.segs.remove(pos).sent_any() {
+            fx.push(Effect::CancelInflight(id));
+        }
+        true
+    }
+
+    /// The oldest utterance anywhere in the pipeline.
+    fn head(&self) -> Option<UtteranceId> {
+        self.inflight
+            .as_ref()
+            .map(|i| i.id)
+            .into_iter()
+            .chain(self.queue.iter().map(|q| q.id))
+            .chain(self.awaiting_recorded.iter().map(|w| w.id))
+            .chain(self.capture.id())
+            .min()
+    }
+
+    fn flush(&mut self, fx: &mut Vec<Effect>) {
+        let Some(head) = self.head() else {
+            return;
+        };
+        let Some(s) = self.segs.iter_mut().find(|s| s.id == head && s.committed) else {
+            return;
+        };
+        while let Some(pcm) = s.held.pop_front() {
+            s.results.expect();
+            fx.push(Effect::Transcribe { id: head, pcm });
+        }
+    }
+
+    fn commit_after(&self) -> Duration {
+        if self.cfg.hands_free_double_tap {
+            self.cfg.tap_max.max(self.cfg.min_press)
+        } else {
+            self.cfg.min_press
+        }
+    }
+
+    fn on_audio(
+        &mut self,
+        id: UtteranceId,
+        at: Instant,
+        pcm: &[f32],
+        vad: &[VadEvent],
+        fx: &mut Vec<Effect>,
+    ) {
+        let committed = match &self.capture {
+            Capture::Holding { id: c, down_at, .. } if *c == id => {
+                at.saturating_duration_since(*down_at) >= self.commit_after()
+            }
+            Capture::HandsFree { id: c, .. } if *c == id => true,
+            Capture::TapPending { id: c, .. } if *c == id => false,
+            _ => return,
+        };
+        let Some(s) = self.segs.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        let closed = s.segmenter.push(pcm, vad);
+        s.held.extend(closed);
+        s.committed |= committed;
+        self.flush(fx);
     }
 
     fn resolve_lone_tap(&mut self, fx: &mut Vec<Effect>) {
@@ -443,6 +586,7 @@ impl Pipeline {
 
     fn discard_capture(&mut self, id: UtteranceId, fx: &mut Vec<Effect>) {
         fx.push(Effect::DiscardRecording(id));
+        self.drop_segments(id, fx);
         self.capture = Capture::Idle;
         let s = self.inflight_overlay();
         self.notify(fx, s);
@@ -452,6 +596,9 @@ impl Pipeline {
         fx.push(Effect::Play(Sound::Stop));
         fx.push(Effect::StopRecording(id));
         self.capture = Capture::Idle;
+        if let Some(s) = self.segs.iter_mut().find(|s| s.id == id) {
+            s.committed = true;
+        }
         self.awaiting_recorded.push(Waiting { id, focus });
         let s = self.inflight_overlay();
         self.notify(fx, s);
@@ -462,6 +609,26 @@ impl Pipeline {
             return;
         };
         let Waiting { id, focus } = self.awaiting_recorded.remove(pos);
+        if let Some(k) = self.segs.iter().position(|s| s.id == id) {
+            // Nothing sent yet means one call on the whole recording, which is today's
+            // path and no slower than several short calls.
+            if !self.segs[k].sent_any() {
+                self.segs.remove(k);
+            } else {
+                let s = &mut self.segs[k];
+                let rest = rec.pcm.get(s.segmenter.fed()..).unwrap_or_default();
+                let tail = s.segmenter.finish(rest);
+                s.held.extend(tail);
+                s.recorded = true;
+                self.queue.push_back(Queued {
+                    id,
+                    focus,
+                    pcm: Vec::new(),
+                });
+                self.pump(fx);
+                return;
+            }
+        }
         if rec.pcm.is_empty() {
             let s = self.inflight_overlay();
             self.show_stage(fx, s);
@@ -492,11 +659,84 @@ impl Pipeline {
             llm_error: None,
             hint: ProvenanceHint::Rules,
         });
-        fx.push(Effect::Transcribe {
-            id: q.id,
-            pcm: q.pcm,
-        });
+        let segmented = self.segs.iter().any(|s| s.id == q.id);
+        if !segmented {
+            fx.push(Effect::Transcribe {
+                id: q.id,
+                pcm: q.pcm,
+            });
+        }
         self.show_stage(fx, OverlayState::Transcribing);
+        if segmented {
+            self.flush(fx);
+            self.try_complete(q.id, fx);
+        }
+    }
+
+    fn on_segment(
+        &mut self,
+        id: UtteranceId,
+        index: Option<u32>,
+        t: Transcript,
+        fx: &mut Vec<Effect>,
+    ) {
+        let Some(s) = self.segs.iter_mut().find(|s| s.id == id && s.sent_any()) else {
+            if index.unwrap_or(0) == 0 {
+                self.on_transcript(id, t, fx);
+            }
+            return;
+        };
+        let Some(index) = index.or_else(|| s.results.oldest_missing()) else {
+            return;
+        };
+        if s.results.set(index, t.text, t.language, t.inference_time) {
+            self.try_complete(id, fx);
+        }
+    }
+
+    fn try_complete(&mut self, id: UtteranceId, fx: &mut Vec<Effect>) {
+        let Some(pos) = self.segs.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let s = &self.segs[pos];
+        if !s.recorded || !s.held.is_empty() || !s.results.is_complete() {
+            return;
+        }
+        if matching(&mut self.inflight, id, Stage::Transcribing).is_none() {
+            return;
+        }
+        let s = self.segs.remove(pos);
+        tracing::debug!(
+            %id,
+            segments = s.results.expected(),
+            inference_ms = s.results.inference().as_secs_f64() * 1e3,
+            "segments stitched"
+        );
+        self.transcribed(
+            s.results.text(),
+            s.results.language().map(str::to_owned),
+            fx,
+        );
+    }
+
+    /// Ends the utterance like a failed whole-recording call. Retrying on the whole
+    /// recording is not attempted: late answers to the cancelled segments share the
+    /// utterance id and could not be told apart from the retry's.
+    fn abort_segmented(&mut self, id: UtteranceId, failure: Failure, fx: &mut Vec<Effect>) {
+        self.segs.retain(|s| s.id != id);
+        fx.push(Effect::CancelInflight(id));
+        if self.capture.id() == Some(id) {
+            fx.push(Effect::DiscardRecording(id));
+            self.capture = Capture::Idle;
+        }
+        self.awaiting_recorded.retain(|w| w.id != id);
+        self.queue.retain(|q| q.id != id);
+        self.error(fx, failure.to_string());
+        if self.inflight.as_ref().is_some_and(|i| i.id == id) {
+            self.finish(fx);
+        } else {
+            self.flush(fx);
+        }
     }
 
     fn normalize_effect(cfg: &PipelineConfig, history: &History, i: &Inflight) -> Effect {
@@ -526,15 +766,21 @@ impl Pipeline {
     }
 
     fn on_transcript(&mut self, id: UtteranceId, t: Transcript, fx: &mut Vec<Effect>) {
-        let Some(i) = matching(&mut self.inflight, id, Stage::Transcribing) else {
+        if matching(&mut self.inflight, id, Stage::Transcribing).is_some() {
+            self.transcribed(t.text, t.language, fx);
+        }
+    }
+
+    fn transcribed(&mut self, text: String, language: Option<String>, fx: &mut Vec<Effect>) {
+        let Some(i) = self.inflight.as_mut() else {
             return;
         };
-        if t.text.trim().is_empty() {
+        if text.trim().is_empty() {
             self.finish(fx);
             return;
         }
-        i.raw = t.text;
-        i.language = t.language;
+        i.raw = text;
+        i.language = language;
         i.stage = Stage::Normalizing;
         fx.push(Self::normalize_effect(&self.cfg, &self.history, i));
         self.show_stage(fx, OverlayState::Normalizing);
@@ -612,9 +858,18 @@ impl Pipeline {
                     self.capture = Capture::Idle;
                 }
                 self.awaiting_recorded.retain(|w| w.id != id);
+                self.drop_segments(id, fx);
                 self.error(fx, Failure::Record(e).to_string());
                 if self.inflight.is_none() {
                     self.pump(fx);
+                    self.flush(fx);
+                }
+            }
+            Failure::Stt(e) if self.segs.iter().any(|s| s.id == id && s.sent_any()) => {
+                if matches!(e, SttError::EmptyAudio) {
+                    self.on_segment(id, None, Transcript::default(), fx);
+                } else {
+                    self.abort_segmented(id, Failure::Stt(e), fx);
                 }
             }
             Failure::Stt(e) => {
@@ -671,6 +926,7 @@ impl Pipeline {
     fn finish(&mut self, fx: &mut Vec<Effect>) {
         self.inflight = None;
         self.pump(fx);
+        self.flush(fx);
         if self.is_recording() {
             self.notify(fx, OverlayState::Listening { level: 0.0 });
         } else if self.inflight.is_none() && self.awaiting_recorded.is_empty() {
@@ -694,6 +950,13 @@ impl Pipeline {
         any |= !self.awaiting_recorded.is_empty() || !self.queue.is_empty();
         self.awaiting_recorded.clear();
         self.queue.clear();
+        let inflight = self.inflight.as_ref().map(|i| i.id);
+        for s in std::mem::take(&mut self.segs) {
+            if s.sent_any() && Some(s.id) != inflight {
+                fx.push(Effect::CancelInflight(s.id));
+                any = true;
+            }
+        }
         if let Some(i) = self.inflight.take() {
             fx.push(Effect::CancelInflight(i.id));
             any = true;
@@ -779,6 +1042,49 @@ mod tests {
             self.p.handle(Event::InsertDone(UtteranceId(id), outcome))
         }
 
+        /// `len_ms` of audio delivered at `at_ms`; VAD times are from recording start.
+        fn audio(&mut self, id: u64, at_ms: u64, len_ms: usize, vad: &[VadEvent]) -> Vec<Effect> {
+            let at = self.at(at_ms);
+            self.p.handle(Event::Audio {
+                id: UtteranceId(id),
+                at,
+                pcm: vec![0.1; samples_ms(len_ms)],
+                vad: vad.to_vec(),
+            })
+        }
+
+        fn recorded_ms(&mut self, id: u64, len_ms: usize) -> Vec<Effect> {
+            self.p.handle(Event::Recorded(
+                UtteranceId(id),
+                Recording {
+                    pcm: vec![0.1; samples_ms(len_ms)],
+                    sample_rate: 16_000,
+                    ..Default::default()
+                },
+            ))
+        }
+
+        fn segment(&mut self, id: u64, index: u32, text: &str) -> Vec<Effect> {
+            self.p.handle(Event::SegmentReady {
+                id: UtteranceId(id),
+                segment_index: index,
+                transcript: Transcript {
+                    utterance: UtteranceId(id),
+                    text: text.into(),
+                    language: Some("en".into()),
+                    ..Default::default()
+                },
+            })
+        }
+
+        /// Two sentences with a pause between them, closed while the key is held.
+        fn two_segments_during_hold(&mut self, id: u64, t0: u64) -> Vec<Effect> {
+            let mut fx = self.audio(id, t0 + 1000, 1000, &[start(100), end(900)]);
+            fx.extend(self.audio(id, t0 + 1500, 500, &[]));
+            fx.extend(self.audio(id, t0 + 3000, 1500, &[start(1600), end(2400)]));
+            fx
+        }
+
         fn reach_transcribing(&mut self) {
             self.down(0);
             self.up(1000);
@@ -819,6 +1125,216 @@ mod tests {
 
     fn id(n: u64) -> UtteranceId {
         UtteranceId(n)
+    }
+
+    fn samples_ms(ms: usize) -> usize {
+        ms * 16
+    }
+
+    fn start(ms: u64) -> VadEvent {
+        VadEvent::SpeechStart {
+            at: Duration::from_millis(ms),
+        }
+    }
+
+    fn end(ms: u64) -> VadEvent {
+        VadEvent::SpeechEnd {
+            at: Duration::from_millis(ms),
+        }
+    }
+
+    /// Sample counts of the `Transcribe` effects for `n`.
+    fn transcribed_lens(fx: &[Effect], n: u64) -> Vec<usize> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Transcribe { id: i, pcm } if *i == id(n) => Some(pcm.len()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn normalized_text(fx: &[Effect]) -> Option<&str> {
+        fx.iter().find_map(|e| match e {
+            Effect::Normalize { transcript, .. } => Some(transcript.as_str()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn segments_closed_during_the_hold_are_transcribed_in_order() {
+        let mut t = T::new();
+        t.down(0);
+        let fx = t.two_segments_during_hold(1, 0);
+        assert_eq!(
+            transcribed_lens(&fx, 1),
+            vec![samples_ms(1100), samples_ms(1200)],
+            "{fx:?}"
+        );
+        assert_eq!(t.p.state(), State::Recording);
+        assert!(
+            t.segment(1, 0, "Hello there.").is_empty(),
+            "held until release"
+        );
+        t.up(3100);
+        let fx = t.recorded_ms(1, 3100);
+        assert!(
+            transcribed_lens(&fx, 1).is_empty(),
+            "no speech after the cut"
+        );
+        assert_eq!(t.p.state(), State::Transcribing);
+        let fx = t.segment(1, 1, "How are you?");
+        assert_eq!(normalized_text(&fx), Some("Hello there. How are you?"));
+        assert_eq!(t.p.state(), State::Normalizing);
+    }
+
+    #[test]
+    fn segments_arriving_out_of_order_are_reordered() {
+        let mut t = T::new();
+        t.down(0);
+        t.two_segments_during_hold(1, 0);
+        t.up(3100);
+        t.recorded_ms(1, 3100);
+        assert!(t.segment(1, 1, "second").is_empty());
+        assert!(t.segment(1, 1, "duplicate").is_empty());
+        let fx = t.segment(1, 0, "first");
+        assert_eq!(normalized_text(&fx), Some("first second"));
+    }
+
+    #[test]
+    fn the_tail_is_transcribed_on_release() {
+        let mut t = T::new();
+        t.down(0);
+        t.two_segments_during_hold(1, 0);
+        t.audio(1, 3500, 500, &[start(3200)]);
+        t.up(3600);
+        let fx = t.recorded_ms(1, 3600);
+        assert_eq!(transcribed_lens(&fx, 1), vec![samples_ms(3600 - 3000)]);
+        t.segment(1, 0, "one");
+        assert!(t.segment(1, 2, "three").is_empty());
+        // Index-less answers fill the oldest gap.
+        let fx = t.transcript(1, "two");
+        assert_eq!(normalized_text(&fx), Some("one two three"));
+    }
+
+    #[test]
+    fn escape_mid_hold_cancels_the_segment_transcriptions() {
+        let mut t = T::new();
+        t.down(0);
+        t.two_segments_during_hold(1, 0);
+        assert_eq!(
+            t.p.handle(Event::Escape),
+            vec![
+                Effect::DiscardRecording(id(1)),
+                Effect::CancelInflight(id(1)),
+                Effect::Play(Sound::Cancel),
+                Effect::Notify(OverlayState::Idle),
+            ]
+        );
+        assert!(t.segment(1, 0, "late").is_empty());
+        assert!(t.up(3100).is_empty());
+        assert!(t.recorded_ms(1, 3100).is_empty());
+        assert_eq!(t.p.state(), State::Idle);
+    }
+
+    #[test]
+    fn with_pre_transcribe_off_the_whole_recording_is_transcribed_once() {
+        let mut t = T::with(PipelineConfig {
+            pre_transcribe: false,
+            ..Default::default()
+        });
+        t.down(0);
+        assert!(t.two_segments_during_hold(1, 0).is_empty());
+        t.up(3100);
+        let fx = t.recorded_ms(1, 3100);
+        assert_eq!(
+            fx,
+            vec![Effect::Transcribe {
+                id: id(1),
+                pcm: vec![0.1; samples_ms(3100)]
+            }]
+        );
+        let fx = t.transcript(1, "all of it");
+        assert_eq!(normalized_text(&fx), Some("all of it"));
+    }
+
+    #[test]
+    fn a_single_sentence_takes_the_whole_recording_path() {
+        let mut t = T::new();
+        t.down(0);
+        assert!(t.audio(1, 1000, 1000, &[start(200)]).is_empty());
+        t.up(1500);
+        assert_eq!(
+            transcribed_lens(&t.recorded_ms(1, 1500), 1),
+            vec![samples_ms(1500)]
+        );
+    }
+
+    #[test]
+    fn unbroken_speech_past_the_cap_is_split_during_the_hold() {
+        let mut cfg = PipelineConfig::default();
+        cfg.segmenter.max_segment = Duration::from_secs(2);
+        let mut t = T::with(cfg);
+        t.down(0);
+        let fx = t.audio(1, 3000, 3000, &[start(0)]);
+        assert_eq!(transcribed_lens(&fx, 1), vec![samples_ms(1010)]);
+        t.up(3000);
+        let fx = t.recorded_ms(1, 3000);
+        assert_eq!(transcribed_lens(&fx, 1), vec![samples_ms(1990)]);
+    }
+
+    #[test]
+    fn a_press_that_may_still_be_a_tap_sends_nothing() {
+        let mut t = T::new();
+        t.down(0);
+        assert!(t.audio(1, 200, 2000, &[start(0), end(1000)]).is_empty());
+        let fx = t.audio(1, 400, 100, &[]);
+        assert_eq!(
+            transcribed_lens(&fx, 1).len(),
+            1,
+            "committed once held past a tap"
+        );
+    }
+
+    #[test]
+    fn a_later_utterance_waits_for_the_one_ahead() {
+        let mut t = T::new();
+        t.reach_transcribing();
+        t.down(2000);
+        assert!(t.two_segments_during_hold(2, 2000).is_empty());
+        t.transcript(1, "first");
+        t.normalized(1, "First.", Provenance::Rules);
+        let fx = t.inserted(1, InsertOutcome::TargetRead);
+        assert_eq!(transcribed_lens(&fx, 2).len(), 2, "{fx:?}");
+    }
+
+    #[test]
+    fn all_empty_segments_end_quietly() {
+        let mut t = T::new();
+        t.down(0);
+        t.two_segments_during_hold(1, 0);
+        t.up(3100);
+        t.recorded_ms(1, 3100);
+        t.segment(1, 0, " ");
+        let fx =
+            t.p.handle(Event::Failed(id(1), Failure::Stt(SttError::EmptyAudio)));
+        assert_eq!(fx, vec![Effect::Notify(OverlayState::Idle)]);
+        assert_eq!(t.p.state(), State::Idle);
+    }
+
+    #[test]
+    fn a_failed_segment_mid_hold_ends_the_utterance() {
+        let mut t = T::new();
+        t.down(0);
+        t.two_segments_during_hold(1, 0);
+        let fx = t.p.handle(Event::Failed(
+            id(1),
+            Failure::Stt(SttError::BackendDied("device lost".into())),
+        ));
+        assert_eq!(fx[0], Effect::CancelInflight(id(1)));
+        assert_eq!(fx[1], Effect::DiscardRecording(id(1)));
+        assert_eq!(fx[2], Effect::Play(Sound::Error));
+        assert_eq!(t.p.state(), State::Idle);
+        assert!(t.up(3100).is_empty());
     }
 
     fn has(fx: &[Effect], pred: impl Fn(&Effect) -> bool) -> bool {

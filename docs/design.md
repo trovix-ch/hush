@@ -198,6 +198,13 @@ streams badly. Instead, while the key is held, every VAD segment that closes is
 transcribed immediately; on release only the tail is left. Tail latency becomes the cost
 of one short segment. A live preview in the overlay is a possible later addition.
 
+*Amended 2026-09-24:* the state machine cuts the segments from audio and VAD events the
+driver streams to it, and sends them only for the oldest utterance in the pipeline, so
+speech is still transcribed in utterance order. If nothing closed before release, the
+whole recording goes to the engine in one call as before: a single call is no slower
+than several, and it keeps the no-speech path unchanged. A pipeline flag turns
+pre-transcription off for A/B measurement; the tail-latency gain is not yet measured.
+
 ### D7. Hotkey: our own low-level keyboard hook
 A `WH_KEYBOARD_LL` hook on a dedicated thread with its own message loop. It is the only
 mechanism that gives key-up, modifier-only keys, and the ability to swallow the key.
@@ -389,6 +396,14 @@ Speech, voice activity detection and the punctuation model all use ONNX Runtime.
 pin the same `ort` version workspace-wide; a second copy means a second native runtime
 shipped. VAD therefore runs on our own `ort` session (the Silero graph is tiny and its
 input contract is stable) rather than through a crate that pins a different `ort`.
+
+*Amended 2026-09-24:* Silero VAD no longer needs ONNX Runtime at all. It runs on
+`tract`, pure Rust, with a replacement for tract's `If` parser: stock tract checks both
+branches of every `If` and rejects the dead, ill-typed branches in the Silero export.
+Its probabilities matched onnxruntime to within 2e-6 on the bench fixtures, and it costs
+about 35 µs per 32 ms chunk in a release build (method: `chunk_cost` test in the audio crate,
+v6.2 model, this machine). It sits behind the audio crate's non-default `silero`
+feature until the driver uses it.
 
 ### D17. Speech runs on ggml/Vulkan; ONNX Runtime is a fallback behind a feature *(perishable)*
 Supersedes the default in D2, by the rule written in D13 before the numbers existed.

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -31,9 +31,27 @@ impl Clock for SystemClock {
 pub struct Shared {
     level_bits: AtomicU32,
     warm: AtomicBool,
+    /// Taken by the consumer, filled by the audio worker (never the device callback).
+    outbox: Mutex<Vec<f32>>,
 }
 
 impl Shared {
+    pub fn take_chunks(&self) -> Vec<f32> {
+        self.outbox
+            .lock()
+            .map(|mut o| std::mem::take(&mut *o))
+            .unwrap_or_default()
+    }
+    fn post(&self, pcm: &[f32]) {
+        if let Ok(mut o) = self.outbox.lock() {
+            o.extend_from_slice(pcm);
+        }
+    }
+    fn clear_outbox(&self) {
+        if let Ok(mut o) = self.outbox.lock() {
+            o.clear();
+        }
+    }
     pub fn level(&self) -> f32 {
         f32::from_bits(self.level_bits.load(Ordering::Relaxed))
     }
@@ -288,7 +306,9 @@ impl<O: StreamOpener> Engine<O> {
                 if out.len() > room {
                     take.capped = true;
                 }
-                take.pcm.extend_from_slice(&out[..out.len().min(room)]);
+                let kept = &out[..out.len().min(room)];
+                take.pcm.extend_from_slice(kept);
+                self.shared.post(kept);
             }
             Mode::Idle { .. } => {
                 let keep = out.len().min(self.preroll_cap);
@@ -315,6 +335,8 @@ impl<O: StreamOpener> Engine<O> {
             Vec::with_capacity(self.max_samples.min(samples_for(Duration::from_secs(15))));
         pcm.extend(self.preroll.drain(..));
         pcm.truncate(self.max_samples);
+        self.shared.clear_outbox();
+        self.shared.post(&pcm);
         self.mode = Mode::Recording(Take::new(pcm));
         Ok(())
     }
@@ -344,6 +366,7 @@ impl<O: StreamOpener> Engine<O> {
         else {
             unreachable!("checked above");
         };
+        self.shared.clear_outbox();
         let lost_frames = take
             .lost_at
             .map(|t| samples_for(now.saturating_duration_since(t)))
@@ -365,6 +388,7 @@ impl<O: StreamOpener> Engine<O> {
         if matches!(self.mode, Mode::Recording(_)) {
             self.pump(now);
             self.mode = Mode::Idle { since: now };
+            self.shared.clear_outbox();
             self.pump(now);
         }
     }
@@ -459,6 +483,10 @@ impl Recorder for WorkerRecorder {
 
     fn cancel(&mut self) {
         let _ = self.send(Cmd::Cancel);
+    }
+
+    fn take_chunks(&mut self) -> Vec<f32> {
+        self.shared.take_chunks()
     }
 
     fn level(&self) -> f32 {
@@ -787,6 +815,35 @@ mod tests {
         assert!((e.shared().level() - 0.5).abs() < 0.02);
         feed_secs(&mut e, &p, 0.0, 0.1, &mut t);
         assert!(e.shared().level() < 0.01);
+    }
+
+    #[test]
+    fn streamed_chunks_are_a_prefix_of_the_recording() {
+        let (mut e, p, mut t) = engine(RecorderConfig::default(), 48_000);
+        let shared = e.shared();
+        e.start(t).unwrap();
+        feed_secs(&mut e, &p, 0.0, 0.3, &mut t);
+        e.stop(t).unwrap();
+        feed_secs(&mut e, &p, 0.2, 0.5, &mut t);
+        assert!(shared.take_chunks().is_empty(), "nothing while idle");
+        e.start(t).unwrap();
+        let mut streamed = shared.take_chunks();
+        assert!(!streamed.is_empty(), "the pre-roll comes first");
+        for _ in 0..5 {
+            feed_secs(&mut e, &p, 0.3, 0.1, &mut t);
+            streamed.extend(shared.take_chunks());
+        }
+        let r = e.stop(t).unwrap();
+        assert!(r.pcm.len() >= streamed.len());
+        assert_eq!(r.pcm[..streamed.len()], streamed[..]);
+        assert!(
+            shared.take_chunks().is_empty(),
+            "stop clears what was not taken"
+        );
+        e.start(t).unwrap();
+        feed_secs(&mut e, &p, 0.3, 0.1, &mut t);
+        e.cancel(t);
+        assert!(shared.take_chunks().is_empty(), "cancel clears too");
     }
 
     #[test]
