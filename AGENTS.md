@@ -94,9 +94,6 @@ contradicts, the code is right and the prose gets fixed or deleted in the same c
    drops samples, and synthetic keys are refused while the session is locked. Say which
    session you measured in. Do not stop system services (the RDP clipboard, clipboard
    history) without saying so and restoring them.
-7. **Editing files with scripts.** Files change through the editor tools, never through
-   `sed -i`, heredocs or a script that rewrites a file. A script once deleted the
-   function next to the block it replaced and only the tests noticed.
 
 ## Hit every surface
 
@@ -107,8 +104,9 @@ A change is not done until each of these that it touches is handled:
 - The overlay state and sound for any new user-visible outcome.
 - The transcript history for any new place text can be lost.
 - Per-app policy if the behaviour differs by target application.
-- A numbered decision in `docs/design.md` when the change supersedes one. Decisions are
-  superseded by adding a new number, never by editing history.
+- The decision in `docs/design.md` that the change touches: amended in place with a
+  dated note when the change refines it, or a new numbered decision when it reverses
+  it.
 - The measurements section, if the change was justified by a number.
 
 ## Building, running, verifying
@@ -152,17 +150,28 @@ Say so explicitly instead of claiming them.
 ## Commits
 
 Commits are checkpoints: each one builds, passes the gates, and is a state worth rolling
-back to. One concern per commit. The subject says what changed in plain language; the
-body says why, what was rejected and what was measured. A commit that changes a
-decision names the decision it supersedes. Nothing under `target/`, no models, no
-scratch output, no plans or implementation notes.
+back to. One concern per commit. Nothing under `target/`, no models, no scratch output,
+no plans or implementation notes.
+
+Conventional-commit subjects, one short sentence of plain prose after the prefix:
+`feat(stt): run Parakeet on ggml/Vulkan by default`, `fix(insert): restore only after
+the target read`, `docs(design): record the Vulkan gate result`. Types: `feat`, `fix`,
+`perf`, `refactor`, `test`, `docs`, `build`, `chore`. Scope is the crate or area
+(`core`, `audio`, `stt`, `normalize`, `platform`, `app`, `bench`, `design`, `agents`).
+A breaking change carries `!` after the scope and a `BREAKING:` line in the body.
+
+The body, in this order: the important changes first, as short bullets, with anything
+breaking or behaviour-changing marked; then the rationale, what was rejected and what
+was measured. A commit that changes a decision names it.
 
 ## Documentation
 
 - `docs/design.md` is the decision record: numbered decisions with rationale and
   rejected alternatives, and a measurements section where every number carries its
-  method and date. Sections that name crates, versions, models or machine state are
-  marked perishable and dated.
+  method and date. A decision is kept at its current truth: refinements are amended in
+  place with a dated note, and a reversal gets a new number that names the one it
+  supersedes. Sections that name crates, versions, models or machine state are marked
+  perishable and dated.
 - `docs/research/` holds dated reports with sources. They are evidence for decisions,
   not instructions; verify before relying on one that is months old.
 - Nothing else is documentation. No implementation notes, no plans, no TODO files, no
