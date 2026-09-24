@@ -1,0 +1,16 @@
+[package]
+name = "spike-transcribe-cpp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone on purpose: this spike must not join or perturb the main workspace.
+[workspace]
+
+[dependencies]
+# Exact pin: the bindings are 0.x and do not promise semver between patches.
+transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vulkan"] }
+hound = "3"
+
+[profile.release]
+debug = false
