@@ -1,5 +1,6 @@
-//! Windows silently removes a low-level hook whose callback overruns
-//! `LowLevelHooksTimeout`, so the callback only compares, `try_send`s and returns; all
+//! Windows drops the key events a low-level hook's callback overruns
+//! `LowLevelHooksTimeout` on, and is documented to remove such a hook silently, so the
+//! callback only compares, `try_send`s and returns; all
 //! other work is posted back to the hook thread, the only thread allowed to unhook.
 //! A key the hook swallows never reaches `GetAsyncKeyState`, so the watchdog reads the
 //! hotkey showing up there as proof that nothing swallowed it.
@@ -189,7 +190,7 @@ impl HotkeyConfig {
         Self {
             key,
             watchdog_period: Duration::from_millis(100),
-            probe_interval: Duration::from_millis(500),
+            probe_interval: Duration::from_millis(250),
             accept_injected: false,
         }
     }
@@ -303,6 +304,8 @@ struct Shared {
 
 const WM_HOOK_REINSTALL: u32 = WM_APP + 1;
 const WM_HOOK_MASK: u32 = WM_APP + 2;
+#[cfg(test)]
+const WM_HOOK_DEBUG_REMOVE: u32 = WM_APP + 3;
 
 struct CallbackState {
     shared: Option<Arc<Shared>>,
@@ -535,6 +538,11 @@ fn hook_thread(
             WM_HOOK_MASK => {
                 send_inputs(&mask_inputs(false));
             }
+            #[cfg(test)]
+            WM_HOOK_DEBUG_REMOVE => {
+                // SAFETY: our own hook; the reinstall's second unhook of it just fails.
+                let _ = unsafe { UnhookWindowsHookEx(hook) };
+            }
             WM_HOOK_REINSTALL => {
                 let reason = reason_from(msg.wParam.0);
                 // SAFETY: `hook` was installed by this thread and is removed once here.
@@ -616,6 +624,59 @@ fn sample_keys(buf: &mut [bool; 256]) {
     }
 }
 
+const PROBE_ANSWER: Duration = Duration::from_millis(50);
+const CONFIRM_PROBES: u32 = 3;
+const CONFIRM_SPACING: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    Answered,
+    Unanswered,
+    /// A locked or secure desktop refuses injection; that proves nothing either way.
+    Refused,
+}
+
+/// Measured 2026-09-24: `SendInput` returns only after the low-level hooks ran or
+/// `LowLevelHooksTimeout` (about 300 ms per event here) gave up on them, so a live hook
+/// has answered by the time it returns and the wait only covers clock slack.
+fn probe(shared: &Shared) -> Probe {
+    let start = shared.heartbeat.load(Ordering::Relaxed);
+    if send_inputs(&mask_inputs(true)) == 0 {
+        return Probe::Refused;
+    }
+    let deadline = Instant::now() + PROBE_ANSWER;
+    loop {
+        if shared.heartbeat.load(Ordering::Relaxed) != start {
+            return Probe::Answered;
+        }
+        if Instant::now() >= deadline {
+            return Probe::Unanswered;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A callback that overruns the timeout loses that event, which then reaches the key
+/// state unseen, but the hook stays installed (measured 2026-09-24 on Windows 11 with
+/// stalls up to 6 s). So a disagreement only raises suspicion, and only probes that go
+/// unanswered across most of a second prove the hook gone: reinstalling a live hook ends
+/// the user's recording for nothing.
+struct Suspicion {
+    reason: ReinstallReason,
+    unanswered: u32,
+    next_probe: Instant,
+}
+
+impl Suspicion {
+    fn probe_now(reason: ReinstallReason) -> Self {
+        Self {
+            reason,
+            unanswered: 0,
+            next_probe: Instant::now(),
+        }
+    }
+}
+
 /// Counted from when a new hook went in, not from the post: key changes from the dead
 /// period surface just after it and say nothing about the new hook.
 struct RateLimit {
@@ -649,6 +710,7 @@ fn watchdog_thread(
     // After a reinstall the hotkey may still be physically down; it counts again only
     // once it has been seen released.
     let mut key_check_armed = true;
+    let mut suspect: Option<Suspicion> = None;
     let mut limit = RateLimit {
         last: None,
         seen_done: shared.reinstalls_done.load(Ordering::Acquire),
@@ -698,21 +760,19 @@ fn watchdog_thread(
         let held = shared.held.load(Ordering::Acquire);
         let spec = KeySpec::unpack(shared.spec.load(Ordering::Relaxed));
 
-        if held && !blind && !probe_interval.is_zero() && last_probe.elapsed() >= probe_interval {
+        if held
+            && !blind
+            && suspect.is_none()
+            && !probe_interval.is_zero()
+            && last_probe.elapsed() >= probe_interval
+        {
             last_probe = Instant::now();
-            let start = shared.heartbeat.load(Ordering::Relaxed);
-            send_inputs(&mask_inputs(true));
-            let deadline = Instant::now() + Duration::from_millis(250);
-            let mut answered = false;
-            while Instant::now() < deadline {
-                if shared.heartbeat.load(Ordering::Relaxed) != start {
-                    answered = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if !answered && shared.held.load(Ordering::Acquire) {
-                reinstall(ReinstallReason::ProbeUnanswered, &mut limit);
+            if probe(&shared) == Probe::Unanswered && shared.held.load(Ordering::Acquire) {
+                suspect = Some(Suspicion {
+                    reason: ReinstallReason::ProbeUnanswered,
+                    unanswered: 1,
+                    next_probe: last_probe + CONFIRM_SPACING,
+                });
             }
         }
 
@@ -729,7 +789,7 @@ fn watchdog_thread(
                 if unswallowed_ticks >= 2 {
                     key_check_armed = false;
                     unswallowed_ticks = 0;
-                    reinstall(ReinstallReason::KeyNotSwallowed, &mut limit);
+                    suspect.get_or_insert(Suspicion::probe_now(ReinstallReason::KeyNotSwallowed));
                 }
             }
         }
@@ -742,7 +802,26 @@ fn watchdog_thread(
             .enumerate()
             .any(|(vk, (a, b))| a != b && vk as u8 != VK_MASK as u8);
         if changed && !blind && hb_before == hb_hist[0] {
-            reinstall(ReinstallReason::HeartbeatStopped, &mut limit);
+            suspect.get_or_insert(Suspicion::probe_now(ReinstallReason::HeartbeatStopped));
+        }
+
+        if let Some(s) = suspect.as_mut() {
+            let now = Instant::now();
+            if blind {
+                suspect = None;
+            } else if now >= s.next_probe {
+                match probe(&shared) {
+                    Probe::Answered | Probe::Refused => suspect = None,
+                    Probe::Unanswered => {
+                        s.unanswered += 1;
+                        s.next_probe = now + CONFIRM_SPACING;
+                        if s.unanswered >= CONFIRM_PROBES {
+                            reinstall(s.reason, &mut limit);
+                            suspect = None;
+                        }
+                    }
+                }
+            }
         }
         hb_hist = [hb_hist[1], hb_before];
         std::mem::swap(&mut prev_keys, &mut cur_keys);
@@ -844,10 +923,20 @@ impl HookHandle {
         };
     }
 
-    /// Past `LowLevelHooksTimeout`, Windows silently removes the hook.
+    /// Past `LowLevelHooksTimeout`, Windows drops the events it was waiting on.
     #[doc(hidden)]
     pub fn debug_stall_next_callback(&self, ms: u32) {
         self.shared.stall_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// What Windows is documented to do to a hook that overruns its timeout, which a
+    /// stall does not reproduce here.
+    #[cfg(test)]
+    fn debug_remove_hook_silently(&self) {
+        // SAFETY: posting a plain integer message to the hook thread.
+        let _ = unsafe {
+            PostThreadMessageW(self.hook_tid, WM_HOOK_DEBUG_REMOVE, WPARAM(0), LPARAM(0))
+        };
     }
 }
 
@@ -1123,19 +1212,15 @@ mod tests {
         assert!(passed_visible, "passed F17 not visible in async state");
     }
 
-    #[test]
-    fn watchdog_recovers_from_stalled_callback() {
-        let _g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-        if !input_desktop_available() {
-            return;
-        }
+    /// Holds F18, breaks the hook with `break_it`, passes F19 through, and returns how long
+    /// the reinstall took after that.
+    fn assert_recovers(break_it: impl FnOnce(&HookHandle)) -> Option<Duration> {
         let (h, rx) = live_hook("F18");
-        inject!(&[key_event(0x81, false)]);
+        try_inject(&[key_event(0x81, false)]).ok()?;
         assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
-        // Longer than LowLevelHooksTimeout and than the watchdog's rate limit.
-        h.debug_stall_next_callback(1500);
+        break_it(&h);
         let t0 = Instant::now();
-        inject!(&[key_event(0x82, false), key_event(0x82, true)]);
+        try_inject(&[key_event(0x82, false), key_event(0x82, true)]).ok()?;
         // Waits on the reinstall event itself; the bound only catches a watchdog that
         // never acts.
         let mut got_up = false;
@@ -1148,10 +1233,11 @@ mod tests {
                 Err(_) => panic!("watchdog never reinstalled within 10 s"),
             }
         };
-        eprintln!("watchdog: {reason:?} after {:?}", t0.elapsed());
+        let took = t0.elapsed();
+        eprintln!("watchdog: {reason:?} after {took:?}");
         assert!(got_up, "no synthetic Up for the held key");
-        inject!(&[key_event(0x81, true)]);
-        inject!(&[key_event(0x81, false), key_event(0x81, true)]);
+        try_inject(&[key_event(0x81, true)]).ok()?;
+        try_inject(&[key_event(0x81, false), key_event(0x81, true)]).ok()?;
         let mut events = Vec::new();
         while let Some(ev) = next(&rx) {
             let down = matches!(ev, HotkeyEvent::Down { .. });
@@ -1164,5 +1250,55 @@ mod tests {
             matches!(events.as_slice(), [HotkeyEvent::Down { .. }]),
             "after the reinstall, expected only the new hook's Down: {events:?}"
         );
+        Some(took)
+    }
+
+    #[test]
+    fn watchdog_recovers_from_silently_removed_hook() {
+        let _g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if !input_desktop_available() {
+            return;
+        }
+        let Some(took) = assert_recovers(HookHandle::debug_remove_hook_silently) else {
+            eprintln!("SKIPPED: injection refused mid-test");
+            return;
+        };
+        assert!(took < Duration::from_millis(1500), "recovery took {took:?}");
+    }
+
+    #[test]
+    fn watchdog_recovers_from_stalled_callback() {
+        let _g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if !input_desktop_available() {
+            return;
+        }
+        // Several times what the confirming probes tolerate from an unresponsive hook
+        // thread, so a watchdog itself delayed by load still sees it.
+        if assert_recovers(|h| h.debug_stall_next_callback(5000)).is_none() {
+            eprintln!("SKIPPED: injection refused mid-test");
+        }
+    }
+
+    #[test]
+    fn lagging_hook_is_not_reinstalled() {
+        let _g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if !input_desktop_available() {
+            return;
+        }
+        let (h, rx) = live_hook("F20");
+        inject!(&[key_event(0x83, false)]);
+        assert!(matches!(next(&rx), Some(HotkeyEvent::Down { .. })));
+        // 300 ms is about the timeout measured here; 800 ms makes sure the passed key's
+        // events are dropped and show up in the key state without the hook seeing them.
+        for stall in [300, 800] {
+            h.debug_stall_next_callback(stall);
+            inject!(&[key_event(0x84, false), key_event(0x84, true)]);
+            let quiet = Duration::from_millis(stall as u64 + 1500);
+            let stray = rx.recv_timeout(quiet).ok();
+            assert_eq!(stray, None, "a {stall} ms lag produced {stray:?}");
+            assert!(h.is_held(), "a {stall} ms lag ended the hold");
+        }
+        inject!(&[key_event(0x83, true)]);
+        assert!(matches!(next(&rx), Some(HotkeyEvent::Up { .. })));
     }
 }
