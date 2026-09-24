@@ -120,20 +120,11 @@ fn default_http_timeout_ms() -> u64 {
     5000
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PipelineSettings {
     pub pre_transcribe: bool,
     pub segmenter: SegmenterConfig,
-}
-
-impl Default for PipelineSettings {
-    fn default() -> Self {
-        Self {
-            pre_transcribe: false,
-            segmenter: SegmenterConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
