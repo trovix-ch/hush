@@ -181,6 +181,16 @@ at the research date. Expected 0.5–0.8 s per 100 output tokens on a 4090-class
 Longer term: LoRA fine-tune of a 1.7–2B model on synthetic disfluency data. Every
 serious product (Wispr, superwhisper's S1-mini, VoiceInk's fine-tune) went this way.
 
+*Measured 2026-09-24 (`spikes/llama-cpp/`):* the embedded path passes the gate. With
+Ollama's exact model file it validates 29 of 30 fixtures, the same as HTTP, at about
+105 ms p50 with the system prefix cached and 250 ms uncached; the grammar costs
+microseconds and blocks only the literal preamble words. Latency did not improve over
+HTTP because Ollama already caches the prefix on the same GPU, so the embedded path is
+about shipping without a server, not speed. A different Q4_K_M build of the same model
+validated one case fewer: the bundled model is pinned by hash and the fixtures re-run
+on that exact file. The very first Vulkan run on a fresh driver cache took 21 s, so
+start-up warms the LLM the same way it warms the speech engine.
+
 Two caveats the review panel made explicit:
 - The HTTP path proves prompt *correctness*, not latency and not grammar safety. It
   cannot snapshot the prefix state and most servers offer no grammar constraint, so an
@@ -614,8 +624,19 @@ one-second target unspent on this GPU, even before the embedded backend and pref
 caching. The 4B model is the default candidate; the 1.7B halves latency but edits
 numbers.
 
-Pending: the embedded llama.cpp smoke test (milestone 2), latency under GPU contention
-with the speech engine on the same card, prompt-cache hit rate.
+Embedded llama.cpp (Vulkan, `llama-cpp-2`, same fixtures, 3 runs, card not running
+Ollama), 2026-09-24:
+
+| model | load | VRAM | prefix cached p50/p95 | uncached p50/p95 | validated |
+|---|---|---|---|---|---|
+| Qwen3-4B-Instruct-2507 Q4_K_M, Ollama's file | 2.8 s | 3.3 GB | 106 / 174 | 245 / 324 | 29/30 |
+| same model, unsloth Q4_K_M build | 2.2 s | 3.3 GB | 109 / 184 | 251 / 436 | 28/30 |
+| Granite 4.0 Micro Q4_K_M | 1.8 s | 2.6 GB | 100 / 181 | 213 / 298 | 24/30 |
+
+Per request with the prefix cached: 46 prompt tokens in 29 ms, 10 output tokens in
+89 ms (about 115 tokens/s), so generation is 80 % of the cost.
+
+Pending: latency under GPU contention with the speech engine on the same card.
 
 ## 8. Build requirements on the development machine *(perishable, 2026-09-24)*
 
